@@ -1,0 +1,198 @@
+"""
+CRUD-Operationen für importierte Dokumente.
+"""
+
+from decimal import Decimal
+
+from sqlalchemy import outerjoin
+from sqlalchemy.orm import Session, joinedload
+
+from app.models.document import Document
+from app.models.invoice_extraction import InvoiceExtraction
+from app.models.order_position import OrderPosition
+
+
+def create(
+    db: Session,
+    batch_id: int,
+    original_filename: str,
+    file_size_bytes: int,
+    company: str,
+    year: int,
+) -> Document:
+    """
+    Erstellt einen neuen Dokument-Datensatz (ohne stored_filename — wird
+    erst nach dem Kopiervorgang gesetzt, da die ID als Dateiname dient).
+    """
+    obj = Document(
+        batch_id=batch_id,
+        original_filename=original_filename,
+        file_size_bytes=file_size_bytes,
+        company=company,
+        year=year,
+        status="pending",
+    )
+    db.add(obj)
+    db.commit()
+    db.refresh(obj)
+    return obj
+
+
+def update_after_copy(
+    db: Session,
+    doc_id: int,
+    stored_filename: str,
+    page_count: int,
+) -> Document | None:
+    """
+    Setzt stored_filename und page_count nach dem erfolgreichen Kopieren.
+    Dies ist Schritt 2 des Zwei-Schritt-Prozesses (Insert → Copy → Update).
+    """
+    obj = db.get(Document, doc_id)
+    if obj is None:
+        return None
+    obj.stored_filename = stored_filename
+    obj.page_count = page_count
+    obj.status = "processing"
+    db.commit()
+    db.refresh(obj)
+    return obj
+
+
+def update_status(
+    db: Session,
+    doc_id: int,
+    status: str,
+    error_message: str | None = None,
+) -> Document | None:
+    """Aktualisiert den Verarbeitungsstatus eines Dokuments."""
+    obj = db.get(Document, doc_id)
+    if obj is None:
+        return None
+    obj.status = status
+    if error_message is not None:
+        obj.error_message = error_message
+    db.commit()
+    db.refresh(obj)
+    return obj
+
+
+def update_comment(db: Session, doc_id: int, comment: str | None) -> Document | None:
+    """Setzt oder entfernt den Kommentar eines Dokuments."""
+    obj = db.get(Document, doc_id)
+    if obj is None:
+        return None
+    obj.comment = comment
+    db.commit()
+    db.refresh(obj)
+    return obj
+
+
+def get_by_id_with_details(db: Session, doc_id: int) -> Document | None:
+    """
+    Gibt ein Dokument inkl. Extraktion und Bestellpositionen zurück.
+    Nutzt joinedload um N+1-Abfragen zu vermeiden.
+    """
+    return (
+        db.query(Document)
+        .options(
+            joinedload(Document.extraction),
+            joinedload(Document.order_positions),
+        )
+        .filter(Document.id == doc_id)
+        .first()
+    )
+
+
+def get_all_filtered(
+    db: Session,
+    company: str | None = None,
+    year: int | None = None,
+    status: str | None = None,
+    total_min: float | None = None,
+    total_max: float | None = None,
+    page_min: int | None = None,
+    page_max: int | None = None,
+) -> list[Document]:
+    """
+    Gibt alle Dokumente zurück, optional gefiltert.
+
+    Für Betragsfilter wird ein Outer Join auf invoice_extractions gemacht,
+    damit Dokumente ohne Extraktion weiterhin erscheinen (außer wenn ein
+    Betragsfilter aktiv ist, der eine vorhandene Extraktion voraussetzt).
+    """
+    query = db.query(Document).options(joinedload(Document.extraction))
+
+    # Betragsfilter benötigen den Join
+    if total_min is not None or total_max is not None:
+        query = query.outerjoin(
+            InvoiceExtraction,
+            Document.id == InvoiceExtraction.document_id,
+        )
+        if total_min is not None:
+            query = query.filter(InvoiceExtraction.total_amount >= Decimal(str(total_min)))
+        if total_max is not None:
+            query = query.filter(InvoiceExtraction.total_amount <= Decimal(str(total_max)))
+
+    if company:
+        query = query.filter(Document.company.ilike(f"%{company}%"))
+    if year is not None:
+        query = query.filter(Document.year == year)
+    if status:
+        query = query.filter(Document.status == status)
+    if page_min is not None:
+        query = query.filter(Document.page_count >= page_min)
+    if page_max is not None:
+        query = query.filter(Document.page_count <= page_max)
+
+    return query.order_by(Document.id.desc()).all()
+
+
+def save_extraction(
+    db: Session,
+    doc_id: int,
+    extracted_data: dict,
+    positions: list[dict],
+    raw_response: str,
+    supplier_id: int | None = None,
+) -> InvoiceExtraction:
+    """
+    Speichert extrahierte Rechnungsdaten und Bestellpositionen.
+    Falls bereits eine Extraktion existiert, wird sie überschrieben.
+
+    Args:
+        doc_id: ID des Dokuments
+        extracted_data: Dict mit den Rechnungsfeldern (supplier_name, iban, ...)
+        positions: Liste von Dicts für die Bestellpositionen
+        raw_response: vollständige KI-Antwort als String (für Debugging)
+        supplier_id: optionale ID des verknüpften Lieferanten-Stammdatensatzes
+    """
+    # Vorhandene Extraktion löschen (falls Wiederholung)
+    db.query(InvoiceExtraction).filter(
+        InvoiceExtraction.document_id == doc_id
+    ).delete()
+    db.query(OrderPosition).filter(
+        OrderPosition.document_id == doc_id
+    ).delete()
+
+    # Neue Extraktion speichern
+    extraction = InvoiceExtraction(
+        document_id=doc_id,
+        raw_response=raw_response,
+        supplier_id=supplier_id,
+        **extracted_data,
+    )
+    db.add(extraction)
+
+    # Bestellpositionen speichern
+    for idx, pos in enumerate(positions):
+        order_pos = OrderPosition(
+            document_id=doc_id,
+            position_index=idx,
+            **pos,
+        )
+        db.add(order_pos)
+
+    db.commit()
+    db.refresh(extraction)
+    return extraction
