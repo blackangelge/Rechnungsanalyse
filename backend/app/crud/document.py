@@ -2,6 +2,7 @@
 CRUD-Operationen für importierte Dokumente.
 """
 
+from datetime import datetime, timezone
 from decimal import Decimal
 
 from sqlalchemy import outerjoin
@@ -77,6 +78,28 @@ def update_status(
     return obj
 
 
+def soft_delete(db: Session, doc_id: int) -> Document | None:
+    """Markiert ein Dokument als gelöscht (Soft-Delete). PDF bleibt erhalten."""
+    obj = db.get(Document, doc_id)
+    if obj is None:
+        return None
+    obj.deleted_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(obj)
+    return obj
+
+
+def restore(db: Session, doc_id: int) -> Document | None:
+    """Stellt ein soft-gelöschtes Dokument wieder her."""
+    obj = db.get(Document, doc_id)
+    if obj is None:
+        return None
+    obj.deleted_at = None
+    db.commit()
+    db.refresh(obj)
+    return obj
+
+
 def update_comment(db: Session, doc_id: int, comment: str | None) -> Document | None:
     """Setzt oder entfernt den Kommentar eines Dokuments."""
     obj = db.get(Document, doc_id)
@@ -113,6 +136,8 @@ def get_all_filtered(
     total_max: float | None = None,
     page_min: int | None = None,
     page_max: int | None = None,
+    batch_ids: list[int] | None = None,
+    include_deleted: bool = False,
 ) -> list[Document]:
     """
     Gibt alle Dokumente zurück, optional gefiltert.
@@ -122,6 +147,14 @@ def get_all_filtered(
     Betragsfilter aktiv ist, der eine vorhandene Extraktion voraussetzt).
     """
     query = db.query(Document).options(joinedload(Document.extraction))
+
+    # Soft-Delete-Filter: standardmäßig nur nicht-gelöschte Dokumente anzeigen
+    if not include_deleted:
+        query = query.filter(Document.deleted_at.is_(None))
+
+    # Import-Batch-Filter
+    if batch_ids:
+        query = query.filter(Document.batch_id.in_(batch_ids))
 
     # Betragsfilter benötigen den Join
     if total_min is not None or total_max is not None:

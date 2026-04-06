@@ -87,6 +87,19 @@ async def start_import(payload: ImportBatchCreate, db: Session = Depends(get_db)
     return batch
 
 
+@router.get("/{batch_id}/status", response_model=ImportBatchRead)
+def get_import_status(batch_id: int, db: Session = Depends(get_db)):
+    """
+    Gibt nur den Status eines Import-Batches zurück — OHNE Dokumentliste.
+    Für leichtgewichtiges Polling während eines laufenden Imports.
+    """
+    from app.models.import_batch import ImportBatch as ImportBatchModel
+    obj = db.get(ImportBatchModel, batch_id)
+    if obj is None:
+        raise HTTPException(status_code=404, detail="Import-Batch nicht gefunden")
+    return obj
+
+
 @router.get("/{batch_id}", response_model=ImportBatchWithDocuments)
 def get_import(batch_id: int, db: Session = Depends(get_db)):
     """Gibt einen Import-Batch mit vollständiger Dokumentliste zurück."""

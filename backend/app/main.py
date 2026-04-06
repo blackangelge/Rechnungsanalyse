@@ -8,7 +8,7 @@ Die CORS-Middleware erlaubt Anfragen vom Next.js-Frontend.
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.routers import ai_configs, documents, items, settings, sse
+from app.routers import ai_configs, documents, items, logs, settings, sse
 from app.routers import imports as imports_router  # 'imports' ist ein Python-Keyword
 
 # ── FastAPI-Instanz ─────────────────────────────────────────────────────────
@@ -40,6 +40,7 @@ app.include_router(imports_router.router)  # /api/imports/* (POST, GET)
 app.include_router(sse.router)             # /api/imports/{id}/progress (SSE)
 app.include_router(documents.router)       # /api/documents/*
 app.include_router(settings.router)        # /api/settings/*
+app.include_router(logs.router)            # /api/logs/*
 
 
 # ── Health-Check ────────────────────────────────────────────────────────────

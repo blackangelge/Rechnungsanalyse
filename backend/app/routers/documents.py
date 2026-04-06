@@ -14,7 +14,7 @@ import logging
 from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
@@ -56,10 +56,13 @@ def list_documents(
     total_max: Optional[float] = None,
     page_min: Optional[int] = None,
     page_max: Optional[int] = None,
+    batch_ids: Optional[list[int]] = Query(default=None),
+    include_deleted: bool = False,
     db: Session = Depends(get_db),
 ):
     """
-    Gibt alle Dokumente zurück, optional gefiltert nach Firma, Jahr, Status und Betrag.
+    Gibt alle Dokumente zurück, optional gefiltert.
+    include_deleted=true zeigt auch soft-gelöschte Dokumente an.
     """
     return crud.document.get_all_filtered(
         db,
@@ -70,6 +73,8 @@ def list_documents(
         total_max=total_max,
         page_min=page_min,
         page_max=page_max,
+        batch_ids=batch_ids,
+        include_deleted=include_deleted,
     )
 
 
@@ -168,10 +173,22 @@ async def _run_analysis(
     system_prompt_text: str | None,
 ) -> None:
     """
-    Hintergrund-Coroutine: Analysiert alle Dokumente parallel (max. 4 gleichzeitig).
+    Hintergrund-Coroutine: Analysiert alle Dokumente parallel.
+    Parallelität wird aus den ProcessingSettings gelesen (Standard: 4).
     Öffnet eigene DB-Session (läuft unabhängig vom Request-Lifecycle).
     """
-    semaphore = asyncio.Semaphore(4)
+    # KI-Parallelität aus DB lesen
+    try:
+        _db = SessionLocal()
+        try:
+            proc_settings = crud.processing_settings.get_or_create(_db)
+            ai_concurrency = proc_settings.ai_concurrency
+        finally:
+            _db.close()
+    except Exception:
+        ai_concurrency = 4
+    logger.info("KI-Analyse-Parallelität: %d gleichzeitige Aufrufe", ai_concurrency)
+    semaphore = asyncio.Semaphore(ai_concurrency)
     tasks = [
         _analyze_single(
             doc_id=doc_id,
@@ -249,6 +266,11 @@ async def _analyze_single(
 
             # KI-Extraktion
             logger.info("Starte KI-Extraktion für Dokument #%d", doc_id)
+            crud.system_log.add(
+                db, category="ki", level="info",
+                message=f"KI-Analyse gestartet: {doc.original_filename} — Modell: {ai_config.model_name}, {len(images_b64)} Seite(n)",
+                batch_id=doc.batch_id, document_id=doc_id,
+            )
             extracted_fields, order_positions, raw_response = await ai_service.extract_invoice_data(
                 images_b64=images_b64,
                 config=ai_config,
@@ -285,13 +307,25 @@ async def _analyze_single(
             )
 
             # Status setzen
-            if raw_response.startswith("KI überlastet:") or raw_response.startswith("KI-Fehler:"):
+            is_ki_error = raw_response.startswith("KI überlastet:") or raw_response.startswith("KI-Fehler:") or raw_response.startswith("KI-Timeout") or raw_response.startswith("KI-Verbindungsfehler") or raw_response.startswith("Unerwarteter KI-Fehler")
+            if is_ki_error:
                 crud.document.update_status(
                     db, doc_id, "error", error_message=raw_response
                 )
+                crud.system_log.add(
+                    db, category="ki", level="error",
+                    message=f"KI-Fehler: {doc.original_filename} — {raw_response[:200]}",
+                    batch_id=doc.batch_id, document_id=doc_id,
+                )
                 logger.warning("Dokument #%d: KI-Fehler — %s", doc_id, raw_response)
             else:
+                filled = len([v for v in extracted_fields.values() if v is not None])
                 crud.document.update_status(db, doc_id, "done")
+                crud.system_log.add(
+                    db, category="ki", level="info",
+                    message=f"KI-Analyse erfolgreich: {doc.original_filename} — {filled} Felder, {len(order_positions)} Positionen",
+                    batch_id=doc.batch_id, document_id=doc_id,
+                )
                 logger.info("Dokument #%d erfolgreich analysiert", doc_id)
 
         except Exception as exc:
@@ -304,6 +338,32 @@ async def _analyze_single(
                 pass
         finally:
             db.close()
+
+
+# ─── DELETE /api/documents/{id} — Soft-Delete ───────────────────────────────
+
+@router.delete("/{doc_id}", response_model=DocumentDetail)
+def soft_delete_document(doc_id: int, db: Session = Depends(get_db)):
+    """
+    Markiert ein Dokument als gelöscht (Soft-Delete).
+    Die PDF-Datei und alle Extraktionsdaten bleiben erhalten.
+    Das Dokument kann über POST /{id}/restore wiederhergestellt werden.
+    """
+    doc = crud.document.soft_delete(db, doc_id)
+    if doc is None:
+        raise HTTPException(status_code=404, detail="Dokument nicht gefunden")
+    return crud.document.get_by_id_with_details(db, doc_id)
+
+
+# ─── POST /api/documents/{id}/restore — Wiederherstellen ────────────────────
+
+@router.post("/{doc_id}/restore", response_model=DocumentDetail)
+def restore_document(doc_id: int, db: Session = Depends(get_db)):
+    """Stellt ein soft-gelöschtes Dokument wieder her."""
+    doc = crud.document.restore(db, doc_id)
+    if doc is None:
+        raise HTTPException(status_code=404, detail="Dokument nicht gefunden")
+    return crud.document.get_by_id_with_details(db, doc_id)
 
 
 # ─── GET /api/documents/{id} ─────────────────────────────────────────────────

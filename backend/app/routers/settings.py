@@ -13,6 +13,7 @@ from app import crud
 from app.config import settings
 from app.database import get_db
 from app.schemas.image_settings import ImageSettingsRead, ImageSettingsUpdate
+from app.schemas.processing_settings import ProcessingSettingsRead, ProcessingSettingsUpdate
 from app.schemas.system_prompt import SystemPromptCreate, SystemPromptRead, SystemPromptUpdate
 
 router = APIRouter(prefix="/api/settings", tags=["Einstellungen"])
@@ -35,6 +36,20 @@ def get_image_settings(db: Session = Depends(get_db)):
 @router.put("/image-conversion", response_model=ImageSettingsRead)
 def update_image_settings(payload: ImageSettingsUpdate, db: Session = Depends(get_db)):
     return crud.image_settings.update(db, payload)
+
+
+# ── Verarbeitungseinstellungen ────────────────────────────────────────────────
+
+@router.get("/processing", response_model=ProcessingSettingsRead)
+def get_processing_settings(db: Session = Depends(get_db)):
+    """Gibt die aktuellen Parallelitäts-Einstellungen zurück."""
+    return crud.processing_settings.get_or_create(db)
+
+
+@router.put("/processing", response_model=ProcessingSettingsRead)
+def update_processing_settings(payload: ProcessingSettingsUpdate, db: Session = Depends(get_db)):
+    """Aktualisiert die Parallelitäts-Einstellungen."""
+    return crud.processing_settings.update(db, payload)
 
 
 # ── Systemprompts ─────────────────────────────────────────────────────────────

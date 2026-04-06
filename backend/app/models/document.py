@@ -61,6 +61,12 @@ class Document(Base):
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
 
+    # Soft-Delete: gesetzt wenn das Dokument als gelöscht markiert wurde
+    # (NULL = aktiv, Timestamp = gelöscht)
+    deleted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, default=None
+    )
+
     # Beziehung zum übergeordneten Batch
     batch: Mapped["ImportBatch"] = relationship(  # noqa: F821
         "ImportBatch", back_populates="documents"

@@ -23,6 +23,8 @@ const NAV_LINKS = [
   { href: "/settings/ai", label: "KI-Einstellungen" },
   { href: "/settings/prompts", label: "Systemprompts" },
   { href: "/settings/image", label: "Bildeinstellungen" },
+  { href: "/settings/processing", label: "Einstellungen" },
+  { href: "/logs", label: "Logs" },
 ];
 
 export default function Nav() {

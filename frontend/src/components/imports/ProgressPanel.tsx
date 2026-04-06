@@ -7,10 +7,13 @@
  * - Vergangene Zeit
  * - Verarbeitungsgeschwindigkeit (Dokumente/Minute)
  * - Aktueller Status
+ *
+ * Ruft onDone() auf, sobald der Import abgeschlossen ist (done oder error).
  */
 
 "use client";
 
+import { useEffect } from "react";
 import { ProgressEvent } from "@/lib/api";
 import { useSSE } from "@/lib/sse";
 
@@ -19,6 +22,8 @@ interface Props {
   initialStatus: string;
   initialTotal?: number;
   initialProcessed?: number;
+  /** Wird aufgerufen, wenn der Import abgeschlossen ist (done oder error). */
+  onDone?: () => void;
 }
 
 /** Formatiert Sekunden als MM:SS oder HH:MM:SS */
@@ -34,17 +39,31 @@ function formatDuration(seconds: number): string {
   return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
 }
 
-export default function ProgressPanel({ batchId, initialStatus, initialTotal = 0, initialProcessed = 0 }: Props) {
+export default function ProgressPanel({
+  batchId,
+  initialStatus,
+  initialTotal = 0,
+  initialProcessed = 0,
+  onDone,
+}: Props) {
   // SSE nur aktiv, wenn Import läuft oder noch nicht begonnen hat
   const shouldStream = initialStatus === "running" || initialStatus === "pending";
   const sseUrl = shouldStream ? `/api/imports/${batchId}/progress` : null;
 
   const { data, status: sseStatus, error } = useSSE<ProgressEvent>(sseUrl);
 
+  // onDone auslösen, wenn SSE "done" oder "error" meldet
+  useEffect(() => {
+    if (data?.status === "done" || data?.status === "error") {
+      onDone?.();
+    }
+  }, [data?.status, onDone]);
+
   // Anzeige: SSE-Daten oder Fallback auf Initialstatus
-  const isRunning = data?.status === "running" || initialStatus === "running";
-  const isDone = data?.status === "done" || initialStatus === "done";
-  const isError = data?.status === "error" || initialStatus === "error";
+  const currentStatus = data?.status ?? initialStatus;
+  const isRunning = currentStatus === "running" || currentStatus === "pending";
+  const isDone = currentStatus === "done";
+  const isError = currentStatus === "error";
 
   const total = data?.total ?? initialTotal;
   const processed = data?.processed ?? initialProcessed;
@@ -52,11 +71,15 @@ export default function ProgressPanel({ batchId, initialStatus, initialTotal = 0
   const elapsed = data?.elapsed_seconds ?? 0;
   const speed = data?.docs_per_minute ?? 0;
 
+  // Geschätzte Restzeit
+  const remaining = (speed > 0 && total > processed)
+    ? Math.round((total - processed) / speed * 60)
+    : null;
+
   return (
     <div className="rounded-lg border bg-white p-5 shadow-sm">
       <div className="mb-4 flex items-center justify-between">
         <h2 className="font-semibold">Import-Fortschritt</h2>
-        {/* Status-Badge */}
         <span
           className={[
             "rounded-full px-3 py-1 text-xs font-medium",
@@ -66,7 +89,7 @@ export default function ProgressPanel({ batchId, initialStatus, initialTotal = 0
             !isRunning && !isDone && !isError ? "bg-gray-100 text-gray-500" : "",
           ].join(" ")}
         >
-          {data?.status ?? initialStatus}
+          {isDone ? "Abgeschlossen" : isError ? "Fehler" : isRunning ? "Läuft…" : currentStatus}
         </span>
       </div>
 
@@ -79,14 +102,14 @@ export default function ProgressPanel({ batchId, initialStatus, initialTotal = 0
       <div className="mb-4">
         <div className="mb-1 flex justify-between text-xs text-gray-500">
           <span>
-            {processed} / {total} Dokumente
+            {processed.toLocaleString("de-DE")} / {total.toLocaleString("de-DE")} Dokumente
           </span>
-          <span>{percent}%</span>
+          <span className="font-medium">{percent}%</span>
         </div>
         <div className="h-3 w-full overflow-hidden rounded-full bg-gray-100">
           <div
             className={[
-              "h-3 rounded-full transition-all duration-500",
+              "h-3 rounded-full transition-all duration-700",
               isDone ? "bg-green-500" : isError ? "bg-red-400" : "bg-blue-500",
             ].join(" ")}
             style={{ width: `${percent}%` }}
@@ -95,30 +118,43 @@ export default function ProgressPanel({ batchId, initialStatus, initialTotal = 0
       </div>
 
       {/* Statistiken */}
-      <div className="grid grid-cols-3 gap-4 text-center">
+      <div className="grid grid-cols-3 gap-3 text-center">
         <div className="rounded bg-gray-50 p-3">
-          <p className="text-2xl font-bold text-gray-800">{processed}</p>
+          <p className="text-xl font-bold tabular-nums text-gray-800">
+            {processed.toLocaleString("de-DE")}
+          </p>
           <p className="text-xs text-gray-500">Verarbeitet</p>
         </div>
         <div className="rounded bg-gray-50 p-3">
-          <p className="text-2xl font-bold text-gray-800">{formatDuration(elapsed)}</p>
+          <p className="text-xl font-bold tabular-nums text-gray-800">
+            {formatDuration(elapsed)}
+          </p>
           <p className="text-xs text-gray-500">Verstrichene Zeit</p>
         </div>
         <div className="rounded bg-gray-50 p-3">
-          <p className="text-2xl font-bold text-gray-800">{speed.toFixed(1)}</p>
+          <p className="text-xl font-bold tabular-nums text-gray-800">
+            {speed > 0 ? speed.toFixed(1) : "–"}
+          </p>
           <p className="text-xs text-gray-500">Dok./Minute</p>
         </div>
       </div>
 
+      {/* Restzeit-Schätzung */}
+      {isRunning && remaining !== null && remaining > 0 && (
+        <p className="mt-3 text-center text-xs text-gray-400">
+          Geschätzte Restzeit: ca. {formatDuration(remaining)}
+        </p>
+      )}
+
       {/* Abschluss-Meldung */}
       {isDone && (
         <p className="mt-4 rounded bg-green-50 px-3 py-2 text-sm text-green-700">
-          Import erfolgreich abgeschlossen — {total} Dokumente verarbeitet.
+          Import erfolgreich abgeschlossen — {total.toLocaleString("de-DE")} Dokumente verarbeitet.
         </p>
       )}
       {isError && (
         <p className="mt-4 rounded bg-red-50 px-3 py-2 text-sm text-red-700">
-          Import mit Fehlern abgeschlossen. Einzelne Dokumente können Fehler enthalten.
+          Import mit Fehlern abgeschlossen. Fehlerdokumente sind unten markiert.
         </p>
       )}
     </div>

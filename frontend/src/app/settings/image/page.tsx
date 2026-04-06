@@ -45,7 +45,10 @@ export default function ImageSettingsPage() {
       setImageFormat(data.image_format);
       setJpegQuality(data.jpeg_quality);
     } catch {
-      setError("Fehler beim Laden der Bildeinstellungen");
+      // Standardwerte werden verwendet (bereits als useState-Defaults gesetzt).
+      // Kein Fehler anzeigen — das Formular ist trotzdem speicherbar (PUT legt
+      // den Datensatz beim ersten Speichern automatisch an).
+      console.warn("Bildeinstellungen konnten nicht geladen werden, Standardwerte werden verwendet.");
     } finally {
       setLoading(false);
     }

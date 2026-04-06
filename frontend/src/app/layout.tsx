@@ -18,8 +18,10 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
       <body className="min-h-screen bg-gray-50 text-gray-900 antialiased">
         {/* Globale Navigationsleiste */}
         <Nav />
-        {/* Seiteninhalt — maximale Breite für Dashboard-Tabellen erhöht */}
-        <main className="mx-auto max-w-7xl p-6">{children}</main>
+        {/* Seiteninhalt — overflow-x-hidden für Full-Width-Breakout in Belege */}
+        <main className="overflow-x-hidden">
+          <div className="mx-auto max-w-7xl p-6">{children}</div>
+        </main>
       </body>
     </html>
   );

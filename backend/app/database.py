@@ -16,7 +16,22 @@ from app.config import settings
 # ─── Synchrone Engine ────────────────────────────────────────────────────────
 # Wird von allen normalen FastAPI-Routen über die get_db()-Dependency verwendet.
 # pool_pre_ping=True prüft die Verbindung vor jeder Abfrage und reconnectet bei Bedarf.
-engine = create_engine(settings.database_url, pool_pre_ping=True)
+engine = create_engine(
+    settings.database_url,
+    pool_pre_ping=True,
+    # pool_size: Permanente Verbindungen im Pool.
+    # Mit dem neuen Session-Design (kurze Verbindungen pro DB-Phase) reichen 10.
+    # Jeder Task hält eine Verbindung nur für ~50 ms (Commit), nicht für die
+    # gesamte Datei-Kopier-Dauer.
+    pool_size=10,
+    # max_overflow: Zusätzliche Verbindungen bei kurzzeitigen Spitzen.
+    max_overflow=20,
+    # pool_timeout: Wie lange auf eine freie Verbindung gewartet wird (Sekunden).
+    # Standard ist 30 — erhöht auf 60 für sehr hohe Parallelität.
+    pool_timeout=60,
+    # pool_recycle: Verbindungen nach 1 Stunde neu aufbauen (verhindert stale connections).
+    pool_recycle=3600,
+)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 # ─── Asynchrone Engine ───────────────────────────────────────────────────────

@@ -22,6 +22,7 @@ class DocumentRead(BaseModel):
     status: str
     error_message: str | None
     created_at: datetime
+    deleted_at: datetime | None = None
 
     model_config = ConfigDict(from_attributes=True)
 

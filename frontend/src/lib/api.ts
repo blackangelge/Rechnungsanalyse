@@ -22,6 +22,21 @@ export const apiClient = axios.create({
   headers: { "Content-Type": "application/json" },
 });
 
+// Array-Parameter ohne Klammern serialisieren: batch_ids=1&batch_ids=2
+// (FastAPI erwartet dieses Format, nicht batch_ids[]=1&batch_ids[]=2)
+apiClient.defaults.paramsSerializer = (params) => {
+  const parts: string[] = [];
+  for (const key of Object.keys(params)) {
+    const val = params[key];
+    if (Array.isArray(val)) {
+      val.forEach((v) => parts.push(`${encodeURIComponent(key)}=${encodeURIComponent(v)}`));
+    } else if (val !== undefined && val !== null) {
+      parts.push(`${encodeURIComponent(key)}=${encodeURIComponent(val)}`);
+    }
+  }
+  return parts.join("&");
+};
+
 // ─── Typen: Items (Platzhalter-CRUD) ─────────────────────────────────────────
 
 export interface Item {
@@ -140,6 +155,13 @@ export const importsApi = {
   create: (data: ImportBatchCreate) =>
     apiClient.post<ImportBatch>("/api/imports/", data).then((r) => r.data),
 
+  /**
+   * Nur Status + Metadaten eines Batches laden — OHNE Dokumentliste.
+   * Für leichtgewichtiges Polling während eines laufenden Imports.
+   */
+  getStatus: (id: number) =>
+    apiClient.get<ImportBatch>(`/api/imports/${id}/status`).then((r) => r.data),
+
   /** Import-Batch löschen */
   delete: (id: number) => apiClient.delete(`/api/imports/${id}`),
 };
@@ -159,6 +181,7 @@ export interface DocumentItem {
   status: "pending" | "processing" | "done" | "error";
   error_message: string | null;
   created_at: string;
+  deleted_at: string | null;
   /** Kurzfelder aus der Extraktion (nur in der Beleg-Liste) */
   total_amount?: number | null;
   invoice_number?: string | null;
@@ -215,6 +238,8 @@ export interface DocumentFilter {
   total_max?: number;
   page_min?: number;
   page_max?: number;
+  batch_ids?: number[];
+  include_deleted?: boolean;
 }
 
 export interface AnalyzeRequest {
@@ -242,6 +267,14 @@ export const documentsApi = {
     apiClient
       .patch<DocumentDetail>(`/api/documents/${id}/comment`, { comment })
       .then((r) => r.data),
+
+  /** Soft-Delete: Dokument als gelöscht markieren (PDF bleibt erhalten) */
+  softDelete: (id: number) =>
+    apiClient.delete<DocumentDetail>(`/api/documents/${id}`).then((r) => r.data),
+
+  /** Soft-gelöschtes Dokument wiederherstellen */
+  restore: (id: number) =>
+    apiClient.post<DocumentDetail>(`/api/documents/${id}/restore`).then((r) => r.data),
 
   /** KI-Analyse für ausgewählte Dokumente starten */
   analyze: (data: AnalyzeRequest) =>
@@ -310,6 +343,57 @@ export const imageSettingsApi = {
   update: (data: ImageSettingsUpdate) =>
     apiClient
       .put<ImageSettings>("/api/settings/image-conversion", data)
+      .then((r) => r.data),
+};
+
+// ─── Typen: Verarbeitungseinstellungen ───────────────────────────────────────
+
+export interface ProcessingSettings {
+  id: number;
+  import_concurrency: number;
+  ai_concurrency: number;
+}
+
+export interface ProcessingSettingsUpdate {
+  import_concurrency: number;
+  ai_concurrency: number;
+}
+
+export const processingSettingsApi = {
+  /** Aktuelle Verarbeitungseinstellungen laden */
+  get: () =>
+    apiClient
+      .get<ProcessingSettings>("/api/settings/processing")
+      .then((r) => r.data),
+
+  /** Verarbeitungseinstellungen speichern */
+  update: (data: ProcessingSettingsUpdate) =>
+    apiClient
+      .put<ProcessingSettings>("/api/settings/processing", data)
+      .then((r) => r.data),
+};
+
+// ─── Typen: Systemlogs ───────────────────────────────────────────────────────
+
+export interface SystemLog {
+  id: number;
+  category: "import" | "ki" | string;
+  level: "info" | "warning" | "error" | string;
+  message: string;
+  batch_id: number | null;
+  document_id: number | null;
+  created_at: string;
+}
+
+export const logsApi = {
+  /** Log-Einträge laden (neueste zuerst) */
+  list: (params?: { category?: string; level?: string; limit?: number }) =>
+    apiClient.get<SystemLog[]>("/api/logs", { params }).then((r) => r.data),
+
+  /** Alle oder kategoriegefilterte Logs löschen */
+  clear: (category?: string) =>
+    apiClient
+      .delete<{ deleted: number }>("/api/logs", { params: category ? { category } : undefined })
       .then((r) => r.data),
 };
 
