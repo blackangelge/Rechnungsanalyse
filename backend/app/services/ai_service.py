@@ -130,59 +130,77 @@ async def extract_invoice_data(
     # System-Prompt auswählen
     active_system_prompt = system_prompt_text if system_prompt_text else DEFAULT_SYSTEM_PROMPT
 
-    # ─── Nachricht zusammenbauen ────────────────────────────────────────────
-    # Alle Seiten werden als separate image_url-Parts in EINER Nachricht gesendet.
-    content_parts: list[dict] = []
+    endpoint_type = getattr(config, "endpoint_type", "openai") or "openai"
+    base = config.api_url.rstrip("/")
+    reasoning = getattr(config, "reasoning", "off") or "off"
+    # "on" wird als "high" übermittelt
+    reasoning_value = "high" if reasoning == "on" else reasoning
 
-    # Einleitungstext vor den Bildern
-    content_parts.append({
-        "type": "text",
-        "text": (
-            f"Die folgende Rechnung besteht aus {len(images_b64)} Seite(n). "
-            "Analysiere alle Seiten und extrahiere die Daten gemäß der Anweisung."
-        ),
-    })
-
-    # Jede Seite als Bild anhängen
-    for idx, data_url in enumerate(images_b64):
-        content_parts.append({
-            "type": "image_url",
-            "image_url": {
-                "url": data_url,
-                # "detail" weglassen — LM Studio und viele lokale APIs ignorieren
-                # oder lehnen diesen Parameter ab, was zu Channel-Warnungen führt.
-            },
-        })
-        logger.debug("  Seite %d/%d in Anfrage eingebettet", idx + 1, len(images_b64))
-
-    # ─── API-Aufruf ─────────────────────────────────────────────────────────
+    # ─── Request je nach Endpunkt-Typ aufbauen ───────────────────────────────
     headers = {"Content-Type": "application/json"}
     if config.api_key:
         headers["Authorization"] = f"Bearer {config.api_key}"
 
-    request_body: dict = {
-        "model": config.model_name,
-        "max_tokens": config.max_tokens,
-        "temperature": config.temperature,
-        "stream": False,  # Explizit deaktivieren — LM Studio löst sonst Channel-Warnungen aus
-        "messages": [
-            {"role": "system", "content": active_system_prompt},
-            {"role": "user", "content": content_parts},
-        ],
-    }
-
-    # Reasoning-Modus immer an API weiterleiten
-    reasoning = getattr(config, "reasoning", "off") or "off"
-    # "on" wird als "high" übermittelt (OpenAI-kompatibel: off/low/medium/high)
-    request_body["reasoning"] = "high" if reasoning == "on" else reasoning
-
-    endpoint_type = getattr(config, "endpoint_type", "openai") or "openai"
-    base = config.api_url.rstrip("/")
     if endpoint_type == "lmstudio":
+        # ── LM Studio REST API (/api/v1/chat) ────────────────────────────────
+        # Eigenes Format: input-Array mit type:"image" und type:"message",
+        # system_prompt als separates Feld, max_output_tokens statt max_tokens.
         endpoint = base + "/api/v1/chat"
+
+        input_parts: list[dict] = []
+        for idx, data_url in enumerate(images_b64):
+            input_parts.append({"type": "image", "data_url": data_url})
+            logger.debug("  Seite %d/%d in Anfrage eingebettet", idx + 1, len(images_b64))
+
+        # Analyseauftrag als abschließende Textnachricht
+        input_parts.append({
+            "type": "message",
+            "content": (
+                f"Die folgende Rechnung besteht aus {len(images_b64)} Seite(n). "
+                "Analysiere alle Seiten und extrahiere die Daten gemäß der Anweisung."
+            ),
+        })
+
+        request_body: dict = {
+            "model": config.model_name,
+            "input": input_parts,
+            "system_prompt": active_system_prompt,
+            "temperature": config.temperature,
+            "max_output_tokens": config.max_tokens,
+            "reasoning": reasoning_value,
+            "stream": False,
+        }
+
     else:
+        # ── OpenAI-kompatible API (/v1/chat/completions) ─────────────────────
+        # Standard: messages-Array mit image_url-Parts.
         endpoint = base + "/v1/chat/completions"
-    logger.debug("Sende Anfrage an: %s", endpoint)
+
+        content_parts: list[dict] = []
+        content_parts.append({
+            "type": "text",
+            "text": (
+                f"Die folgende Rechnung besteht aus {len(images_b64)} Seite(n). "
+                "Analysiere alle Seiten und extrahiere die Daten gemäß der Anweisung."
+            ),
+        })
+        for idx, data_url in enumerate(images_b64):
+            content_parts.append({"type": "image_url", "image_url": {"url": data_url}})
+            logger.debug("  Seite %d/%d in Anfrage eingebettet", idx + 1, len(images_b64))
+
+        request_body = {
+            "model": config.model_name,
+            "max_tokens": config.max_tokens,
+            "temperature": config.temperature,
+            "reasoning": reasoning_value,
+            "stream": False,
+            "messages": [
+                {"role": "system", "content": active_system_prompt},
+                {"role": "user", "content": content_parts},
+            ],
+        }
+
+    logger.info("Sende Anfrage an: %s (Typ: %s)", endpoint, endpoint_type)
 
     raw_text = ""
 
@@ -194,14 +212,13 @@ async def extract_invoice_data(
 
         # ─── HTTP-Fehlerbehandlung ohne raise_for_status ──────────────────
         if status_code == 200:
-            # Erfolg — normal verarbeiten
             pass
         elif status_code in (429, 503, 502, 504):
             raw_text = f"KI überlastet: HTTP {status_code}"
             logger.warning("KI-API überlastet (HTTP %d): %s", status_code, endpoint)
             return {}, [], raw_text
         elif status_code == 500:
-            raw_text = f"KI-Fehler: HTTP 500"
+            raw_text = "KI-Fehler: HTTP 500"
             logger.error("KI-API interner Fehler (HTTP 500): %s", endpoint)
             return {}, [], raw_text
         else:
@@ -209,14 +226,30 @@ async def extract_invoice_data(
             logger.error("KI-API unerwarteter Status (HTTP %d): %s", status_code, endpoint)
             return {}, [], raw_text
 
-        # ─── Antwort auslesen ────────────────────────────────────────────
+        # ─── Antwort auslesen (format-abhängig) ──────────────────────────
         try:
             response_data = response.json()
-            raw_text = (
-                response_data.get("choices", [{}])[0]
-                .get("message", {})
-                .get("content", "")
-            )
+            if endpoint_type == "lmstudio":
+                # LM Studio: output-Array → erstes Item mit type="message"
+                output_items = response_data.get("output") or []
+                raw_text = next(
+                    (item.get("content", "") for item in output_items if item.get("type") == "message"),
+                    "",
+                )
+                stats = response_data.get("stats") or {}
+                logger.info(
+                    "LM Studio Antwort: %d Input-Token, %d Output-Token, %.1f tok/s",
+                    stats.get("input_tokens", 0),
+                    stats.get("total_output_tokens", 0),
+                    stats.get("tokens_per_second", 0),
+                )
+            else:
+                # OpenAI: choices[0].message.content
+                raw_text = (
+                    response_data.get("choices", [{}])[0]
+                    .get("message", {})
+                    .get("content", "")
+                )
         except Exception as parse_exc:
             raw_text = f"Antwort-Parse-Fehler: {parse_exc}"
             logger.error("Fehler beim Parsen der API-Antwort: %s", parse_exc)
