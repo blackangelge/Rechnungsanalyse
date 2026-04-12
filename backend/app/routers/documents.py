@@ -246,6 +246,7 @@ def _db_analyze_read(doc_id: int, ai_config_id: int) -> dict | None:
             "ai_max_tokens": ai_config.max_tokens,
             "ai_temperature": ai_config.temperature,
             "ai_reasoning": getattr(ai_config, "reasoning", "off") or "off",
+            "ai_endpoint_type": getattr(ai_config, "endpoint_type", "openai") or "openai",
         }
     except Exception as exc:
         logger.exception("Phase 1 DB-Fehler bei Dokument #%d: %s", doc_id, exc)
@@ -405,6 +406,7 @@ async def _analyze_single(
         ai_max_tokens: int = data["ai_max_tokens"]
         ai_temperature: float = data["ai_temperature"]
         ai_reasoning: str = data["ai_reasoning"]
+        ai_endpoint_type: str = data["ai_endpoint_type"]
 
         # ── Phase 2: PDF → Bilder (blockierende IO, kein DB-Handle offen) ────
         logger.info("Rendere PDF für Dokument #%d: %s", doc_id, pdf_path.name)
@@ -437,6 +439,7 @@ async def _analyze_single(
                 self.max_tokens = ai_max_tokens
                 self.temperature = ai_temperature
                 self.reasoning = ai_reasoning
+                self.endpoint_type = ai_endpoint_type
 
         extracted_fields, order_positions, raw_response = await ai_service.extract_invoice_data(
             images_b64=images_b64,
