@@ -11,7 +11,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { AIConfig, aiConfigsApi } from "@/lib/api";
+import { AIConfig, aiConfigsApi, extractApiError } from "@/lib/api";
 import AIConfigForm from "@/components/settings/AIConfigForm";
 
 export default function AISettingsPage() {
@@ -28,8 +28,8 @@ export default function AISettingsPage() {
       setError(null);
       const data = await aiConfigsApi.list();
       setConfigs(data);
-    } catch {
-      setError("Fehler beim Laden der KI-Konfigurationen");
+    } catch (err) {
+      setError(extractApiError(err, "Fehler beim Laden der KI-Konfigurationen"));
     } finally {
       setLoading(false);
     }
@@ -45,8 +45,8 @@ export default function AISettingsPage() {
     try {
       await aiConfigsApi.delete(config.id);
       await load();
-    } catch {
-      alert("Fehler beim Löschen");
+    } catch (err) {
+      alert(extractApiError(err, "Fehler beim Löschen"));
     }
   }
 
@@ -55,8 +55,8 @@ export default function AISettingsPage() {
     try {
       await aiConfigsApi.setDefault(config.id);
       await load();
-    } catch {
-      alert("Fehler beim Setzen des Standards");
+    } catch (err) {
+      alert(extractApiError(err, "Fehler beim Setzen des Standards"));
     }
   }
 

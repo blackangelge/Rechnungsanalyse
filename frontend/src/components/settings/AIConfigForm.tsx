@@ -8,7 +8,7 @@
 "use client";
 
 import { useState } from "react";
-import { AIConfig, AIConfigCreate, aiConfigsApi, ReasoningLevel } from "@/lib/api";
+import { AIConfig, AIConfigCreate, aiConfigsApi, extractApiError, ReasoningLevel } from "@/lib/api";
 
 interface Props {
   /** Vorhandene Konfiguration zum Bearbeiten (undefined = neue Konfiguration) */
@@ -59,8 +59,7 @@ export default function AIConfigForm({ initialData, onSaved, onCancel }: Props) 
       }
       onSaved();
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : "Unbekannter Fehler";
-      setError(`Fehler beim Speichern: ${msg}`);
+      setError(extractApiError(err, "Fehler beim Speichern der KI-Konfiguration"));
     } finally {
       setLoading(false);
     }

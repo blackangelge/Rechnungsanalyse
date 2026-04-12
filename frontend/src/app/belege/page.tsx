@@ -11,6 +11,7 @@ import {
   SystemPrompt,
   aiConfigsApi,
   documentsApi,
+  extractApiError,
   importsApi,
   systemPromptsApi,
 } from "@/lib/api";
@@ -172,7 +173,7 @@ export default function BelegePage() {
       const docs = await documentsApi.list(filters);
       setDocuments(docs);
     } catch (err) {
-      setError("Fehler beim Laden der Belege");
+      setError(extractApiError(err, "Fehler beim Laden der Belege"));
       console.error(err);
     } finally {
       setLoading(false);
@@ -285,8 +286,7 @@ export default function BelegePage() {
       setSelectedIds(new Set());
       await loadDocuments(activeFilters);
     } catch (err: unknown) {
-      const msg = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail ?? "Fehler beim Starten der KI-Analyse";
-      setError(msg);
+      setError(extractApiError(err, "Fehler beim Starten der KI-Analyse"));
     } finally {
       setAnalyzing(false);
     }
@@ -301,7 +301,7 @@ export default function BelegePage() {
       setSelectedIds((prev) => { const next = new Set(prev); next.delete(docId); return next; });
       await loadDocuments(activeFilters);
     } catch (err) {
-      setError("Fehler beim Löschen des Belegs");
+      setError(extractApiError(err, "Fehler beim Löschen des Belegs"));
       console.error(err);
     }
   }
@@ -311,7 +311,7 @@ export default function BelegePage() {
       await documentsApi.restore(docId);
       await loadDocuments(activeFilters);
     } catch (err) {
-      setError("Fehler beim Wiederherstellen des Belegs");
+      setError(extractApiError(err, "Fehler beim Wiederherstellen des Belegs"));
       console.error(err);
     }
   }

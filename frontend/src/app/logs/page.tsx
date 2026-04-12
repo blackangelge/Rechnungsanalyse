@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { SystemLog, logsApi } from "@/lib/api";
+import { SystemLog, logsApi, extractApiError } from "@/lib/api";
 
 // ─── Hilfsfunktionen ────────────────────────────────────────────────────────
 
@@ -38,10 +38,12 @@ function CategoryBadge({ category }: { category: string }) {
   const styles: Record<string, string> = {
     import: "bg-purple-100 text-purple-700",
     ki: "bg-green-100 text-green-700",
+    system: "bg-gray-200 text-gray-700",
   };
   const labels: Record<string, string> = {
     import: "Import",
     ki: "KI-Abfrage",
+    system: "System",
   };
   return (
     <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ${styles[category] ?? "bg-gray-100 text-gray-600"}`}>
@@ -80,7 +82,7 @@ export default function LogsPage() {
       const data = await logsApi.list(params);
       setLogs(data);
     } catch (err) {
-      setError("Fehler beim Laden der Logs");
+      setError(extractApiError(err, "Fehler beim Laden der Logs"));
       console.error(err);
     } finally {
       setLoading(false);
@@ -131,7 +133,7 @@ export default function LogsPage() {
       await loadLogs(filterCategory, filterLevel);
       setError(null);
     } catch (err) {
-      setError("Fehler beim Löschen der Logs");
+      setError(extractApiError(err, "Fehler beim Löschen der Logs"));
       console.error(err);
     } finally {
       setClearing(false);
@@ -173,6 +175,7 @@ export default function LogsPage() {
             <option value="">Alle</option>
             <option value="import">Import</option>
             <option value="ki">KI-Abfragen</option>
+            <option value="system">System</option>
           </select>
         </div>
 

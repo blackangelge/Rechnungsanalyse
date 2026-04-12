@@ -37,6 +37,28 @@ apiClient.defaults.paramsSerializer = (params) => {
   return parts.join("&");
 };
 
+/**
+ * Extrahiert eine lesbare Fehlermeldung aus einem Axios-Fehler.
+ * Liest bevorzugt das `detail`-Feld aus der FastAPI-Antwort.
+ */
+export function extractApiError(err: unknown, fallback = "Unbekannter Fehler"): string {
+  if (err && typeof err === "object") {
+    const e = err as {
+      response?: { data?: { detail?: unknown }; status?: number };
+      message?: string;
+    };
+    const detail = e.response?.data?.detail;
+    if (typeof detail === "string" && detail) return detail;
+    if (detail && typeof detail === "object") return JSON.stringify(detail);
+    const status = e.response?.status;
+    if (status === 0 || e.message === "Network Error")
+      return "Backend nicht erreichbar — bitte Container-Status prüfen";
+    if (status) return `HTTP ${status}: ${fallback}`;
+    if (e.message) return e.message;
+  }
+  return fallback;
+}
+
 // ─── Typen: Items (Platzhalter-CRUD) ─────────────────────────────────────────
 
 export interface Item {
