@@ -33,6 +33,15 @@ class ImportBatchCreate(BaseModel):
     # ID der KI-Konfiguration (None = Standard-Konfiguration verwenden)
     ai_config_id: int | None = None
 
+    # ID des Systemprompts für die KI-Analyse (None = Standard-Prompt verwenden)
+    system_prompt_id: int | None = None
+
+    # Nach Abschluss des Imports direkt KI-Analyse starten
+    analyze_after_import: bool = False
+
+    # Quelldateien aus dem Import-Ordner löschen, nachdem sie erfolgreich kopiert wurden
+    delete_source_files: bool = False
+
 
 class ImportBatchRead(BaseModel):
     """Vollständige Antwort eines Import-Batches."""

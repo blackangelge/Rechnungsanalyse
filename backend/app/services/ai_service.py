@@ -35,33 +35,65 @@ Nicht gefundene Werte setzt du auf null.
 
 JSON-Struktur:
 {
-  "supplier_name": "Vollständige Firma des Lieferanten",
-  "supplier_address": "Vollständige Anschrift",
-  "hrb_number": "HRB-Nummer",
-  "tax_number": "Steuernummer",
-  "vat_id": "USt-IdNr.",
-  "bank_name": "Name der Bank",
-  "iban": "IBAN",
-  "bic": "BIC",
-  "customer_number": "Kundennummer",
-  "invoice_number": "Rechnungsnummer",
-  "invoice_date": "YYYY-MM-DD",
-  "due_date": "YYYY-MM-DD",
-  "total_amount": 0.00,
-  "discount_amount": 0.00,
-  "cash_discount_amount": 0.00,
-  "payment_terms": "Zahlungsbedingungen als Text",
-  "order_positions": [
-    {
-      "product_description": "Artikelbezeichnung",
-      "article_number": "Artikelnummer",
-      "quantity": 1.0,
-      "unit": "Stück",
-      "unit_price": 0.00,
-      "total_price": 0.00,
-      "discount": "Preisnachlass pro Position"
+  "lieferant": {
+    "name": "Vollständige Bezeichnung des Lieferanten",
+    "anschrift": {
+      "strasse": "Straße und Hausnummer",
+      "plz": "PLZ",
+      "ort": "Ort",
+      "land": "Land (falls angegeben)"
+    },
+    "hrb_nummer": "HRB-Nummer des Handelsregisters",
+    "steuernummer": "Steuernummer des Lieferanten",
+    "ust_id_nr": "USt-IdNr. des Lieferanten",
+    "bankverbindung": {
+      "bank_name": "Name der Bank",
+      "iban": "IBAN-Nummer",
+      "bic": "BIC-Nummer"
     }
-  ]
+  },
+  "rechnungsdaten": {
+    "rechnungsnummer": "Rechnungsnummer",
+    "rechnungsdatum": "YYYY-MM-DD",
+    "faelligkeit": "YYYY-MM-DD",
+    "kundennummer": "Kundennummer des Rechnungsempfängers"
+  },
+  "positionen": [
+    {
+      "position_nr": 1,
+      "artikelbezeichnung": "Vollständige Produkt-/Artikelbezeichnung",
+      "artikelnummer_lieferant": "Artikelnummer des Lieferanten",
+      "menge": 0,
+      "mengeneinheit": "Stück/kg/Liter/Palette/etc.",
+      "einzelpreis": 0.00,
+      "gesamtpreis": 0.00,
+      "waehrung": "EUR",
+      "steuersatz": 19.0,
+      "preisnachlass": {
+        "betrag": 0.00,
+        "prozent": null,
+        "bezeichnung": "Art des Nachlasses, z.B. Rabatt, Mengenrabatt"
+      }
+    }
+  ],
+  "zahlungsinformationen": {
+    "gesamtbetrag_netto": 0.00,
+    "umsatzsteuer_zusammenfassung": [
+      {
+        "steuersatz": 19.0,
+        "nettobetrag": 0.00,
+        "steuerbetrag": 0.00
+      }
+    ],
+    "gesamtbetrag_brutto": 0.00,
+    "waehrung": "EUR",
+    "skonto": {
+      "prozent": null,
+      "betrag": null,
+      "frist_tage": null
+    },
+    "zahlungsbedingungen": "Freitextfeld mit den vollständigen Zahlungsbedingungen"
+  }
 }"""
 
 # Timeout für einen einzelnen KI-API-Aufruf in Sekunden.
@@ -117,7 +149,8 @@ async def extract_invoice_data(
             "type": "image_url",
             "image_url": {
                 "url": data_url,
-                "detail": "high",
+                # "detail" weglassen — LM Studio und viele lokale APIs ignorieren
+                # oder lehnen diesen Parameter ab, was zu Channel-Warnungen führt.
             },
         })
         logger.debug("  Seite %d/%d in Anfrage eingebettet", idx + 1, len(images_b64))
@@ -131,6 +164,7 @@ async def extract_invoice_data(
         "model": config.model_name,
         "max_tokens": config.max_tokens,
         "temperature": config.temperature,
+        "stream": False,  # Explizit deaktivieren — LM Studio löst sonst Channel-Warnungen aus
         "messages": [
             {"role": "system", "content": active_system_prompt},
             {"role": "user", "content": content_parts},
@@ -200,15 +234,21 @@ async def extract_invoice_data(
         logger.error("JSON-Parse-Fehler: %s", exc)
         return {}, [], raw_text
 
-    # Bestellpositionen aus dem Ergebnis herauslösen
-    order_positions: list[dict] = parsed.pop("order_positions", []) or []
+    # Währungswerte normalisieren: Dezimalkomma → Dezimalpunkt (79,99 → 79.99)
+    parsed = _normalize_decimal_commas(parsed)
+    raw_text = json.dumps(parsed, ensure_ascii=False, indent=2)
 
-    # Felder bereinigen
+    # Neues verschachteltes Format vs. altes flaches Format erkennen
     try:
-        extracted_fields = _clean_fields(parsed)
+        if "lieferant" in parsed or "rechnungsdaten" in parsed or "zahlungsinformationen" in parsed:
+            extracted_fields, order_positions = _map_new_format(parsed)
+        else:
+            # Altes flaches Format (Rückwärtskompatibilität)
+            order_positions: list[dict] = parsed.pop("order_positions", []) or []
+            extracted_fields = _clean_flat_fields(parsed)
     except Exception as exc:
-        logger.error("Fehler beim Bereinigen der Felder: %s", exc)
-        extracted_fields = {}
+        logger.error("Fehler beim Verarbeiten der Felder: %s", exc)
+        extracted_fields, order_positions = {}, []
 
     logger.info(
         "Extraktion erfolgreich: %d Felder, %d Positionen",
@@ -217,6 +257,36 @@ async def extract_invoice_data(
     )
 
     return extracted_fields, order_positions, raw_text
+
+
+def _normalize_decimal_commas(obj):
+    """
+    Normalisiert Dezimalkommas in Zahlenwerten rekursiv im gesamten geparsten JSON.
+
+    Wandelt Strings wie "79,99" → 79.99, "1.234,56" → 1234.56,
+    und auch "719,99 €" / "€ 719,99" → 719.99 um (Währungssymbol wird ignoriert).
+    Freitexte wie "Musterstraße 1, Ort" bleiben unberührt.
+    """
+    if isinstance(obj, dict):
+        return {k: _normalize_decimal_commas(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_normalize_decimal_commas(item) for item in obj]
+    if isinstance(obj, str):
+        s = obj.strip()
+        # Währungssymbole und Leerzeichen entfernen (€, $, £, ¥)
+        cleaned = re.sub(r'[€$£¥\s]', '', s)
+        # Muster: optional Tausender-Trennpunkte, dann Komma + 1–2 Dezimalstellen
+        # Beispiele: "79,99" | "1.234,56" | "719,99 €" (nach Bereinigung)
+        # Kein Match: "Muster,Text" | "Straße 1, Ort"
+        if _DECIMAL_COMMA_RE.match(cleaned):
+            try:
+                return float(cleaned.replace(".", "").replace(",", "."))
+            except ValueError:
+                pass
+    return obj
+
+
+_DECIMAL_COMMA_RE = re.compile(r'^\d{1,3}(?:\.\d{3})*,\d{1,2}$')
 
 
 def _parse_json_response(raw_text: str) -> dict:
@@ -255,37 +325,145 @@ def _parse_json_response(raw_text: str) -> dict:
     return {}
 
 
-def _clean_fields(data: dict) -> dict:
+def _str(val) -> str | None:
+    """Gibt None zurück bei leeren Strings, sonst den getrimmten Wert."""
+    if val is None:
+        return None
+    s = str(val).strip()
+    return s if s else None
+
+
+def _date(val) -> str | None:
     """
-    Bereinigt die extrahierten Felder:
+    Normalisiert ein Datum auf ISO-Format (YYYY-MM-DD) oder gibt None zurück.
+    Akzeptiert: "2024-01-15", "15.01.2024", "01/15/2024".
+    Unbekannte Formate → None (verhindert DB-Fehler durch ungültige Strings).
+    """
+    s = _str(val)
+    if s is None:
+        return None
+    # Bereits ISO
+    if re.match(r'^\d{4}-\d{2}-\d{2}$', s):
+        return s
+    # Deutsches Format DD.MM.YYYY
+    m = re.match(r'^(\d{1,2})\.(\d{1,2})\.(\d{4})$', s)
+    if m:
+        return f"{m.group(3)}-{m.group(2).zfill(2)}-{m.group(1).zfill(2)}"
+    # US-Format MM/DD/YYYY
+    m = re.match(r'^(\d{1,2})/(\d{1,2})/(\d{4})$', s)
+    if m:
+        return f"{m.group(3)}-{m.group(1).zfill(2)}-{m.group(2).zfill(2)}"
+    logger.warning("Unbekanntes Datumsformat ignoriert: '%s'", s)
+    return None
+
+
+def _num(val) -> float | None:
+    """Konvertiert einen Wert in float, normalisiert europäische Formate."""
+    if val is None:
+        return None
+    if isinstance(val, (int, float)):
+        return float(val)
+    s = str(val).strip().replace(" ", "")
+    # Europäisches Format: "1.234,56" → "1234.56"
+    if "," in s and "." in s:
+        s = s.replace(".", "").replace(",", ".")
+    elif "," in s:
+        s = s.replace(",", ".")
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def _map_new_format(data: dict) -> tuple[dict, list[dict]]:
+    """
+    Mappt das neue verschachtelte KI-JSON-Format auf die flachen DB-Felder.
+    Gibt (extracted_fields, order_positions) zurück.
+    """
+    lieferant = data.get("lieferant") or {}
+    anschrift = lieferant.get("anschrift") or {}
+    bank = lieferant.get("bankverbindung") or {}
+    rechnung = data.get("rechnungsdaten") or {}
+    zahlung = data.get("zahlungsinformationen") or {}
+    skonto = zahlung.get("skonto") or {}
+
+    # Anschrift zusammensetzen
+    adress_parts = [
+        _str(anschrift.get("strasse")),
+        " ".join(filter(None, [_str(anschrift.get("plz")), _str(anschrift.get("ort"))])) or None,
+        _str(anschrift.get("land")),
+    ]
+    supplier_address = "\n".join(p for p in adress_parts if p) or None
+
+    extracted_fields = {
+        "supplier_name":      _str(lieferant.get("name")),
+        "supplier_address":   supplier_address,
+        "hrb_number":         _str(lieferant.get("hrb_nummer")),
+        "tax_number":         _str(lieferant.get("steuernummer")),
+        "vat_id":             _str(lieferant.get("ust_id_nr")),
+        "bank_name":          _str(bank.get("bank_name")),
+        "iban":               _str(bank.get("iban")),
+        "bic":                _str(bank.get("bic")),
+        "customer_number":    _str(rechnung.get("kundennummer")),
+        "invoice_number":     _str(rechnung.get("rechnungsnummer")),
+        "invoice_date":       _date(rechnung.get("rechnungsdatum")),
+        "due_date":           _date(rechnung.get("faelligkeit")),
+        "total_amount":       _num(zahlung.get("gesamtbetrag_brutto")),
+        "discount_amount":    None,  # nicht im neuen Format vorhanden
+        "cash_discount_amount": _num(skonto.get("betrag")),
+        "payment_terms":      _str(zahlung.get("zahlungsbedingungen")),
+    }
+
+    # Positionen mappen
+    order_positions = []
+    for pos in (data.get("positionen") or []):
+        nachlass = pos.get("preisnachlass") or {}
+        # Preisnachlass als lesbaren String zusammenfassen
+        discount_parts = []
+        if nachlass.get("betrag") is not None:
+            discount_parts.append(f"{nachlass['betrag']} {pos.get('waehrung', 'EUR')}")
+        if nachlass.get("prozent") is not None:
+            discount_parts.append(f"{nachlass['prozent']}%")
+        if nachlass.get("bezeichnung"):
+            discount_parts.append(str(nachlass["bezeichnung"]))
+        discount_str = " / ".join(discount_parts) if discount_parts else None
+
+        order_positions.append({
+            "product_description": _str(pos.get("artikelbezeichnung")),
+            "article_number":      _str(pos.get("artikelnummer_lieferant")),
+            "quantity":            _num(pos.get("menge")),
+            "unit":                _str(pos.get("mengeneinheit")),
+            "unit_price":          _num(pos.get("einzelpreis")),
+            "total_price":         _num(pos.get("gesamtpreis")),
+            "discount":            discount_str,
+        })
+
+    return extracted_fields, order_positions
+
+
+def _clean_flat_fields(data: dict) -> dict:
+    """
+    Bereinigt das alte flache KI-Format (Rückwärtskompatibilität).
     - Leere Strings → None
     - Zahlenfelder: Kommas durch Punkte ersetzen
-    - Nur bekannte Felder durchlassen (kein Datenmüll in die DB)
+    - Datumsfelder: auf ISO-Format normalisieren
+    - Nur bekannte Felder durchlassen
     """
-    # Erlaubte Felder für invoice_extractions (ohne order_positions)
     allowed_fields = {
         "supplier_name", "supplier_address", "hrb_number", "tax_number",
         "vat_id", "bank_name", "iban", "bic", "customer_number",
         "invoice_number", "invoice_date", "due_date", "total_amount",
         "discount_amount", "cash_discount_amount", "payment_terms",
     }
-
+    date_fields = {"invoice_date", "due_date"}
     cleaned = {}
     for key in allowed_fields:
         value = data.get(key)
-
-        # Leere Strings als None behandeln
         if isinstance(value, str) and not value.strip():
             value = None
-
-        # Europäische Zahlenformate normalisieren ("1.234,56" → "1234.56")
-        if isinstance(value, str) and key.endswith(("_amount",)):
-            value = value.replace(".", "").replace(",", ".")
-            try:
-                value = float(value)
-            except ValueError:
-                value = None
-
+        elif key in date_fields:
+            value = _date(value)
+        elif isinstance(value, str) and key.endswith(("_amount",)):
+            value = _num(value)
         cleaned[key] = value
-
     return cleaned

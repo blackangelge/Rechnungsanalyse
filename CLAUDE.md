@@ -48,8 +48,10 @@ app/
 │   ├── supplier.py         # Lieferanten-Stammdaten (Deduplication)
 │   └── system_prompt.py    # Systemprompts für KI-Extraktion
 ├── schemas/                # Pydantic-Schemas (Request/Response)
-│   └── document.py         # DocumentRead, DocumentListRead (+Extraktion-Summary),
-│                           #   DocumentDetail, DocumentCommentUpdate
+│   ├── document.py         # DocumentRead, DocumentListRead (+Extraktion-Summary),
+│   │                       #   DocumentDetail, DocumentCommentUpdate
+│   └── import_batch.py     # ImportBatchCreate (inkl. analyze_after_import,
+│                           #   system_prompt_id, delete_source_files)
 ├── crud/                   # Datenbankoperationen (je Modell eine Datei)
 │   ├── document.py         # get_all_filtered mit joinedload(extraction)
 │   ├── import_batch.py
@@ -57,7 +59,9 @@ app/
 │   └── system_prompt.py
 ├── routers/                # API-Endpunkte
 │   ├── imports.py          # GET/POST /api/imports, DELETE löscht auch Dateien
+│   │                       # _import_then_analyze, _delete_source_files
 │   ├── documents.py        # GET /api/documents, POST /analyze, GET/{id}, preview, comment
+│   │                       # _KI_IO_EXECUTOR, _analyze_single (phasenbasiert)
 │   ├── ai_configs.py       # CRUD /api/ai-configs, POST set-default
 │   ├── settings.py         # GET/PUT /api/settings/image-conversion
 │   │                       # GET /api/settings/paths
@@ -67,6 +71,7 @@ app/
 └── services/
     ├── import_service.py   # Import-Orchestrierung, parallel (Semaphore 4), kein KI
     ├── ai_service.py       # KI-Extraktion via OpenAI-kompatibler Vision-API
+    │                       # Neues verschachteltes JSON-Format + Normalisierung
     └── pdf_service.py      # PDF → Bilder (pypdfium2), Seitenanzahl (pypdf)
 alembic/
 └── versions/
@@ -82,8 +87,24 @@ alembic/
 3. Alle `.pdf`/`.PDF` im Import-Ordner werden gefunden
 4. Speicherziel: `STORAGE_PATH/{Firma}_{Jahr}/{id}.pdf`
 5. Pro PDF parallel (max. 4): DB-Datensatz anlegen → kopieren → Seitenanzahl erfassen
-6. **Kein KI beim Import** — KI-Analyse wird separat über die Belege-Seite gestartet
-7. Fortschritt wird via SSE an das Frontend gestreamt
+6. Fortschritt wird via SSE an das Frontend gestreamt
+7. Optional nach Import: Quelldateien löschen und/oder KI-Analyse starten
+
+### Import-Optionen (`ImportBatchCreate`)
+
+| Feld | Typ | Beschreibung |
+|---|---|---|
+| `analyze_after_import` | `bool` | KI-Analyse direkt nach Import starten |
+| `ai_config_id` | `int\|None` | Spezifische KI-Konfiguration (None = Standard) |
+| `system_prompt_id` | `int\|None` | Spezifischer Systemprompt (None = Standard) |
+| `delete_source_files` | `bool` | Original-PDFs aus Import-Ordner löschen nach erfolgreichem Kopieren |
+
+**Task-Pfade in `imports.py`:**
+- `analyze_after_import=True` → `_import_then_analyze(batch_id, import_folder, ai_config_id, system_prompt_id, delete_source_files)`
+- `analyze_after_import=False, delete_source_files=True` → `_import_and_delete(batch_id, import_folder)`
+- Sonst → `run_import(batch_id)`
+
+`_delete_source_files()` löscht nur Dateien, für die ein DB-Eintrag mit `stored_filename` existiert (kein Blind-Delete).
 
 ### Import löschen
 
@@ -92,16 +113,78 @@ alembic/
 - Leere Unterordner werden ebenfalls entfernt
 - DB-Einträge (Batch → Dokumente → Extraktionen → Positionen via CASCADE)
 
-### KI-Extraktion
+### KI-Extraktion (`services/ai_service.py`)
 
 - Unterstützt jede OpenAI-kompatible Vision-API (LM Studio, Ollama, OpenAI, etc.)
 - Endpunkt: `{api_url}/chat/completions`
 - Alle PDF-Seiten werden in **einer** Anfrage gesendet (als `image_url`-Parts)
+- **Kein `"detail": "high"`** in image_url → LM-Studio-Kompatibilität
+- **`"stream": False`** explizit gesetzt → verhindert channelId-Warnungen in LM Studio
 - System-Prompt: aus DB (Standard-Prompt) oder explizit per `system_prompt_id`
-- Antwort: JSON mit Rechnungsfeldern + `order_positions`-Array
-- JSON-Parse-Fallbacks: direkt → Markdown-Codeblock → `{...}`-Suche
 - **Niemals `raise_for_status()`** — alle HTTP-Fehler (429/503/500/Timeout/Netzwerk)
   werden als `({}, [], "KI-Fehler: ...")` zurückgegeben, nie als Exception
+
+#### Verschachteltes KI-JSON-Format (neu)
+
+Die KI soll Daten in diesem verschachtelten Format zurückgeben:
+
+```json
+{
+  "lieferant": {
+    "name": "...",
+    "adresse": "...",
+    "steuernummer": "...",
+    "ustid": "...",
+    "hrb": "...",
+    "bankverbindung": { "bank": "...", "iban": "...", "bic": "..." }
+  },
+  "rechnungsdaten": {
+    "rechnungsnummer": "...",
+    "rechnungsdatum": "...",
+    "lieferdatum": "..."
+  },
+  "positionen": [
+    { "bezeichnung": "...", "menge": 1, "einheit": "...", "einzelpreis": 0.0, "gesamtpreis": 0.0, "steuersatz": 19.0 }
+  ],
+  "zahlungsinformationen": {
+    "nettobetrag": 0.0,
+    "steuerbetrag": 0.0,
+    "gesamtbetrag_brutto": 0.0,
+    "waehrung": "EUR",
+    "faelligkeitsdatum": "...",
+    "zahlungsziel_tage": 0,
+    "skonto_prozent": 0.0
+  }
+}
+```
+
+**Auto-Detection:** Enthält das geparste JSON `lieferant`, `rechnungsdaten` oder `zahlungsinformationen` → neues Format (`_map_new_format()`). Sonst → altes flaches Format (`_clean_flat_fields()`).
+
+#### Normalisierung-Hilfsfunktionen
+
+| Funktion | Beschreibung |
+|---|---|
+| `_normalize_decimal_commas(obj)` | Rekursiv: `"1.234,56 €"` → `1234.56`, `"719,99"` → `719.99` — strips `€$£¥` vorher |
+| `_date(val)` | `"25.03.2025"` / `"2025-03-25"` / `"03/25/2025"` → `"2025-03-25"` (ISO); unbekanntes Format → `None` (verhindert DB-Fehler) |
+| `_num(val)` | String oder Zahl → `float\|None` |
+| `_str(val)` | Beliebig → `str\|None` |
+
+### KI-Analyse: Phasenbasierter Ansatz (`routers/documents.py`)
+
+**Problem:** Wenn `_analyze_single` die DB-Session während PDF-Rendering + KI-API-Aufruf (Minuten) offen hält, sättigt das den gemeinsamen uvicorn-Thread-Pool → GET-Endpunkte (Dokumente, Imports) timeoutten.
+
+**Lösung:** Dedizierter `_KI_IO_EXECUTOR` (ThreadPoolExecutor, Prefix `ki_pdf`) + phasenbasierter Ablauf:
+
+| Phase | Inhalt | DB-Session |
+|---|---|---|
+| 1 | Alle Daten aus DB lesen, in lokale Variablen kopieren | offen → sofort schließen |
+| 2 | PDF → Bilder via `_run_ki_io()` (blockierendes IO) | geschlossen |
+| 3 | KI-API-Aufruf via async httpx | geschlossen |
+| 4 | Ergebnisse in DB schreiben (neue Session) | offen → schließen |
+
+`_set_error(doc_id, message)` — Hilfsfunktion, öffnet eigene Session nur zum Setzen des Fehlerstatus.
+
+**Fehlerbehandlung:** Bei fehlgeschlagenem DB-Commit (z.B. ungültiges Datum) → `db.rollback()` + erneuter Versuch; bei erneutem Fehler → `_set_error()` mit frischer Session.
 
 ### Lieferanten-Deduplication (`crud/supplier.py`)
 
@@ -149,6 +232,7 @@ src/
 │   ├── page.tsx                        # Redirect zu /dashboard
 │   ├── dashboard/page.tsx              # Übersicht aller Import-Batches
 │   ├── belege/page.tsx                 # Alle Dokumente, Filter, KI-Analyse starten
+│   │                                   # KI-Rohdaten-Ansicht + Infos-Ansicht (50/50)
 │   ├── imports/
 │   │   ├── new/page.tsx                # Neuen Import starten
 │   │   └── [id]/page.tsx               # Import-Detail mit Dokumentenliste + PDF-Vorschau
@@ -162,6 +246,8 @@ src/
 │   ├── dashboard/BatchTable.tsx
 │   ├── dashboard/FilterBar.tsx
 │   ├── imports/ImportForm.tsx          # Firma + Jahr + Pfad-Vorschau (aus API)
+│   │                                   # Optionen: Quelldateien löschen,
+│   │                                   #   KI-Analyse nach Import (mit KI-Config + Prompt)
 │   ├── imports/DocumentsTable.tsx
 │   ├── imports/ProgressPanel.tsx       # SSE + initialTotal/initialProcessed Fallback
 │   ├── imports/DebugWindow.tsx
@@ -205,6 +291,45 @@ Exports:
 - Betrag/Rechnungsnr./Lieferant kommen direkt aus `DocumentItem` (Backend liefert Extraktion-Summary mit)
 - Aktionsleiste bei Auswahl: KI-Konfiguration + Systemprompt wählen → „KI-Analyse starten"
 - Auto-Refresh alle 5 s solange Dokumente mit Status `processing` vorhanden
+
+#### Aktions-Buttons pro Dokument
+
+| Button | Bedingung | Funktion |
+|---|---|---|
+| **KI** (violett) | Status `done` oder `error` | Zeigt KI-Rohantwort als JSON im Modal-Overlay |
+| **Infos** (smaragd) | Status `done` | Wechselt in Infos-Ansicht (50/50 Split) |
+
+#### Infos-Ansicht
+
+- Tabelle verschwindet, wird durch 50/50-Split ersetzt: **Infos links, PDF-iframe rechts**
+- Navigationsleiste oben: `← Zur Liste` | `Beleg N / M` | `← Vorherige` | `Nächste →`
+- Navigation scrollt automatisch zum Inhalt
+- Abschnitte: Lieferant, Bankverbindung, Rechnungsdaten, Zahlungsinformationen, USt-Zusammenfassung, Positionen
+- Liest verschachteltes KI-JSON aus `raw_response`; fällt auf flache Extraktionsfelder zurück
+
+#### `fmt()` Währungsformatierung
+
+Behandelt sowohl `number` als auch Strings wie `"719,99 €"`:
+- Strips `€$£¥` und Leerzeichen
+- Normalisiert `"1.234,56"` → `1234.56`
+- Gibt `null` zurück für leere Werte, Original-String bei Parse-Fehler
+
+### Neuer Import (`components/imports/ImportForm.tsx`)
+
+**Import-Optionen:**
+
+| Option | Typ | Beschreibung |
+|---|---|---|
+| Quelldateien löschen | Checkbox (orange) | Original-PDFs aus Import-Ordner löschen nach erfolgreichem Kopieren |
+| Dokumente an KI senden | Checkbox (blau) | KI-Analyse nach Import automatisch starten |
+| ↳ KI-Konfiguration | Dropdown | Nur sichtbar wenn KI aktiv; Standard vorgewählt |
+| ↳ Systemprompt | Dropdown | Nur sichtbar wenn KI aktiv; Standard-Prompt vorgewählt |
+
+### Bekannte Fallstricke
+
+- **Infinite render loop in `useCallback`**: Nie State-Variablen in Dependency-Array aufnehmen, die innerhalb des Callbacks gesetzt werden. Stattdessen `useRef` verwenden (z.B. `batchLoadedRef` in `/imports/[id]/page.tsx`).
+- **LM Studio `channelId`-Warnung**: Entsteht durch `"detail": "high"` in image_url oder fehlendes `"stream": false`. Beides in `ai_service.py` korrekt gesetzt.
+- **Dokument bleibt auf „Wird verarbeitet"**: Kann durch fehlgeschlagenen DB-Commit entstehen (z.B. Datum im falschen Format von KI). `_date()` in `ai_service.py` normalisiert alle bekannten Formate → `None` bei unbekanntem Format, verhindert Commit-Fehler.
 
 ### Wichtige Abhängigkeiten
 
