@@ -116,15 +116,15 @@ export default function AIConfigForm({ initialData, onSaved, onCancel }: Props) 
         </label>
         <input
           className="input"
-          placeholder={endpointType === "lmstudio" ? "http://localhost:1234/api/v1" : "http://localhost:1234/v1"}
+          placeholder="http://192.168.178.170:1234"
           value={apiUrl}
           onChange={(e) => setApiUrl(e.target.value)}
           required
         />
         <p className="mt-1 text-xs text-gray-400">
           {endpointType === "lmstudio"
-            ? "Basis-URL für LM Studio REST API (ohne /chat)"
-            : "Basis-URL für OpenAI-kompatible API (ohne /chat/completions)"}
+            ? <>Nur Host + Port — Pfad wird automatisch ergänzt: <span className="font-mono">/api/v1/chat</span></>
+            : <>Nur Host + Port — Pfad wird automatisch ergänzt: <span className="font-mono">/v1/chat/completions</span></>}
         </p>
       </div>
 

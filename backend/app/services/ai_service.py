@@ -179,9 +179,9 @@ async def extract_invoice_data(
     endpoint_type = getattr(config, "endpoint_type", "openai") or "openai"
     base = config.api_url.rstrip("/")
     if endpoint_type == "lmstudio":
-        endpoint = base + "/chat"
+        endpoint = base + "/api/v1/chat"
     else:
-        endpoint = base + "/chat/completions"
+        endpoint = base + "/v1/chat/completions"
     logger.debug("Sende Anfrage an: %s", endpoint)
 
     raw_text = ""
