@@ -50,6 +50,9 @@ class AIConfig(Base):
     # Wird als reasoning_effort an OpenAI-kompatible APIs übergeben (sofern != "off")
     reasoning: Mapped[str] = mapped_column(String(20), default="off", server_default="off", nullable=False)
 
+    # API-Endpunkt-Typ: "openai" = POST /chat/completions, "lmstudio" = POST /api/v1/chat
+    endpoint_type: Mapped[str] = mapped_column(String(20), default="openai", server_default="openai", nullable=False)
+
     # Erstellungs- und Änderungszeitpunkt
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False

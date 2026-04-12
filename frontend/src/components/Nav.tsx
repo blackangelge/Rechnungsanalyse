@@ -20,10 +20,12 @@ const NAV_LINKS = [
   { href: "/dashboard", label: "Dashboard" },
   { href: "/belege", label: "Belege" },
   { href: "/imports/new", label: "Neuer Import" },
+  { href: "/lieferanten", label: "Lieferanten" },
   { href: "/settings/ai", label: "KI-Einstellungen" },
   { href: "/settings/prompts", label: "Systemprompts" },
   { href: "/settings/image", label: "Bildeinstellungen" },
   { href: "/settings/processing", label: "Einstellungen" },
+  { href: "/settings/backup", label: "Backup / Restore" },
   { href: "/logs", label: "Logs" },
 ];
 

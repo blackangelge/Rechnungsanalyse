@@ -23,7 +23,12 @@ class Supplier(Base):
     # Vollständige Firma / Bezeichnung
     name: Mapped[str] = mapped_column(String(255), nullable=False)
 
-    # Anschrift (mehrzeilig möglich)
+    # Strukturierte Anschrift
+    street: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    zip_code: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    city: Mapped[str | None] = mapped_column(String(255), nullable=True)
+
+    # Anschrift (kombiniert, für Rückwärtskompatibilität)
     address: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     # Handelsregisternummer (z.B. "HRB 12345")

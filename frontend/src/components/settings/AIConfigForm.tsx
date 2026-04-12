@@ -8,7 +8,7 @@
 "use client";
 
 import { useState } from "react";
-import { AIConfig, AIConfigCreate, aiConfigsApi, extractApiError, ReasoningLevel } from "@/lib/api";
+import { AIConfig, AIConfigCreate, aiConfigsApi, extractApiError, EndpointType, ReasoningLevel } from "@/lib/api";
 
 interface Props {
   /** Vorhandene Konfiguration zum Bearbeiten (undefined = neue Konfiguration) */
@@ -29,6 +29,7 @@ export default function AIConfigForm({ initialData, onSaved, onCancel }: Props) 
   const [maxTokens, setMaxTokens] = useState(initialData?.max_tokens ?? 2048);
   const [temperature, setTemperature] = useState(initialData?.temperature ?? 0.1);
   const [reasoning, setReasoning] = useState<ReasoningLevel>(initialData?.reasoning ?? "off");
+  const [endpointType, setEndpointType] = useState<EndpointType>(initialData?.endpoint_type ?? "openai");
 
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -47,6 +48,7 @@ export default function AIConfigForm({ initialData, onSaved, onCancel }: Props) 
       max_tokens: maxTokens,
       temperature,
       reasoning,
+      endpoint_type: endpointType,
     };
 
     try {
@@ -92,6 +94,21 @@ export default function AIConfigForm({ initialData, onSaved, onCancel }: Props) 
         />
       </div>
 
+      {/* Endpunkt-Typ */}
+      <div>
+        <label className="mb-1 block text-sm font-medium text-gray-700">
+          API-Endpunkt-Typ <span className="text-red-500">*</span>
+        </label>
+        <select
+          value={endpointType}
+          onChange={(e) => setEndpointType(e.target.value as EndpointType)}
+          className="rounded border border-gray-300 bg-white px-3 py-2 text-sm focus:border-blue-500 focus:outline-none w-full"
+        >
+          <option value="openai">OpenAI-kompatible API — POST /v1/chat/completions</option>
+          <option value="lmstudio">LM Studio REST API — POST /api/v1/chat (unterstützt reasoning)</option>
+        </select>
+      </div>
+
       {/* API-URL */}
       <div>
         <label className="mb-1 block text-sm font-medium text-gray-700">
@@ -99,13 +116,15 @@ export default function AIConfigForm({ initialData, onSaved, onCancel }: Props) 
         </label>
         <input
           className="input"
-          placeholder="http://localhost:1234/v1"
+          placeholder={endpointType === "lmstudio" ? "http://localhost:1234/api/v1" : "http://localhost:1234/v1"}
           value={apiUrl}
           onChange={(e) => setApiUrl(e.target.value)}
           required
         />
         <p className="mt-1 text-xs text-gray-400">
-          Basis-URL ohne /chat/completions (OpenAI-kompatibel)
+          {endpointType === "lmstudio"
+            ? "Basis-URL für LM Studio REST API (ohne /chat)"
+            : "Basis-URL für OpenAI-kompatible API (ohne /chat/completions)"}
         </p>
       </div>
 
@@ -185,7 +204,7 @@ export default function AIConfigForm({ initialData, onSaved, onCancel }: Props) 
           <option value="on">on — maximal</option>
         </select>
         <p className="mt-1 text-xs text-gray-400">
-          Wird als <span className="font-mono">reasoning_effort</span> an die API übergeben. Nur von bestimmten Modellen unterstützt.
+          Wird als <span className="font-mono">reasoning</span> an die API übergeben. Nur von bestimmten Modellen unterstützt (z.B. LM Studio mit deepseek-r1).
         </p>
       </div>
 

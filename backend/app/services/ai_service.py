@@ -98,7 +98,7 @@ JSON-Struktur:
 
 # Timeout für einen einzelnen KI-API-Aufruf in Sekunden.
 # Lokale Modelle können bei langen PDFs länger brauchen.
-REQUEST_TIMEOUT_SECONDS = 120
+REQUEST_TIMEOUT_SECONDS = 900
 
 
 async def extract_invoice_data(
@@ -176,7 +176,12 @@ async def extract_invoice_data(
     # "on" wird als "high" übermittelt (OpenAI-kompatibel: off/low/medium/high)
     request_body["reasoning"] = "high" if reasoning == "on" else reasoning
 
-    endpoint = config.api_url.rstrip("/") + "/chat/completions"
+    endpoint_type = getattr(config, "endpoint_type", "openai") or "openai"
+    base = config.api_url.rstrip("/")
+    if endpoint_type == "lmstudio":
+        endpoint = base + "/chat"
+    else:
+        endpoint = base + "/chat/completions"
     logger.debug("Sende Anfrage an: %s", endpoint)
 
     raw_text = ""
@@ -409,6 +414,9 @@ def _map_new_format(data: dict) -> tuple[dict, list[dict]]:
         "bank_name":          _str(bank.get("bank_name")),
         "iban":               _str(bank.get("iban")),
         "bic":                _str(bank.get("bic")),
+        "supplier_street":    _str(anschrift.get("strasse")),
+        "supplier_zip":       _str(anschrift.get("plz")),
+        "supplier_city":      _str(anschrift.get("ort")),
         "customer_number":    _str(rechnung.get("kundennummer")),
         "invoice_number":     _str(rechnung.get("rechnungsnummer")),
         "invoice_date":       _date(rechnung.get("rechnungsdatum")),

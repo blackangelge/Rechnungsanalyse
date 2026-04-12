@@ -12,6 +12,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, HttpUrl
 
 ReasoningLevel = Literal["off", "low", "medium", "high", "on"]
+EndpointType = Literal["openai", "lmstudio"]
 
 
 class AIConfigBase(BaseModel):
@@ -33,6 +34,8 @@ class AIConfigBase(BaseModel):
     temperature: float = 0.1
     # Reasoning-Modus für unterstützte Modelle
     reasoning: ReasoningLevel = "off"
+    # API-Endpunkt-Typ
+    endpoint_type: EndpointType = "openai"
 
 
 class AIConfigCreate(AIConfigBase):

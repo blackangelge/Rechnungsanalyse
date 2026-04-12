@@ -84,3 +84,104 @@ def set_default_system_prompt(prompt_id: int, db: Session = Depends(get_db)):
 def delete_system_prompt(prompt_id: int, db: Session = Depends(get_db)):
     if not crud.system_prompt.delete(db, prompt_id):
         raise HTTPException(status_code=404, detail="Systemprompt nicht gefunden")
+
+
+# ── Backup / Restore ──────────────────────────────────────────────────────────
+
+from fastapi import UploadFile, File
+from fastapi.responses import JSONResponse
+import json as _json
+from datetime import datetime as _dt
+
+
+@router.get("/backup")
+def download_backup(db: Session = Depends(get_db)):
+    """
+    Exportiert alle Einstellungen als JSON-Datei:
+    KI-Konfigurationen, Systemprompts, Bildeinstellungen, Verarbeitungseinstellungen.
+    """
+    ai_configs = crud.ai_config.get_all(db)
+    prompts = crud.system_prompt.get_all(db)
+    img = crud.image_settings.get_or_create(db)
+    processing = crud.processing_settings.get_or_create(db)
+
+    def _obj(o):
+        return {c.name: getattr(o, c.name) for c in o.__table__.columns}
+
+    backup = {
+        "version": 1,
+        "exported_at": _dt.utcnow().isoformat(),
+        "ai_configs": [_obj(c) for c in ai_configs],
+        "system_prompts": [_obj(p) for p in prompts],
+        "image_settings": _obj(img),
+        "processing_settings": _obj(processing),
+    }
+
+    from fastapi.responses import Response
+    content = _json.dumps(backup, ensure_ascii=False, indent=2, default=str)
+    return Response(
+        content=content,
+        media_type="application/json",
+        headers={"Content-Disposition": "attachment; filename=rechnungsanalyse-backup.json"},
+    )
+
+
+@router.post("/restore")
+async def upload_restore(file: UploadFile = File(...), db: Session = Depends(get_db)):
+    """
+    Importiert Einstellungen aus einer zuvor exportierten Backup-JSON-Datei.
+    Bestehende Daten werden GELÖSCHT und durch die Backup-Daten ersetzt.
+    """
+    try:
+        content = await file.read()
+        backup = _json.loads(content)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Ungültige JSON-Datei: {exc}")
+
+    if backup.get("version") != 1:
+        raise HTTPException(status_code=400, detail="Unbekanntes Backup-Format (version != 1)")
+
+    restored = {"ai_configs": 0, "system_prompts": 0}
+
+    # KI-Konfigurationen wiederherstellen
+    from app.models.ai_config import AIConfig
+    db.query(AIConfig).delete()
+    for c in (backup.get("ai_configs") or []):
+        c.pop("id", None)
+        c.pop("created_at", None)
+        c.pop("updated_at", None)
+        db.add(AIConfig(**c))
+        restored["ai_configs"] += 1
+
+    # Systemprompts wiederherstellen
+    from app.models.system_prompt import SystemPrompt
+    db.query(SystemPrompt).delete()
+    for p in (backup.get("system_prompts") or []):
+        p.pop("id", None)
+        p.pop("created_at", None)
+        p.pop("updated_at", None)
+        db.add(SystemPrompt(**p))
+        restored["system_prompts"] += 1
+
+    # Bildeinstellungen wiederherstellen
+    img_data = backup.get("image_settings")
+    if img_data:
+        from app.models.image_settings import ImageSettings
+        img_data.pop("id", None)
+        img_data.pop("created_at", None)
+        img_data.pop("updated_at", None)
+        db.query(ImageSettings).delete()
+        db.add(ImageSettings(**img_data))
+
+    # Verarbeitungseinstellungen wiederherstellen
+    proc_data = backup.get("processing_settings")
+    if proc_data:
+        from app.models.processing_settings import ProcessingSettings
+        proc_data.pop("id", None)
+        proc_data.pop("created_at", None)
+        proc_data.pop("updated_at", None)
+        db.query(ProcessingSettings).delete()
+        db.add(ProcessingSettings(**proc_data))
+
+    db.commit()
+    return {"restored": restored, "message": "Backup erfolgreich wiederhergestellt"}
