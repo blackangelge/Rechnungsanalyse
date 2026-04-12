@@ -171,11 +171,10 @@ async def extract_invoice_data(
         ],
     }
 
-    # Reasoning-Modus an API weiterleiten (nur wenn aktiviert)
+    # Reasoning-Modus immer an API weiterleiten
     reasoning = getattr(config, "reasoning", "off") or "off"
-    if reasoning != "off":
-        # "on" wird als "high" übermittelt (OpenAI-kompatibel: low/medium/high)
-        request_body["reasoning_effort"] = "high" if reasoning == "on" else reasoning
+    # "on" wird als "high" übermittelt (OpenAI-kompatibel: off/low/medium/high)
+    request_body["reasoning_effort"] = "high" if reasoning == "on" else reasoning
 
     endpoint = config.api_url.rstrip("/") + "/chat/completions"
     logger.debug("Sende Anfrage an: %s", endpoint)
