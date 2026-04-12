@@ -1,9 +1,10 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import {
   AIConfig,
   AnalyzeRequest,
+  DocumentDetail,
   DocumentFilter,
   DocumentItem,
   ImportBatch,
@@ -144,6 +145,14 @@ export default function BelegePage() {
 
   // Löschen-Bestätigung
   const [deleteConfirmId, setDeleteConfirmId] = useState<number | null>(null);
+
+  // KI-Modal
+  const [viewMode, setViewMode] = useState<"ki" | "infos" | null>(null);
+  const [viewedDoc, setViewedDoc] = useState<DocumentDetail | null>(null);
+  const [viewLoading, setViewLoading] = useState(false);
+  // Infos-Inline-Ansicht (ersetzt Tabelle)
+  const [infosDocId, setInfosDocId] = useState<number | null>(null);
+  const infosContainerRef = useRef<HTMLDivElement>(null);
 
   // Analyse-Optionen
   const [aiConfigs, setAiConfigs] = useState<AIConfig[]>([]);
@@ -307,12 +316,47 @@ export default function BelegePage() {
     }
   }
 
+  // ─── KI-Modal / Infos-Inline öffnen ─────────────────────────────────────
+
+  async function openView(docId: number, mode: "ki" | "infos") {
+    setViewMode(mode);
+    setViewedDoc(null);
+    setViewLoading(true);
+    if (mode === "infos") {
+      setInfosDocId(docId);
+      setPreviewDocId(null); // PDF-Vorschau schließen
+    }
+    try {
+      const detail = await documentsApi.get(docId);
+      setViewedDoc(detail);
+    } catch (err) {
+      console.error("Fehler beim Laden des Dokuments:", err);
+    } finally {
+      setViewLoading(false);
+    }
+  }
+
+  function closeView() {
+    setViewMode(null);
+    setViewedDoc(null);
+    setInfosDocId(null);
+  }
+
+  async function navigateInfos(delta: number) {
+    const idx = documents.findIndex((d) => d.id === infosDocId);
+    const nextIdx = idx + delta;
+    if (nextIdx < 0 || nextIdx >= documents.length) return;
+    await openView(documents[nextIdx].id, "infos");
+    infosContainerRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+  }
+
   // ─── Ableitungen ──────────────────────────────────────────────────────────
 
   const activeDocs = documents.filter((d) => !d.deleted_at);
   const allSelected = activeDocs.length > 0 && selectedIds.size === activeDocs.length;
   const someSelected = selectedIds.size > 0 && selectedIds.size < activeDocs.length;
   const availableYears = Array.from(new Set(documents.map((d) => d.year))).sort((a, b) => b - a);
+  const infosIdx = infosDocId !== null ? documents.findIndex((d) => d.id === infosDocId) : -1;
 
   // ─── Render ───────────────────────────────────────────────────────────────
 
@@ -445,8 +489,81 @@ export default function BelegePage() {
 
       </div>{/* Ende Kopfbereich */}
 
-      {/* ── Tabelle: volle Bildschirmbreite ──────────────────────────── */}
+      {/* ── Tabelle / Infos-Ansicht: volle Bildschirmbreite ─────────── */}
       <div className="relative left-1/2 w-screen -translate-x-1/2 px-6 mt-4">
+
+        {viewMode === "infos" ? (
+          /* ── Inline Infos-Ansicht (ersetzt Tabelle) ── */
+          <div ref={infosContainerRef}>
+            {/* Navigationsleiste */}
+            <div className="mb-4 flex items-center gap-3 rounded-lg border bg-white px-4 py-2.5 shadow-sm">
+              <button
+                onClick={closeView}
+                className="rounded border border-gray-300 px-3 py-1.5 text-sm text-gray-600 hover:bg-gray-50 transition-colors"
+              >
+                ← Zur Liste
+              </button>
+              <div className="h-5 w-px bg-gray-200" />
+              {infosIdx >= 0 && (
+                <span className="text-sm text-gray-500">
+                  Beleg <span className="font-semibold text-gray-800">{infosIdx + 1}</span>
+                  <span className="text-gray-400"> / {documents.length}</span>
+                </span>
+              )}
+              <div className="ml-auto flex items-center gap-2">
+                <button
+                  onClick={() => navigateInfos(-1)}
+                  disabled={infosIdx <= 0 || viewLoading}
+                  className="rounded border border-gray-300 px-3 py-1.5 text-sm text-gray-600 hover:bg-gray-50 disabled:opacity-40 transition-colors"
+                >
+                  ← Vorherige
+                </button>
+                <button
+                  onClick={() => navigateInfos(1)}
+                  disabled={infosIdx >= documents.length - 1 || viewLoading}
+                  className="rounded border border-gray-300 px-3 py-1.5 text-sm text-gray-600 hover:bg-gray-50 disabled:opacity-40 transition-colors"
+                >
+                  Nächste →
+                </button>
+              </div>
+            </div>
+
+            {/* Infos-Inhalt: 50/50 Split */}
+            {viewLoading ? (
+              <div className="flex items-center justify-center py-16 text-gray-400 text-sm rounded-xl border bg-white shadow-sm">
+                <span className="animate-spin mr-2 inline-block">⟳</span> Lade…
+              </div>
+            ) : viewedDoc ? (
+              <div className="flex gap-4">
+                {/* Linke Seite: Extrahierte Daten */}
+                <div className="w-1/2 shrink-0 overflow-y-auto rounded-xl border bg-white shadow-sm" style={{ maxHeight: "calc(100vh - 14rem)" }}>
+                  <div className="sticky top-0 z-10 border-b bg-white px-5 py-3">
+                    <h2 className="text-sm font-semibold text-gray-900 truncate">{viewedDoc.original_filename}</h2>
+                    <p className="text-xs text-gray-500">{viewedDoc.company} {viewedDoc.year} · #{viewedDoc.id}</p>
+                  </div>
+                  <div className="p-5">
+                    <InfosView doc={viewedDoc} />
+                  </div>
+                </div>
+
+                {/* Rechte Seite: PDF-Vorschau */}
+                <div className="w-1/2 shrink-0 rounded-xl border bg-white shadow-sm overflow-hidden">
+                  <iframe
+                    src={documentsApi.previewUrl(viewedDoc.id)}
+                    className="w-full rounded-xl"
+                    style={{ height: "calc(100vh - 14rem)" }}
+                    title={`PDF ${viewedDoc.original_filename}`}
+                  />
+                </div>
+              </div>
+            ) : (
+              <div className="rounded-xl border bg-white shadow-sm p-6 text-sm text-red-500">
+                Dokument konnte nicht geladen werden.
+              </div>
+            )}
+          </div>
+        ) : (
+        <>
 
         {/* Anzahl */}
         <div className="mb-2 text-sm text-gray-500">
@@ -551,7 +668,7 @@ export default function BelegePage() {
 
                       {/* Aktionen */}
                       <td className="px-3 py-2.5">
-                        <div className="flex items-center gap-1.5">
+                        <div className="flex items-center gap-1.5 flex-wrap">
                           {/* PDF */}
                           {!isDeleted && (
                             <button
@@ -566,6 +683,26 @@ export default function BelegePage() {
                               ].join(" ")}
                             >
                               {isActivePreview ? "Vorschau aus" : "PDF"}
+                            </button>
+                          )}
+
+                          {/* KI-Rohantwort anzeigen */}
+                          {(doc.status === "done" || doc.status === "error") && (
+                            <button
+                              onClick={() => openView(doc.id, "ki")}
+                              className="rounded border border-violet-300 px-2 py-1 text-xs font-medium text-violet-700 hover:bg-violet-50 transition-colors"
+                            >
+                              KI
+                            </button>
+                          )}
+
+                          {/* Extrahierte Infos anzeigen */}
+                          {doc.status === "done" && (
+                            <button
+                              onClick={() => openView(doc.id, "infos")}
+                              className="rounded border border-emerald-300 px-2 py-1 text-xs font-medium text-emerald-700 hover:bg-emerald-50 transition-colors"
+                            >
+                              Infos
                             </button>
                           )}
 
@@ -625,7 +762,269 @@ export default function BelegePage() {
           )}
 
         </div>{/* Ende Split-View */}
+        </>
+        )}{/* Ende Tabelle/Infos-Conditional */}
       </div>{/* Ende volle Breite */}
+
+      {/* ── KI-Rohantwort Modal ──────────────────────────────────────── */}
+      {viewMode === "ki" && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
+          onClick={closeView}
+        >
+          <div
+            className="relative flex max-h-[90vh] w-full max-w-4xl flex-col rounded-xl bg-white shadow-2xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between border-b px-6 py-4">
+              <div>
+                <h2 className="text-lg font-semibold text-gray-900">KI-Rohantwort</h2>
+                {viewedDoc && (
+                  <p className="text-sm text-gray-500">{viewedDoc.original_filename} · #{viewedDoc.id}</p>
+                )}
+              </div>
+              <button onClick={closeView} className="text-gray-400 hover:text-gray-700 text-xl leading-none">✕</button>
+            </div>
+            <div className="overflow-y-auto p-6">
+              {viewLoading && (
+                <div className="flex items-center justify-center py-12 text-gray-400 text-sm">
+                  <span className="animate-spin mr-2">⟳</span> Lade…
+                </div>
+              )}
+              {!viewLoading && viewedDoc && (
+                <KiRawView rawResponse={viewedDoc.extraction?.raw_response ?? null} />
+              )}
+              {!viewLoading && !viewedDoc && (
+                <p className="text-sm text-red-500">Dokument konnte nicht geladen werden.</p>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </>
+  );
+}
+
+// ─── KI-Rohantwort-Ansicht ────────────────────────────────────────────────────
+
+function KiRawView({ rawResponse }: { rawResponse: string | null }) {
+  if (!rawResponse) {
+    return <p className="text-sm text-gray-400">Keine KI-Antwort gespeichert.</p>;
+  }
+
+  let formatted = rawResponse;
+  try {
+    formatted = JSON.stringify(JSON.parse(rawResponse), null, 2);
+  } catch {
+    // Kein gültiges JSON → Rohantwort anzeigen
+  }
+
+  return (
+    <pre className="overflow-x-auto rounded-lg bg-gray-950 p-4 text-xs leading-relaxed text-green-300 whitespace-pre-wrap break-words">
+      {formatted}
+    </pre>
+  );
+}
+
+// ─── Formatierte Infos-Ansicht ────────────────────────────────────────────────
+
+function InfosView({ doc }: { doc: DocumentDetail }) {
+  const ext = doc.extraction;
+
+  // Neues verschachteltes Format aus raw_response lesen (für Felder außerhalb der DB-Spalten)
+  let raw: Record<string, unknown> | null = null;
+  if (ext?.raw_response) {
+    try { raw = JSON.parse(ext.raw_response); } catch { /* ignore */ }
+  }
+
+  const lieferant = (raw?.lieferant as Record<string, unknown>) ?? null;
+  const anschrift = (lieferant?.anschrift as Record<string, unknown>) ?? null;
+  const bank = (lieferant?.bankverbindung as Record<string, unknown>) ?? null;
+  const rechnung = (raw?.rechnungsdaten as Record<string, unknown>) ?? null;
+  const zahlung = (raw?.zahlungsinformationen as Record<string, unknown>) ?? null;
+  const skonto = (zahlung?.skonto as Record<string, unknown>) ?? null;
+  const positionen = (raw?.positionen as unknown[]) ?? null;
+  const ustZusammenfassung = (zahlung?.umsatzsteuer_zusammenfassung as unknown[]) ?? null;
+
+  function Row({ label, value }: { label: string; value: unknown }) {
+    if (value == null || value === "") return null;
+    return (
+      <div className="flex gap-3 py-1.5 border-b border-gray-100 last:border-0">
+        <span className="w-44 shrink-0 text-xs font-medium text-gray-500">{label}</span>
+        <span className="text-sm text-gray-800 break-words">{String(value)}</span>
+      </div>
+    );
+  }
+
+  function Section({ title, children }: { title: string; children: React.ReactNode }) {
+    return (
+      <div className="mb-6">
+        <h3 className="mb-2 text-sm font-semibold text-gray-700 uppercase tracking-wide">{title}</h3>
+        <div className="rounded-lg border border-gray-200 bg-gray-50 px-4 py-1">
+          {children}
+        </div>
+      </div>
+    );
+  }
+
+  const fmt = (n: unknown): string | null => {
+    if (n == null) return null;
+    let num: number;
+    if (typeof n === "number") {
+      num = n;
+    } else {
+      // Strings wie "719,99 €" oder "1.234,56" parsen
+      const s = String(n).replace(/[€$£¥\s]/g, "");
+      // Europäisches Format: "1.234,56" → "1234.56"
+      const normalized = s.includes(",") ? s.replace(/\./g, "").replace(",", ".") : s;
+      num = parseFloat(normalized);
+    }
+    if (isNaN(num)) return String(n); // Fallback: Originalwert anzeigen
+    return new Intl.NumberFormat("de-DE", { style: "currency", currency: "EUR" }).format(num);
+  };
+
+  return (
+    <div>
+      {/* Lieferant */}
+      <Section title="Lieferant">
+        <Row label="Name" value={lieferant?.name ?? ext?.supplier_name} />
+        {anschrift ? (
+          <>
+            <Row label="Straße" value={anschrift.strasse} />
+            <Row label="PLZ / Ort" value={[anschrift.plz, anschrift.ort].filter(Boolean).join(" ")} />
+            <Row label="Land" value={anschrift.land} />
+          </>
+        ) : (
+          <Row label="Anschrift" value={ext?.supplier_address} />
+        )}
+        <Row label="HRB-Nummer" value={lieferant?.hrb_nummer ?? ext?.hrb_number} />
+        <Row label="Steuernummer" value={lieferant?.steuernummer ?? ext?.tax_number} />
+        <Row label="USt-IdNr." value={lieferant?.ust_id_nr ?? ext?.vat_id} />
+      </Section>
+
+      {/* Bankverbindung */}
+      <Section title="Bankverbindung">
+        <Row label="Bank" value={bank?.bank_name ?? ext?.bank_name} />
+        <Row label="IBAN" value={bank?.iban ?? ext?.iban} />
+        <Row label="BIC" value={bank?.bic ?? ext?.bic} />
+      </Section>
+
+      {/* Rechnungsdaten */}
+      <Section title="Rechnungsdaten">
+        <Row label="Rechnungsnummer" value={rechnung?.rechnungsnummer ?? ext?.invoice_number} />
+        <Row label="Rechnungsdatum" value={rechnung?.rechnungsdatum ?? ext?.invoice_date} />
+        <Row label="Fälligkeit" value={rechnung?.faelligkeit ?? ext?.due_date} />
+        <Row label="Kundennummer" value={rechnung?.kundennummer ?? ext?.customer_number} />
+      </Section>
+
+      {/* Zahlungsinformationen */}
+      <Section title="Zahlungsinformationen">
+        <Row label="Gesamtbetrag Netto" value={fmt(zahlung?.gesamtbetrag_netto)} />
+        <Row label="Gesamtbetrag Brutto" value={fmt(zahlung?.gesamtbetrag_brutto ?? ext?.total_amount)} />
+        <Row label="Währung" value={zahlung?.waehrung} />
+        {skonto && (
+          <>
+            <Row label="Skonto %" value={skonto.prozent != null ? `${skonto.prozent} %` : null} />
+            <Row label="Skonto Betrag" value={fmt(skonto.betrag ?? ext?.cash_discount_amount)} />
+            <Row label="Skonto Frist" value={skonto.frist_tage != null ? `${skonto.frist_tage} Tage` : null} />
+          </>
+        )}
+        <Row label="Zahlungsbedingungen" value={zahlung?.zahlungsbedingungen ?? ext?.payment_terms} />
+      </Section>
+
+      {/* USt-Zusammenfassung */}
+      {ustZusammenfassung && ustZusammenfassung.length > 0 && (
+        <div className="mb-6">
+          <h3 className="mb-2 text-sm font-semibold text-gray-700 uppercase tracking-wide">Umsatzsteuer</h3>
+          <div className="overflow-x-auto rounded-lg border border-gray-200">
+            <table className="w-full text-sm">
+              <thead className="bg-gray-50 text-xs font-medium text-gray-500">
+                <tr>
+                  <th className="px-4 py-2 text-right">Steuersatz</th>
+                  <th className="px-4 py-2 text-right">Nettobetrag</th>
+                  <th className="px-4 py-2 text-right">Steuerbetrag</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y">
+                {(ustZusammenfassung as Record<string, unknown>[]).map((row, i) => (
+                  <tr key={i}>
+                    <td className="px-4 py-2 text-right">{row.steuersatz != null ? `${row.steuersatz} %` : "–"}</td>
+                    <td className="px-4 py-2 text-right">{fmt(row.nettobetrag) ?? "–"}</td>
+                    <td className="px-4 py-2 text-right">{fmt(row.steuerbetrag) ?? "–"}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      {/* Positionen */}
+      {(positionen ?? doc.order_positions).length > 0 && (
+        <div className="mb-2">
+          <h3 className="mb-2 text-sm font-semibold text-gray-700 uppercase tracking-wide">
+            Positionen ({(positionen ?? doc.order_positions).length})
+          </h3>
+          <div className="overflow-x-auto rounded-lg border border-gray-200">
+            <table className="w-full text-sm">
+              <thead className="bg-gray-50 text-xs font-medium text-gray-500">
+                <tr>
+                  <th className="px-3 py-2 text-left">Nr.</th>
+                  <th className="px-3 py-2 text-left">Bezeichnung</th>
+                  <th className="px-3 py-2 text-left">Art.-Nr.</th>
+                  <th className="px-3 py-2 text-right">Menge</th>
+                  <th className="px-3 py-2 text-left">Einheit</th>
+                  <th className="px-3 py-2 text-right">Einzelpreis</th>
+                  <th className="px-3 py-2 text-right">Steuersatz</th>
+                  <th className="px-3 py-2 text-right">Gesamtpreis</th>
+                  <th className="px-3 py-2 text-left">Nachlass</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y">
+                {positionen
+                  ? (positionen as Record<string, unknown>[]).map((pos, i) => {
+                      const nachlass = (pos.preisnachlass as Record<string, unknown>) ?? {};
+                      const nachlassStr = [
+                        nachlass.betrag != null ? fmt(nachlass.betrag) : null,
+                        nachlass.prozent != null ? `${nachlass.prozent}%` : null,
+                        nachlass.bezeichnung ? String(nachlass.bezeichnung) : null,
+                      ].filter(Boolean).join(" / ");
+                      return (
+                        <tr key={i} className="hover:bg-gray-50">
+                          <td className="px-3 py-2 text-gray-500">{String(pos.position_nr ?? i + 1)}</td>
+                          <td className="px-3 py-2">{String(pos.artikelbezeichnung ?? "–")}</td>
+                          <td className="px-3 py-2 text-gray-500 text-xs">{String(pos.artikelnummer_lieferant ?? "–")}</td>
+                          <td className="px-3 py-2 text-right tabular-nums">{pos.menge != null ? String(pos.menge) : "–"}</td>
+                          <td className="px-3 py-2 text-gray-500">{String(pos.mengeneinheit ?? "–")}</td>
+                          <td className="px-3 py-2 text-right tabular-nums">{pos.einzelpreis != null ? fmt(pos.einzelpreis) : "–"}</td>
+                          <td className="px-3 py-2 text-right tabular-nums">{pos.steuersatz != null ? `${pos.steuersatz} %` : "–"}</td>
+                          <td className="px-3 py-2 text-right tabular-nums font-medium">{pos.gesamtpreis != null ? fmt(pos.gesamtpreis) : "–"}</td>
+                          <td className="px-3 py-2 text-xs text-gray-500">{nachlassStr || "–"}</td>
+                        </tr>
+                      );
+                    })
+                  : doc.order_positions.map((pos, i) => (
+                      <tr key={pos.id} className="hover:bg-gray-50">
+                        <td className="px-3 py-2 text-gray-500">{i + 1}</td>
+                        <td className="px-3 py-2">{pos.product_description ?? "–"}</td>
+                        <td className="px-3 py-2 text-gray-500 text-xs">{pos.article_number ?? "–"}</td>
+                        <td className="px-3 py-2 text-right tabular-nums">{pos.quantity != null ? String(pos.quantity) : "–"}</td>
+                        <td className="px-3 py-2 text-gray-500">{pos.unit ?? "–"}</td>
+                        <td className="px-3 py-2 text-right tabular-nums">{pos.unit_price != null ? fmt(pos.unit_price) : "–"}</td>
+                        <td className="px-3 py-2 text-right">–</td>
+                        <td className="px-3 py-2 text-right tabular-nums font-medium">{pos.total_price != null ? fmt(pos.total_price) : "–"}</td>
+                        <td className="px-3 py-2 text-xs text-gray-500">{pos.discount ?? "–"}</td>
+                      </tr>
+                    ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      {!ext && (
+        <p className="text-sm text-gray-400">Keine Extraktionsdaten vorhanden.</p>
+      )}
+    </div>
   );
 }

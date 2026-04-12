@@ -28,6 +28,114 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/imports", tags=["Imports"])
 
 
+async def _delete_source_files(batch_id: int, import_folder: str) -> None:
+    """
+    Löscht die Original-PDFs aus dem Import-Ordner, die erfolgreich kopiert wurden.
+    Es werden nur Dateien gelöscht, für die ein DB-Eintrag mit stored_filename existiert.
+    """
+    from pathlib import Path
+    from app.database import SessionLocal
+
+    db = SessionLocal()
+    try:
+        batch = crud.import_batch.get_by_id(db, batch_id)
+        original_names = [
+            d.original_filename
+            for d in (batch.documents if batch else [])
+            if d.stored_filename and d.original_filename
+        ]
+    finally:
+        db.close()
+
+    folder = Path(import_folder)
+    deleted, failed = 0, 0
+    for name in original_names:
+        src = folder / name
+        try:
+            if src.exists():
+                src.unlink()
+                deleted += 1
+                logger.info("Quelldatei gelöscht: %s", src)
+            else:
+                logger.debug("Quelldatei bereits weg: %s", src)
+        except Exception as exc:
+            failed += 1
+            logger.warning("Konnte Quelldatei nicht löschen %s: %s", src, exc)
+
+    logger.info(
+        "Batch #%d: Quelldateien gelöscht=%d, fehlgeschlagen=%d", batch_id, deleted, failed
+    )
+
+
+async def _import_and_delete(batch_id: int, import_folder: str) -> None:
+    """Import durchführen und danach Quelldateien löschen (ohne KI-Analyse)."""
+    await run_import(batch_id)
+    await _delete_source_files(batch_id, import_folder)
+
+
+async def _import_then_analyze(
+    batch_id: int,
+    import_folder: str,
+    ai_config_id: int | None = None,
+    system_prompt_id: int | None = None,
+    delete_source_files: bool = False,
+) -> None:
+    """
+    Führt zuerst den Import durch, danach startet automatisch die KI-Analyse
+    für alle erfolgreich importierten Dokumente.
+    """
+    from app.database import SessionLocal
+    from app.routers.documents import _run_analysis
+
+    # 1. Import abwarten
+    await run_import(batch_id)
+
+    # 2. Quelldateien löschen (falls gewünscht), bevor KI läuft
+    if delete_source_files:
+        await _delete_source_files(batch_id, import_folder)
+
+    # 3. KI-Konfiguration und Systemprompt auflösen
+    db = SessionLocal()
+    try:
+        # KI-Config
+        if ai_config_id:
+            resolved_config = crud.ai_config.get_by_id(db, ai_config_id)
+        else:
+            resolved_config = crud.ai_config.get_default(db)
+        if resolved_config is None:
+            logger.warning("Batch #%d: Keine KI-Konfiguration gefunden — KI-Analyse übersprungen", batch_id)
+            return
+        resolved_config_id = resolved_config.id
+
+        # Systemprompt
+        if system_prompt_id:
+            sp = crud.system_prompt.get_by_id(db, system_prompt_id)
+            system_prompt_text = sp.content if sp else None
+        else:
+            default_sp = crud.system_prompt.get_default(db)
+            system_prompt_text = default_sp.content if default_sp else None
+
+        batch = crud.import_batch.get_by_id(db, batch_id)
+        doc_ids = [d.id for d in (batch.documents if batch else []) if d.stored_filename]
+    finally:
+        db.close()
+
+    if not doc_ids:
+        logger.info("Batch #%d: Keine Dokumente für KI-Analyse", batch_id)
+        return
+
+    # 4. Dokumente auf "processing" setzen
+    db = SessionLocal()
+    try:
+        for doc_id in doc_ids:
+            crud.document.update_status(db, doc_id, "processing")
+    finally:
+        db.close()
+
+    logger.info("Batch #%d: KI-Analyse für %d Dokument(e) gestartet", batch_id, len(doc_ids))
+    await _run_analysis(doc_ids, resolved_config_id, system_prompt_text)
+
+
 @router.get("", response_model=list[ImportBatchRead])
 def list_imports(
     company_name: str | None = Query(None, description="Firmenname (Teilstring-Suche)"),
@@ -83,7 +191,18 @@ async def start_import(payload: ImportBatchCreate, db: Session = Depends(get_db)
     )
     logger.info("Import-Batch #%d erstellt: %s_%d (%d PDFs)", batch.id, company_name, year, len(pdf_files))
 
-    asyncio.create_task(run_import(batch.id))
+    if payload.analyze_after_import:
+        asyncio.create_task(_import_then_analyze(
+            batch_id=batch.id,
+            import_folder=folder_path,
+            ai_config_id=payload.ai_config_id,
+            system_prompt_id=payload.system_prompt_id,
+            delete_source_files=payload.delete_source_files,
+        ))
+    elif payload.delete_source_files:
+        asyncio.create_task(_import_and_delete(batch.id, folder_path))
+    else:
+        asyncio.create_task(run_import(batch.id))
     return batch
 
 

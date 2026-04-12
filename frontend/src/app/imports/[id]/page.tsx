@@ -17,7 +17,7 @@
 
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useParams } from "next/navigation";
 import { ImportBatch, DocumentItem, importsApi } from "@/lib/api";
 import ProgressPanel from "@/components/imports/ProgressPanel";
@@ -37,12 +37,16 @@ export default function ImportDetailPage() {
   const [metaLoading, setMetaLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
+  // Ref to track whether batch was ever successfully loaded (avoids `batch` in deps)
+  const batchLoadedRef = useRef(false);
+
   /** Nur Batch-Metadaten laden (schnell, kein JOIN über alle Dokumente) */
   const loadMeta = useCallback(async () => {
     try {
       setError(null);
       const data = await importsApi.getStatus(batchId);
       setBatch(data);
+      batchLoadedRef.current = true;
       return data;
     } catch (err: unknown) {
       // ECONNRESET / Netzwerkfehler während laufendem Import → kein harter Fehler
@@ -51,7 +55,7 @@ export default function ImportDetailPage() {
         (err.message.includes("Network Error") ||
           err.message.includes("ECONNRESET") ||
           err.message.includes("socket hang up"));
-      if (isNetworkErr && !batch) {
+      if (isNetworkErr && !batchLoadedRef.current) {
         // Noch kein Batch geladen → Fallback: Seite zeigt Ladezustand
         setError("Backend kurzzeitig nicht erreichbar — bitte Seite neu laden.");
       } else if (!isNetworkErr) {
@@ -62,7 +66,7 @@ export default function ImportDetailPage() {
     } finally {
       setMetaLoading(false);
     }
-  }, [batchId, batch]);
+  }, [batchId]);
 
   /** Dokumente laden — einmalig nach Import-Abschluss */
   const loadDocuments = useCallback(async () => {

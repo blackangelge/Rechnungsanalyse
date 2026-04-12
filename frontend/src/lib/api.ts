@@ -138,6 +138,9 @@ export interface ImportBatchCreate {
   company_name?: string;
   year?: number;
   ai_config_id?: number;
+  system_prompt_id?: number;
+  analyze_after_import?: boolean;
+  delete_source_files?: boolean;
 }
 
 export const importsApi = {
