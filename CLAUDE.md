@@ -44,6 +44,8 @@ app/
 │   ├── ai_config.py
 │   ├── image_settings.py
 │   ├── invoice_extraction.py  # + supplier_id FK → suppliers
+│   │                          # + ki_input_tokens, ki_output_tokens, ki_reasoning_tokens,
+│   │                          #   ki_tokens_per_second, ki_time_to_first_token (nullable)
 │   ├── order_position.py
 │   ├── supplier.py         # Lieferanten-Stammdaten (Deduplication)
 │   └── system_prompt.py    # Systemprompts für KI-Extraktion
@@ -54,6 +56,8 @@ app/
 │                           #   system_prompt_id, delete_source_files)
 ├── crud/                   # Datenbankoperationen (je Modell eine Datei)
 │   ├── document.py         # get_all_filtered mit joinedload(extraction)
+│   │                       # save_extraction: speichert ki_stats; Fallback ohne Stats
+│   │                       #   falls Migration noch nicht angewendet
 │   ├── import_batch.py
 │   ├── supplier.py         # find_or_create (IBAN → VAT-ID → Name)
 │   └── system_prompt.py
@@ -61,23 +65,28 @@ app/
 │   ├── imports.py          # GET/POST /api/imports, DELETE löscht auch Dateien
 │   │                       # _import_then_analyze, _delete_source_files
 │   ├── documents.py        # GET /api/documents, POST /analyze, GET/{id}, preview, comment
-│   │                       # _KI_IO_EXECUTOR, _analyze_single (phasenbasiert)
+│   │                       # _KI_IO_EXECUTOR, _analyze_single (phasenbasiert, sequenziell)
 │   ├── ai_configs.py       # CRUD /api/ai-configs, POST set-default
+│   ├── logs.py             # GET /api/logs (System-Log), GET /api/logs/ki-stats
 │   ├── settings.py         # GET/PUT /api/settings/image-conversion
 │   │                       # GET /api/settings/paths
 │   │                       # CRUD /api/settings/system-prompts
 │   ├── sse.py              # GET /api/imports/{id}/progress (Server-Sent Events)
 │   └── items.py            # CRUD /api/items (Platzhalter)
 └── services/
-    ├── import_service.py   # Import-Orchestrierung, parallel (Semaphore 4), kein KI
+    ├── import_service.py   # Import-Orchestrierung, parallel (Semaphore), kein KI
+    │                       # Keine Seitenanzahl-Lesung mehr — wird bei KI-Analyse gesetzt
     ├── ai_service.py       # KI-Extraktion via OpenAI-kompatibler Vision-API
-    │                       # Neues verschachteltes JSON-Format + Normalisierung
+    │                       # Verschachteltes JSON-Format + Normalisierung
+    │                       # extract_invoice_data ist SYNCHRON (httpx.Client)
     └── pdf_service.py      # PDF → Bilder (pypdfium2), Seitenanzahl (pypdf)
 alembic/
 └── versions/
     ├── 0001_initial.py     # Alle Basistabellen
     ├── 0002_system_prompts.py
-    └── 0003_supplier.py    # suppliers-Tabelle + supplier_id FK auf invoice_extractions
+    ├── 0003_supplier.py    # suppliers-Tabelle + supplier_id FK auf invoice_extractions
+    └── 0009_ki_stats_on_invoice_extractions.py
+                            # 5 ki_*-Spalten auf invoice_extractions (nullable)
 ```
 
 ### Import-Ablauf
@@ -86,7 +95,8 @@ alembic/
 2. Sicherheitscheck: Pfad muss unter `IMPORT_BASE_PATH` liegen
 3. Alle `.pdf`/`.PDF` im Import-Ordner werden gefunden
 4. Speicherziel: `STORAGE_PATH/{Firma}_{Jahr}/{id}.pdf`
-5. Pro PDF parallel (max. 4): DB-Datensatz anlegen → kopieren → Seitenanzahl erfassen
+5. Pro PDF parallel: DB-Datensatz anlegen → kopieren → Status `done` setzen
+   - **Keine Seitenanzahl** beim Import — `page_count` bleibt `0` bis zur KI-Analyse
 6. Fortschritt wird via SSE an das Frontend gestreamt
 7. Optional nach Import: Quelldateien löschen und/oder KI-Analyse starten
 
@@ -116,15 +126,35 @@ alembic/
 ### KI-Extraktion (`services/ai_service.py`)
 
 - Unterstützt jede OpenAI-kompatible Vision-API (LM Studio, Ollama, OpenAI, etc.)
-- Endpunkt: `{api_url}/chat/completions`
-- Alle PDF-Seiten werden in **einer** Anfrage gesendet (als `image_url`-Parts)
+- Endpunkt je nach `endpoint_type`:
+  - `openai` → `{api_url}/v1/chat/completions`
+  - `lmstudio` → `{api_url}/api/v1/chat`
+- Alle PDF-Seiten werden in **einer** Anfrage gesendet
 - **Kein `"detail": "high"`** in image_url → LM-Studio-Kompatibilität
 - **`"stream": False`** explizit gesetzt → verhindert channelId-Warnungen in LM Studio
 - System-Prompt: aus DB (Standard-Prompt) oder explizit per `system_prompt_id`
 - **Niemals `raise_for_status()`** — alle HTTP-Fehler (429/503/500/Timeout/Netzwerk)
-  werden als `({}, [], "KI-Fehler: ...")` zurückgegeben, nie als Exception
+  werden als `({}, [], "KI-Fehler: ...", {})` zurückgegeben, nie als Exception
+- **`extract_invoice_data` ist SYNCHRON** (`def`, nicht `async def`) und verwendet
+  `httpx.Client` (sync). Muss immer via `asyncio.to_thread()` aufgerufen werden.
+  Grund: verhindert, dass JSON-Serialisierung großer Base64-Payloads und HTTP-I/O
+  den asyncio Event-Loop blockieren.
 
-#### Verschachteltes KI-JSON-Format (neu)
+#### Rückgabe von `extract_invoice_data`
+
+```python
+def extract_invoice_data(
+    images_b64: list[str],
+    config: AIConfig,
+    system_prompt_text: str | None = None,
+) -> tuple[dict, list[dict], str, dict]:
+    # Returns: (extracted_fields, order_positions, raw_response, ki_stats)
+```
+
+`ki_stats` enthält: `input_tokens`, `output_tokens`, `reasoning_tokens`,
+`tokens_per_second`, `time_to_first_token` (alle können `None` sein).
+
+#### Verschachteltes KI-JSON-Format
 
 Die KI soll Daten in diesem verschachtelten Format zurückgeben:
 
@@ -132,33 +162,48 @@ Die KI soll Daten in diesem verschachtelten Format zurückgeben:
 {
   "lieferant": {
     "name": "...",
-    "adresse": "...",
+    "anschrift": { "strasse": "...", "plz": "...", "ort": "...", "land": "..." },
+    "hrb_nummer": "...",
     "steuernummer": "...",
-    "ustid": "...",
-    "hrb": "...",
-    "bankverbindung": { "bank": "...", "iban": "...", "bic": "..." }
+    "ust_id_nr": "...",
+    "bankverbindung": { "bank_name": "...", "iban": "...", "bic": "..." }
   },
   "rechnungsdaten": {
     "rechnungsnummer": "...",
-    "rechnungsdatum": "...",
-    "lieferdatum": "..."
+    "rechnungsdatum": "YYYY-MM-DD",
+    "faelligkeit": "YYYY-MM-DD",
+    "kundennummer": "..."
   },
   "positionen": [
-    { "bezeichnung": "...", "menge": 1, "einheit": "...", "einzelpreis": 0.0, "gesamtpreis": 0.0, "steuersatz": 19.0 }
+    {
+      "position_nr": 1,
+      "artikelbezeichnung": "...",
+      "artikelnummer_lieferant": "...",
+      "menge": 1,
+      "mengeneinheit": "Stück",
+      "einzelpreis": 0.0,
+      "gesamtpreis": 0.0,
+      "waehrung": "EUR",
+      "steuersatz": 19.0,
+      "preisnachlass": { "betrag": null, "prozent": null, "bezeichnung": null }
+    }
   ],
   "zahlungsinformationen": {
-    "nettobetrag": 0.0,
-    "steuerbetrag": 0.0,
+    "gesamtbetrag_netto": 0.0,
+    "umsatzsteuer_zusammenfassung": [{ "steuersatz": 19.0, "nettobetrag": 0.0, "steuerbetrag": 0.0 }],
     "gesamtbetrag_brutto": 0.0,
     "waehrung": "EUR",
-    "faelligkeitsdatum": "...",
-    "zahlungsziel_tage": 0,
-    "skonto_prozent": 0.0
+    "skonto": { "prozent": null, "betrag": null, "frist_tage": null },
+    "zahlungsbedingungen": "..."
   }
 }
 ```
 
 **Auto-Detection:** Enthält das geparste JSON `lieferant`, `rechnungsdaten` oder `zahlungsinformationen` → neues Format (`_map_new_format()`). Sonst → altes flaches Format (`_clean_flat_fields()`).
+
+**`_map_new_format()` gibt zurück:** `extracted_fields` enthält neben den DB-Spalten auch
+`supplier_street`, `supplier_zip`, `supplier_city` (nur für Supplier-Lookup, keine DB-Spalten).
+Diese werden in `_db_analyze_write` vor `save_extraction` herausgefiltert (`_SUPPLIER_ONLY_KEYS`).
 
 #### Normalisierung-Hilfsfunktionen
 
@@ -171,20 +216,36 @@ Die KI soll Daten in diesem verschachtelten Format zurückgeben:
 
 ### KI-Analyse: Phasenbasierter Ansatz (`routers/documents.py`)
 
-**Problem:** Wenn `_analyze_single` die DB-Session während PDF-Rendering + KI-API-Aufruf (Minuten) offen hält, sättigt das den gemeinsamen uvicorn-Thread-Pool → GET-Endpunkte (Dokumente, Imports) timeoutten.
+**Kernprinzip:** Alle blockierenden Operationen laufen in Threads — der Event-Loop wird nie blockiert.
 
-**Lösung:** Dedizierter `_KI_IO_EXECUTOR` (ThreadPoolExecutor, Prefix `ki_pdf`) + phasenbasierter Ablauf:
+**Sequenzielle Verarbeitung:** Dokumente werden **nacheinander** analysiert (kein `asyncio.gather`, kein Semaphore). Grund: Lokale Modelle (LM Studio, Ollama) verarbeiten ohnehin nur eine Anfrage gleichzeitig. Parallele Verarbeitung erschöpft auf einem NAS den Thread-Pool und den Arbeitsspeicher.
 
-| Phase | Inhalt | DB-Session |
+| Phase | Inhalt | Ausführung |
 |---|---|---|
-| 1 | Alle Daten aus DB lesen, in lokale Variablen kopieren | offen → sofort schließen |
-| 2 | PDF → Bilder via `_run_ki_io()` (blockierendes IO) | geschlossen |
-| 3 | KI-API-Aufruf via async httpx | geschlossen |
-| 4 | Ergebnisse in DB schreiben (neue Session) | offen → schließen |
+| 1 | Alle Daten aus DB lesen, in lokale Variablen kopieren | `asyncio.to_thread(_db_analyze_read)` |
+| 2 | PDF → Bilder | `_run_ki_io()` (dedizierter `_KI_IO_EXECUTOR`) |
+| 3 | KI-API-Aufruf (sync httpx.Client) | `asyncio.to_thread(ai_service.extract_invoice_data)` |
+| 4 | Ergebnisse + Seitenanzahl in DB schreiben | `asyncio.to_thread(_db_analyze_write)` |
+
+**Seitenanzahl:** `page_count = len(images_b64)` nach Phase 2 → wird in Phase 4 in `Document.page_count` geschrieben.
 
 `_set_error(doc_id, message)` — Hilfsfunktion, öffnet eigene Session nur zum Setzen des Fehlerstatus.
 
-**Fehlerbehandlung:** Bei fehlgeschlagenem DB-Commit (z.B. ungültiges Datum) → `db.rollback()` + erneuter Versuch; bei erneutem Fehler → `_set_error()` mit frischer Session.
+**Fehlerbehandlung in `save_extraction`:** Bei fehlgeschlagenem DB-Commit (z.B. Migration noch nicht angewendet) → `db.rollback()` + Retry ohne KI-Stats-Felder.
+
+### KI-Token-Statistiken
+
+Pro KI-Analyse werden in `invoice_extractions` gespeichert:
+
+| Spalte | Typ | Beschreibung |
+|---|---|---|
+| `ki_input_tokens` | `int\|None` | Eingabe-Token |
+| `ki_output_tokens` | `int\|None` | Ausgabe-Token |
+| `ki_reasoning_tokens` | `int\|None` | Reasoning-Token (nur manche Modelle) |
+| `ki_tokens_per_second` | `float\|None` | Generierungsgeschwindigkeit |
+| `ki_time_to_first_token` | `float\|None` | Zeit bis erstes Token (Sekunden) |
+
+Aggregierte Statistiken: `GET /api/logs/ki-stats` — gibt Summen und Durchschnitte über alle Extraktionen zurück.
 
 ### Lieferanten-Deduplication (`crud/supplier.py`)
 
@@ -211,9 +272,9 @@ STORAGE_PATH=/volume1/docker/_rechnungsanalyse/storage
 
 ```
 fastapi, uvicorn, sqlalchemy, alembic, psycopg2-binary
-httpx          # KI-API-Aufrufe
+httpx          # KI-API-Aufrufe (sync httpx.Client in extract_invoice_data)
 pypdfium2      # PDF → Bilder (kein Poppler nötig)
-pypdf          # Seitenanzahl auslesen
+pypdf          # Seitenanzahl auslesen (nur in pdf_service, nicht mehr im Import)
 Pillow         # Bildbearbeitung / Base64
 sse-starlette  # Server-Sent Events
 pydantic-settings
@@ -235,7 +296,9 @@ src/
 │   │                                   # KI-Rohdaten-Ansicht + Infos-Ansicht (50/50)
 │   ├── imports/
 │   │   ├── new/page.tsx                # Neuen Import starten
-│   │   └── [id]/page.tsx               # Import-Detail mit Dokumentenliste + PDF-Vorschau
+│   │   └── [id]/page.tsx               # Import-Detail: ProgressPanel + Dokumentenliste
+│   │                                   # SSE + Polling-Fallback alle 4 s
+│   │                                   # Dokumentenliste lädt automatisch nach Abschluss
 │   └── settings/
 │       ├── ai/page.tsx                 # KI-Konfigurationen verwalten
 │       ├── prompts/page.tsx            # Systemprompts verwalten
@@ -250,7 +313,6 @@ src/
 │   │                                   #   KI-Analyse nach Import (mit KI-Config + Prompt)
 │   ├── imports/DocumentsTable.tsx
 │   ├── imports/ProgressPanel.tsx       # SSE + initialTotal/initialProcessed Fallback
-│   ├── imports/DebugWindow.tsx
 │   └── settings/AIConfigForm.tsx
 └── lib/
     ├── api.ts      # axios-Client, alle API-Typen und -Funktionen
@@ -278,11 +340,12 @@ src/
 Exports:
 - `itemsApi` — Platzhalter
 - `aiConfigsApi` — KI-Konfigurationen CRUD
-- `importsApi` — Import-Batches CRUD
+- `importsApi` — Import-Batches CRUD + `getStatus(id)` (ohne Dokumentliste)
 - `documentsApi` — Dokumente, Analyse, Vorschau, Kommentar
 - `imageSettingsApi` — Bildkonvertierungseinstellungen
 - `systemPromptsApi` — Systemprompts CRUD
 - `importSettingsApi` — Pfade abrufen (`/api/settings/paths`)
+- `logsApi` — System-Logs + `kiStats()` → `GET /api/logs/ki-stats`
 
 ### Belege-Seite (`belege/page.tsx`)
 
@@ -314,6 +377,21 @@ Behandelt sowohl `number` als auch Strings wie `"719,99 €"`:
 - Normalisiert `"1.234,56"` → `1234.56`
 - Gibt `null` zurück für leere Werte, Original-String bei Parse-Fehler
 
+### Import-Detailseite (`imports/[id]/page.tsx`)
+
+- `ProgressPanel` zeigt Fortschritt via SSE
+- **Polling-Fallback** alle 4 s wenn SSE-Verbindung ausfällt
+- Nach Abschluss des Imports: Dokumentenliste wird automatisch geladen
+- `docsLoadedRef` verhindert doppeltes Laden der Dokumentenliste
+- `batchLoadedRef` verhindert Infinite-Loop in `useCallback`
+
+### Logs-Seite (`logs/page.tsx`)
+
+- System-Log-Tabelle (Import- und KI-Ereignisse)
+- **KI-Stats-Panel** oben: aggregierte Token-Zahlen über alle Extraktionen
+  - Anzahl KI-Anfragen, Summen und Durchschnitte für Input/Output/Reasoning-Tokens
+  - Ø Tokens/Sek., Ø Time-to-First-Token
+
 ### Neuer Import (`components/imports/ImportForm.tsx`)
 
 **Import-Optionen:**
@@ -330,6 +408,10 @@ Behandelt sowohl `number` als auch Strings wie `"719,99 €"`:
 - **Infinite render loop in `useCallback`**: Nie State-Variablen in Dependency-Array aufnehmen, die innerhalb des Callbacks gesetzt werden. Stattdessen `useRef` verwenden (z.B. `batchLoadedRef` in `/imports/[id]/page.tsx`).
 - **LM Studio `channelId`-Warnung**: Entsteht durch `"detail": "high"` in image_url oder fehlendes `"stream": false`. Beides in `ai_service.py` korrekt gesetzt.
 - **Dokument bleibt auf „Wird verarbeitet"**: Kann durch fehlgeschlagenen DB-Commit entstehen (z.B. Datum im falschen Format von KI). `_date()` in `ai_service.py` normalisiert alle bekannten Formate → `None` bei unbekanntem Format, verhindert Commit-Fehler.
+- **Backend friert ein bei mehreren KI-Anfragen**: Entsteht durch parallele `asyncio.to_thread`-Aufrufe mit großen Payloads, die den Thread-Pool erschöpfen. Lösung: KI-Analyse ist sequenziell — `_run_analysis` verwendet eine `for`-Schleife statt `asyncio.gather`.
+- **`NameError: cannot access local variable 'images_b64'`**: Entsteht wenn `del images_b64` vor `len(images_b64)` steht. Seitenanzahl immer zuerst in `page_count` sichern, dann `del`.
+- **`TypeError: Unrecognized arguments` bei `InvoiceExtraction`**: `_map_new_format()` gibt `supplier_street/zip/city` zurück, die keine DB-Spalten sind. Vor `save_extraction` mit `_SUPPLIER_ONLY_KEYS` herausfiltern.
+- **`ki_*`-Spalten fehlen (Migration 0009 nicht angewendet)**: `save_extraction` fängt den Commit-Fehler ab und wiederholt den Schreibvorgang ohne KI-Stats. Migration nachholen: `alembic upgrade head`.
 
 ### Wichtige Abhängigkeiten
 
@@ -378,6 +460,7 @@ ImportBatch  1──n  Document  1──1  InvoiceExtraction  n──1  Supplier
 AIConfig        (referenziert von ImportBatch.ai_config_id)
 ImageSettings   (Singleton, globale Bildkonvertierungseinstellungen)
 SystemPrompt    (Standard-Prompt für KI-Extraktion)
+ProcessingSettings (Singleton, import_concurrency + ai_concurrency)
 ```
 
 ### Migrationen
@@ -387,6 +470,7 @@ SystemPrompt    (Standard-Prompt für KI-Extraktion)
 | `0001_initial.py` | Alle Basistabellen (ai_configs, image_settings, import_batches, documents, invoice_extractions, order_positions) |
 | `0002_system_prompts.py` | `system_prompts`-Tabelle |
 | `0003_supplier.py` | `suppliers`-Tabelle + `supplier_id` FK auf `invoice_extractions` |
+| `0009_ki_stats_on_invoice_extractions.py` | 5 `ki_*`-Spalten auf `invoice_extractions` (nullable) |
 
 ### Import-Status-Flow
 
