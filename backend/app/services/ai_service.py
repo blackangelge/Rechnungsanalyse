@@ -155,7 +155,7 @@ async def extract_invoice_data(
         # Analyseauftrag als abschließende Textnachricht
         input_parts.append({
             "type": "text",
-            "text": (
+            "content": (
                 f"Die folgende Rechnung besteht aus {len(images_b64)} Seite(n). "
                 "Analysiere alle Seiten und extrahiere die Daten gemäß der Anweisung."
             ),
@@ -233,7 +233,7 @@ async def extract_invoice_data(
                 # LM Studio: output-Array → erstes Item mit type="message"
                 output_items = response_data.get("output") or []
                 raw_text = next(
-                    (item.get("content", "") or item.get("text", "")
+                    (item.get("content", "")
                      for item in output_items if item.get("type") in ("text", "message")),
                     "",
                 )
