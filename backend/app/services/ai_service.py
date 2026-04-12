@@ -160,7 +160,7 @@ async def extract_invoice_data(
     if config.api_key:
         headers["Authorization"] = f"Bearer {config.api_key}"
 
-    request_body = {
+    request_body: dict = {
         "model": config.model_name,
         "max_tokens": config.max_tokens,
         "temperature": config.temperature,
@@ -170,6 +170,12 @@ async def extract_invoice_data(
             {"role": "user", "content": content_parts},
         ],
     }
+
+    # Reasoning-Modus an API weiterleiten (nur wenn aktiviert)
+    reasoning = getattr(config, "reasoning", "off") or "off"
+    if reasoning != "off":
+        # "on" wird als "high" übermittelt (OpenAI-kompatibel: low/medium/high)
+        request_body["reasoning_effort"] = "high" if reasoning == "on" else reasoning
 
     endpoint = config.api_url.rstrip("/") + "/chat/completions"
     logger.debug("Sende Anfrage an: %s", endpoint)

@@ -120,7 +120,7 @@ export default function AISettingsPage() {
                 <span className="text-gray-400">{config.api_url}</span>
               </p>
               <p className="mt-0.5 text-xs text-gray-400">
-                Max. Tokens: {config.max_tokens} · Temperatur: {config.temperature}
+                Max. Tokens: {config.max_tokens} · Temperatur: {config.temperature} · Reasoning: {config.reasoning ?? "off"}
               </p>
             </div>
 

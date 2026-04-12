@@ -64,6 +64,8 @@ export const itemsApi = {
 
 // ─── Typen: KI-Konfigurationen ───────────────────────────────────────────────
 
+export type ReasoningLevel = "off" | "low" | "medium" | "high" | "on";
+
 export interface AIConfig {
   id: number;
   name: string;
@@ -73,6 +75,7 @@ export interface AIConfig {
   is_default: boolean;
   max_tokens: number;
   temperature: number;
+  reasoning: ReasoningLevel;
   created_at: string;
   updated_at: string;
 }
@@ -85,6 +88,7 @@ export interface AIConfigCreate {
   is_default?: boolean;
   max_tokens?: number;
   temperature?: number;
+  reasoning?: ReasoningLevel;
 }
 
 export const aiConfigsApi = {
