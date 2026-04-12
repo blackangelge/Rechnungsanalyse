@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { SystemLog, logsApi, extractApiError } from "@/lib/api";
+import { SystemLog, KiStats, logsApi, extractApiError } from "@/lib/api";
 
 // ─── Hilfsfunktionen ────────────────────────────────────────────────────────
 
@@ -59,6 +59,10 @@ export default function LogsPage() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  // KI-Statistiken
+  const [kiStats, setKiStats] = useState<KiStats | null>(null);
+  const [kiStatsLoading, setKiStatsLoading] = useState(false);
+
   // Filter
   const [filterCategory, setFilterCategory] = useState<string>("");
   const [filterLevel, setFilterLevel] = useState<string>("");
@@ -89,9 +93,22 @@ export default function LogsPage() {
     }
   }, []);
 
+  const loadKiStats = useCallback(async () => {
+    setKiStatsLoading(true);
+    try {
+      const data = await logsApi.kiStats();
+      setKiStats(data);
+    } catch (err) {
+      console.error("KI-Statistiken konnten nicht geladen werden:", err);
+    } finally {
+      setKiStatsLoading(false);
+    }
+  }, []);
+
   useEffect(() => {
     loadLogs(filterCategory, filterLevel);
-  }, [loadLogs, filterCategory, filterLevel]);
+    loadKiStats();
+  }, [loadLogs, filterCategory, filterLevel, loadKiStats]);
 
   // Auto-Refresh
   useEffect(() => {
@@ -128,9 +145,10 @@ export default function LogsPage() {
   async function handleClear() {
     setClearing(true);
     try {
-      const result = await logsApi.clear(filterCategory || undefined);
+      await logsApi.clear(filterCategory || undefined);
       setConfirmClear(false);
       await loadLogs(filterCategory, filterLevel);
+      loadKiStats();
       setError(null);
     } catch (err) {
       setError(extractApiError(err, "Fehler beim Löschen der Logs"));
@@ -244,6 +262,94 @@ export default function LogsPage() {
             >
               Abbrechen
             </button>
+          </div>
+        )}
+      </div>
+
+      {/* ── KI-Statistiken ────────────────────────────────────────────── */}
+      <div className="mb-4 rounded-lg border bg-white p-4 shadow-sm">
+        <div className="mb-3 flex items-center justify-between">
+          <h2 className="text-sm font-semibold text-gray-800">KI-Statistiken (alle Analysen)</h2>
+          <button
+            onClick={loadKiStats}
+            disabled={kiStatsLoading}
+            className="text-xs text-blue-600 hover:underline disabled:opacity-50"
+          >
+            {kiStatsLoading ? "Lade..." : "↻ Aktualisieren"}
+          </button>
+        </div>
+
+        {kiStats === null ? (
+          <p className="text-sm text-gray-400">Wird geladen...</p>
+        ) : (
+          <div className="grid grid-cols-2 gap-x-8 gap-y-2 sm:grid-cols-3 lg:grid-cols-5 text-sm">
+            {/* Anfragen */}
+            <div className="flex flex-col">
+              <span className="text-xs text-gray-500">KI-Anfragen</span>
+              <span className="font-semibold text-gray-900 tabular-nums">
+                {kiStats.ki_requests ?? 0}
+                {kiStats.total_extractions > 0 && (
+                  <span className="ml-1 text-xs font-normal text-gray-400">
+                    / {kiStats.total_extractions} gesamt
+                  </span>
+                )}
+              </span>
+            </div>
+
+            {/* Input-Tokens */}
+            <div className="flex flex-col">
+              <span className="text-xs text-gray-500">Input-Tokens (Σ)</span>
+              <span className="font-semibold text-gray-900 tabular-nums">
+                {kiStats.sum_input_tokens != null
+                  ? kiStats.sum_input_tokens.toLocaleString("de-DE")
+                  : "–"}
+              </span>
+              {kiStats.avg_input_tokens != null && (
+                <span className="text-xs text-gray-400">
+                  Ø {Math.round(kiStats.avg_input_tokens).toLocaleString("de-DE")}
+                </span>
+              )}
+            </div>
+
+            {/* Output-Tokens */}
+            <div className="flex flex-col">
+              <span className="text-xs text-gray-500">Output-Tokens (Σ)</span>
+              <span className="font-semibold text-gray-900 tabular-nums">
+                {kiStats.sum_output_tokens != null
+                  ? kiStats.sum_output_tokens.toLocaleString("de-DE")
+                  : "–"}
+              </span>
+              {kiStats.avg_output_tokens != null && (
+                <span className="text-xs text-gray-400">
+                  Ø {Math.round(kiStats.avg_output_tokens).toLocaleString("de-DE")}
+                </span>
+              )}
+            </div>
+
+            {/* Reasoning-Tokens */}
+            <div className="flex flex-col">
+              <span className="text-xs text-gray-500">Reasoning-Tokens (Σ)</span>
+              <span className="font-semibold text-gray-900 tabular-nums">
+                {kiStats.sum_reasoning_tokens != null
+                  ? kiStats.sum_reasoning_tokens.toLocaleString("de-DE")
+                  : "–"}
+              </span>
+            </div>
+
+            {/* Tokens/Sek. */}
+            <div className="flex flex-col">
+              <span className="text-xs text-gray-500">Tokens/Sek. (Ø)</span>
+              <span className="font-semibold text-gray-900 tabular-nums">
+                {kiStats.avg_tokens_per_second != null
+                  ? kiStats.avg_tokens_per_second.toLocaleString("de-DE", { maximumFractionDigits: 1 })
+                  : "–"}
+              </span>
+              {kiStats.avg_time_to_first_token != null && (
+                <span className="text-xs text-gray-400">
+                  TTFT Ø {kiStats.avg_time_to_first_token.toLocaleString("de-DE", { maximumFractionDigits: 2 })} s
+                </span>
+              )}
+            </div>
           </div>
         )}
       </div>

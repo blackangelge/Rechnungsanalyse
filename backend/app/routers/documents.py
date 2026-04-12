@@ -189,18 +189,6 @@ async def analyze_documents(
     )
 
 
-def _db_get_ai_concurrency() -> int:
-    """Liest die KI-Parallelität aus den ProcessingSettings (sync, für to_thread)."""
-    db = SessionLocal()
-    try:
-        s = crud.processing_settings.get_or_create(db)
-        return s.ai_concurrency
-    except Exception:
-        return 2
-    finally:
-        db.close()
-
-
 def _db_analyze_read(doc_id: int, ai_config_id: int) -> dict | None:
     """
     Phase 1 (sync, für asyncio.to_thread): Liest alle für die KI-Analyse
@@ -270,6 +258,7 @@ def _db_analyze_write(
     extracted_fields: dict,
     order_positions: list,
     raw_response: str,
+    ki_stats: dict | None = None,
 ) -> None:
     """
     Phase 4 (sync, für asyncio.to_thread): Schreibt KI-Ergebnisse in die DB.
@@ -305,14 +294,29 @@ def _db_analyze_write(
         except Exception as exc:
             logger.warning("Supplier-Lookup für #%d fehlgeschlagen: %s", doc_id, exc)
 
+        # Felder entfernen, die nur für den Supplier-Lookup genutzt werden
+        # und KEINE Spalten in invoice_extractions sind
+        _SUPPLIER_ONLY_KEYS = {"supplier_street", "supplier_zip", "supplier_city"}
+        extraction_data = {k: v for k, v in extracted_fields.items()
+                           if k not in _SUPPLIER_ONLY_KEYS}
+
         crud.document.save_extraction(
             db=db,
             doc_id=doc_id,
-            extracted_data=extracted_fields,
+            extracted_data=extraction_data,
             positions=order_positions,
             raw_response=raw_response,
             supplier_id=supplier_id,
+            ki_stats=ki_stats,
         )
+
+        # Seitenanzahl aus der KI-Analyse (= Anzahl gerenderter Bilder) setzen
+        if page_count > 0:
+            from app.models.document import Document as _DocModel
+            _doc = db.get(_DocModel, doc_id)
+            if _doc is not None:
+                _doc.page_count = page_count
+                db.commit()
 
         is_ki_error = any(raw_response.startswith(p) for p in (
             "KI überlastet:", "KI-Fehler:", "KI-Timeout",
@@ -332,10 +336,10 @@ def _db_analyze_write(
             crud.system_log.add(
                 db, category="ki", level="info",
                 message=(f"KI-Analyse erfolgreich: {original_filename} — "
-                         f"{filled} Felder, {len(order_positions)} Positionen"),
+                         f"{filled} Felder, {len(order_positions)} Positionen, {page_count} Seite(n)"),
                 batch_id=batch_id, document_id=doc_id,
             )
-            logger.info("Dokument #%d erfolgreich analysiert", doc_id)
+            logger.info("Dokument #%d erfolgreich analysiert (%d Seiten)", doc_id, page_count)
 
     except Exception as exc:
         logger.exception("Phase 4 DB-Fehler bei Dokument #%d: %s", doc_id, exc)
@@ -355,25 +359,30 @@ async def _run_analysis(
     system_prompt_text: str | None,
 ) -> None:
     """
-    Hintergrund-Coroutine: Analysiert alle Dokumente parallel.
-    DB-Operationen laufen via asyncio.to_thread() — blockieren den Event-Loop nicht.
+    Hintergrund-Coroutine: Analysiert alle Dokumente nacheinander (sequenziell).
+
+    Warum sequenziell statt parallel?
+    - Lokale Modelle (LM Studio, Ollama) verarbeiten ohnehin nur eine Anfrage gleichzeitig.
+    - Parallele PDF-Renderungen + JSON-Serialisierungen erschöpfen den Thread-Pool und
+      den Arbeitsspeicher des NAS.
+    - Sequenziell ist auf einem NAS mit lokalem Modell genauso schnell, aber stabil.
     """
-    ai_concurrency = await asyncio.to_thread(_db_get_ai_concurrency)
-    logger.info("KI-Analyse-Parallelität: %d gleichzeitige Aufrufe", ai_concurrency)
-    semaphore = asyncio.Semaphore(ai_concurrency)
-    tasks = [
-        _analyze_single(doc_id, ai_config_id, system_prompt_text, semaphore)
-        for doc_id in document_ids
-    ]
-    await asyncio.gather(*tasks)
-    logger.info("KI-Analyse-Batch abgeschlossen (%d Dokumente)", len(document_ids))
+    logger.info("KI-Analyse gestartet: %d Dokument(e) werden nacheinander verarbeitet", len(document_ids))
+
+    for doc_id in document_ids:
+        try:
+            await _analyze_single(doc_id, ai_config_id, system_prompt_text)
+        except Exception as exc:
+            logger.exception("Unbehandelter Fehler bei Dokument #%d: %s", doc_id, exc)
+            await asyncio.to_thread(_set_error, doc_id, f"Unerwarteter Fehler: {exc}")
+
+    logger.info("KI-Analyse abgeschlossen (%d Dokumente)", len(document_ids))
 
 
 async def _analyze_single(
     doc_id: int,
     ai_config_id: int,
     system_prompt_text: str | None,
-    semaphore: asyncio.Semaphore,
 ) -> None:
     """
     Analysiert ein einzelnes Dokument mit KI-Extraktion.
@@ -385,80 +394,89 @@ async def _analyze_single(
 
     Phase 1: DB-Daten lesen         → asyncio.to_thread(_db_analyze_read)
     Phase 2: PDF → Bilder           → _run_ki_io() (dedizierter Pool)
-    Phase 3: KI-API-Aufruf          → async httpx (nativ nicht-blockierend)
+    Phase 3: KI-API-Aufruf          → asyncio.to_thread (sync httpx.Client, im Thread)
     Phase 4: Ergebnisse in DB       → asyncio.to_thread(_db_analyze_write)
     """
-    async with semaphore:
-        # ── Phase 1: Alle Daten aus DB lesen (im Thread, nicht-blockierend) ──
-        data = await asyncio.to_thread(_db_analyze_read, doc_id, ai_config_id)
-        if data is None:
-            return  # Fehler wurde bereits von _db_analyze_read in DB geschrieben
+    # ── Phase 1: Alle Daten aus DB lesen (im Thread, nicht-blockierend) ──
+    data = await asyncio.to_thread(_db_analyze_read, doc_id, ai_config_id)
+    if data is None:
+        return  # Fehler wurde bereits von _db_analyze_read in DB geschrieben
 
-        pdf_path: Path = data["pdf_path"]
-        original_filename: str = data["original_filename"]
-        batch_id: int | None = data["batch_id"]
-        img_dpi: int = data["img_dpi"]
-        img_format: str = data["img_format"]
-        img_quality: int = data["img_quality"]
-        ai_api_url: str = data["ai_api_url"]
-        ai_api_key: str | None = data["ai_api_key"]
-        ai_model_name: str = data["ai_model_name"]
-        ai_max_tokens: int = data["ai_max_tokens"]
-        ai_temperature: float = data["ai_temperature"]
-        ai_reasoning: str = data["ai_reasoning"]
-        ai_endpoint_type: str = data["ai_endpoint_type"]
+    pdf_path: Path = data["pdf_path"]
+    original_filename: str = data["original_filename"]
+    batch_id: int | None = data["batch_id"]
+    img_dpi: int = data["img_dpi"]
+    img_format: str = data["img_format"]
+    img_quality: int = data["img_quality"]
+    ai_api_url: str = data["ai_api_url"]
+    ai_api_key: str | None = data["ai_api_key"]
+    ai_model_name: str = data["ai_model_name"]
+    ai_max_tokens: int = data["ai_max_tokens"]
+    ai_temperature: float = data["ai_temperature"]
+    ai_reasoning: str = data["ai_reasoning"]
+    ai_endpoint_type: str = data["ai_endpoint_type"]
 
-        # ── Phase 2: PDF → Bilder (blockierende IO, kein DB-Handle offen) ────
-        logger.info("Rendere PDF für Dokument #%d: %s", doc_id, pdf_path.name)
-        try:
-            images_b64: list = await _run_ki_io(
-                pdf_service.pdf_to_base64_images,
-                pdf_path,
-                img_dpi,
-                img_format,
-                img_quality,
-            )
-        except Exception as exc:
-            logger.error("Fehler beim Rendern von #%d: %s", doc_id, exc)
-            _set_error(doc_id, f"PDF-Rendering-Fehler: {exc}")
-            return
-
-        if not images_b64:
-            _set_error(doc_id, "PDF konnte nicht gerendert werden")
-            return
-
-        # ── Phase 3: KI-API-Aufruf (async httpx, kein DB-Handle offen) ───────
-        logger.info("Starte KI-Extraktion für Dokument #%d (%d Seite(n))", doc_id, len(images_b64))
-
-        # Minimales Config-Proxy-Objekt für ai_service (nur benötigte Felder)
-        class _ConfigProxy:
-            def __init__(self):
-                self.api_url = ai_api_url
-                self.api_key = ai_api_key
-                self.model_name = ai_model_name
-                self.max_tokens = ai_max_tokens
-                self.temperature = ai_temperature
-                self.reasoning = ai_reasoning
-                self.endpoint_type = ai_endpoint_type
-
-        extracted_fields, order_positions, raw_response = await ai_service.extract_invoice_data(
-            images_b64=images_b64,
-            config=_ConfigProxy(),
-            system_prompt_text=system_prompt_text,
+    # ── Phase 2: PDF → Bilder (blockierende IO, kein DB-Handle offen) ────
+    logger.info("Rendere PDF für Dokument #%d: %s", doc_id, pdf_path.name)
+    try:
+        images_b64: list = await _run_ki_io(
+            pdf_service.pdf_to_base64_images,
+            pdf_path,
+            img_dpi,
+            img_format,
+            img_quality,
         )
+    except Exception as exc:
+        logger.error("Fehler beim Rendern von #%d: %s", doc_id, exc)
+        _set_error(doc_id, f"PDF-Rendering-Fehler: {exc}")
+        return
 
-        # ── Phase 4: Ergebnisse in DB schreiben (im Thread, nicht-blockierend) ─
+    if not images_b64:
+        _set_error(doc_id, "PDF konnte nicht gerendert werden")
+        return
+
+    # ── Phase 3: KI-API-Aufruf (sync httpx.Client im Thread, kein DB-Handle offen) ─
+    logger.info("Starte KI-Extraktion für Dokument #%d (%d Seite(n))", doc_id, len(images_b64))
+
+    # Minimales Config-Proxy-Objekt für ai_service (nur benötigte Felder)
+    class _ConfigProxy:
+        def __init__(self):
+            self.api_url = ai_api_url
+            self.api_key = ai_api_key
+            self.model_name = ai_model_name
+            self.max_tokens = ai_max_tokens
+            self.temperature = ai_temperature
+            self.reasoning = ai_reasoning
+            self.endpoint_type = ai_endpoint_type
+
+    # extract_invoice_data ist synchron — komplett im Thread ausführen.
+    # Der Event-Loop berührt NICHTS davon (JSON-Dump, HTTP, Parsing).
+    config_proxy = _ConfigProxy()
+    extracted_fields, order_positions, raw_response, ki_stats = (
         await asyncio.to_thread(
-            _db_analyze_write,
-            doc_id,
-            original_filename,
-            batch_id,
-            ai_model_name,
-            len(images_b64),
-            extracted_fields,
-            order_positions,
-            raw_response,
+            ai_service.extract_invoice_data,
+            images_b64,
+            config_proxy,
+            system_prompt_text,
         )
+    )
+    # Seitenanzahl merken und Bilddaten sofort freigeben
+    page_count = len(images_b64)
+    del images_b64
+
+    # ── Phase 4: Ergebnisse in DB schreiben (im Thread, nicht-blockierend) ─
+    await asyncio.to_thread(
+        _db_analyze_write,
+        doc_id,
+        original_filename,
+        batch_id,
+        ai_model_name,
+        page_count,
+        extracted_fields,
+        order_positions,
+        raw_response,
+        ki_stats,
+    )
 
 
 # ─── DELETE /api/documents/{id} — Soft-Delete ───────────────────────────────

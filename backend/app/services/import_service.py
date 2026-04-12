@@ -7,7 +7,7 @@ ARCHITEKTUR — Event-Loop-Schutz:
   jederzeit reaktionsfähig — auch während langer Import-Vorgänge.
 
   Drei Thread-Pools:
-  - _IMPORT_IO_EXECUTOR : Datei-Kopieren, Seitenanzahl lesen
+  - _IMPORT_IO_EXECUTOR : Datei-Kopieren
   - asyncio.to_thread() : DB-Operationen (verwendet den Standard-Pool)
   - (Event-Loop-Thread) : NUR async/await-Koordination, KEIN blockierender Code
 """
@@ -22,7 +22,6 @@ from pathlib import Path
 from app import crud
 from app.config import settings
 from app.database import SessionLocal
-from app.services import pdf_service
 
 logger = logging.getLogger(__name__)
 
@@ -333,15 +332,9 @@ async def _process_single_document(
                                 f"Kopierfehler: {exc}", pdf_path.name)
         return False
 
-    # ── Phase 3: Seitenanzahl lesen (IO im Import-Pool) ──────────────────────
-    try:
-        page_count = await _run_import_io(pdf_service.get_page_count, dest_path)
-    except Exception as exc:
-        logger.warning("Seitenanzahl für '%s' nicht lesbar: %s", pdf_path.name, exc)
-        page_count = 0
+    # ── Phase 3: Status auf 'done' setzen (DB im Thread) ─────────────────────
+    # Seitenanzahl wird später bei der KI-Analyse aus den gerenderten Bildern gesetzt.
+    await asyncio.to_thread(_db_doc_finish, doc_id, stored_filename, 0)
 
-    # ── Phase 4: Status auf 'done' setzen (DB im Thread) ─────────────────────
-    await asyncio.to_thread(_db_doc_finish, doc_id, stored_filename, page_count)
-
-    logger.debug("Dokument #%d importiert: %s (%d Seiten)", doc_id, pdf_path.name, page_count)
+    logger.debug("Dokument #%d importiert: %s", doc_id, pdf_path.name)
     return True

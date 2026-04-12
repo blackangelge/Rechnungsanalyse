@@ -10,7 +10,7 @@ später analysieren zu können.
 from datetime import date, datetime
 from decimal import Decimal
 
-from sqlalchemy import Date, DateTime, ForeignKey, Integer, Numeric, String, Text, func
+from sqlalchemy import Date, DateTime, Float, ForeignKey, Integer, Numeric, String, Text, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.supplier import Supplier  # noqa: F401
@@ -104,6 +104,13 @@ class InvoiceExtraction(Base):
     # ─── KI-Rohdaten ─────────────────────────────────────────────────────────
     # Vollständige JSON-Antwort der KI für spätere Fehleranalyse
     raw_response: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # ─── KI-Statistiken ──────────────────────────────────────────────────────
+    ki_input_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    ki_output_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    ki_reasoning_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    ki_tokens_per_second: Mapped[float | None] = mapped_column(Float, nullable=True)
+    ki_time_to_first_token: Mapped[float | None] = mapped_column(Float, nullable=True)
 
     # Erstellungs- und Änderungszeitpunkt
     created_at: Mapped[datetime] = mapped_column(

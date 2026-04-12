@@ -417,10 +417,26 @@ export interface SystemLog {
   created_at: string;
 }
 
+export interface KiStats {
+  total_extractions: number;
+  ki_requests: number;
+  sum_input_tokens: number | null;
+  sum_output_tokens: number | null;
+  sum_reasoning_tokens: number | null;
+  avg_tokens_per_second: number | null;
+  avg_time_to_first_token: number | null;
+  avg_input_tokens: number | null;
+  avg_output_tokens: number | null;
+}
+
 export const logsApi = {
   /** Log-Einträge laden (neueste zuerst) */
   list: (params?: { category?: string; level?: string; limit?: number }) =>
     apiClient.get<SystemLog[]>("/api/logs", { params }).then((r) => r.data),
+
+  /** Aggregierte KI-Statistiken */
+  kiStats: () =>
+    apiClient.get<KiStats>("/api/logs/ki-stats").then((r) => r.data),
 
   /** Alle oder kategoriegefilterte Logs löschen */
   clear: (category?: string) =>

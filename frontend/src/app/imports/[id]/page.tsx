@@ -3,16 +3,10 @@
  *
  * Zeigt für einen Import-Batch:
  * - Fortschrittsanzeige mit SSE-Echtzeit-Updates
- * - Debug-Fenster mit rohen SSE-Events
- * - Dokumententabelle (paginiert, 50 pro Seite) — NUR nach Abschluss des Imports
+ * - Dokumententabelle (paginiert) — nach Abschluss des Imports
  *
- * WICHTIG: Während der Import läuft, wird die Dokumentliste NICHT geladen
- * und NICHT alle 5 Sekunden gepolt. Das SSE-Protokoll liefert den Fortschritt.
- * Erst wenn der Import abgeschlossen ist (done/error), wird die Dokumentliste
- * einmalig geladen und paginiert angezeigt.
- *
- * Warum? Mit 1000 Dokumenten wäre ein 5-Sekunden-Poll ein 1000-Zeilen-JSON
- * bei jeder Anfrage — das friert den Browser ein und belastet den Server.
+ * Während der Import läuft: SSE für Echtzeit-Fortschritt + Polling als Fallback.
+ * Nach Abschluss: Dokumentliste wird einmalig geladen.
  */
 
 "use client";
@@ -21,7 +15,6 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useParams } from "next/navigation";
 import { ImportBatch, DocumentItem, importsApi } from "@/lib/api";
 import ProgressPanel from "@/components/imports/ProgressPanel";
-import DebugWindow from "@/components/imports/DebugWindow";
 import DocumentsTable from "@/components/imports/DocumentsTable";
 
 export default function ImportDetailPage() {
@@ -39,6 +32,10 @@ export default function ImportDetailPage() {
 
   // Ref to track whether batch was ever successfully loaded (avoids `batch` in deps)
   const batchLoadedRef = useRef(false);
+  // Ref to track whether documents have been loaded (avoid double-load)
+  const docsLoadedRef = useRef(false);
+  // Polling-Timer
+  const pollTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   /** Nur Batch-Metadaten laden (schnell, kein JOIN über alle Dokumente) */
   const loadMeta = useCallback(async () => {
@@ -49,19 +46,16 @@ export default function ImportDetailPage() {
       batchLoadedRef.current = true;
       return data;
     } catch (err: unknown) {
-      // ECONNRESET / Netzwerkfehler während laufendem Import → kein harter Fehler
       const isNetworkErr =
         err instanceof Error &&
         (err.message.includes("Network Error") ||
           err.message.includes("ECONNRESET") ||
           err.message.includes("socket hang up"));
       if (isNetworkErr && !batchLoadedRef.current) {
-        // Noch kein Batch geladen → Fallback: Seite zeigt Ladezustand
         setError("Backend kurzzeitig nicht erreichbar — bitte Seite neu laden.");
       } else if (!isNetworkErr) {
         setError("Fehler beim Laden des Imports");
       }
-      // Bei bereits geladenem Batch + Netzwerkfehler: alten Stand behalten
       return null;
     } finally {
       setMetaLoading(false);
@@ -70,30 +64,70 @@ export default function ImportDetailPage() {
 
   /** Dokumente laden — einmalig nach Import-Abschluss */
   const loadDocuments = useCallback(async () => {
+    if (docsLoadedRef.current) return; // kein Doppel-Load
+    docsLoadedRef.current = true;
     setDocsLoading(true);
     try {
       const data = await importsApi.get(batchId);
       setDocuments(data.documents);
-      setBatch(data); // ImportBatchWithDocuments ist Subtyp von ImportBatch
+      setBatch(data);
     } catch {
+      docsLoadedRef.current = false; // Retry erlauben
       setError("Fehler beim Laden der Dokumente");
     } finally {
       setDocsLoading(false);
     }
   }, [batchId]);
 
+  /** Polling-Stop */
+  const stopPolling = useCallback(() => {
+    if (pollTimerRef.current) {
+      clearInterval(pollTimerRef.current);
+      pollTimerRef.current = null;
+    }
+  }, []);
+
+  /** Polling starten: prüft alle 4 s den Batch-Status als SSE-Fallback */
+  const startPolling = useCallback(() => {
+    if (pollTimerRef.current) return; // läuft bereits
+    pollTimerRef.current = setInterval(async () => {
+      try {
+        const data = await importsApi.getStatus(batchId);
+        setBatch(data);
+        if (data.status === "done" || data.status === "error") {
+          stopPolling();
+          loadDocuments();
+        }
+      } catch {
+        // Netzwerkfehler ignorieren — nächster Poll-Versuch in 4 s
+      }
+    }, 4000);
+  }, [batchId, loadDocuments, stopPolling]);
+
   // Initialer Ladevorgang
   useEffect(() => {
     loadMeta().then((data) => {
-      // Falls Import bereits abgeschlossen → Dokumente sofort laden
-      if (data && (data.status === "done" || data.status === "error")) {
+      if (!data) return;
+      if (data.status === "done" || data.status === "error") {
+        // Import bereits abgeschlossen → Dokumente sofort laden
         loadDocuments();
+      } else {
+        // Import läuft → Polling als Fallback starten (SSE kann ausfallen)
+        startPolling();
       }
     });
-  }, [loadMeta, loadDocuments]);
+    return () => stopPolling();
+  }, [loadMeta, loadDocuments, startPolling, stopPolling]);
 
-  /** Callback vom ProgressPanel: Import ist abgeschlossen → Dokumente laden */
+  /** Callback vom ProgressPanel: Import ist abgeschlossen (via SSE) */
   const handleImportDone = useCallback(() => {
+    stopPolling(); // Polling stoppen, SSE hat gewonnen
+    loadDocuments();
+  }, [loadDocuments, stopPolling]);
+
+  /** Manueller Refresh der Dokumentliste */
+  const handleManualRefresh = useCallback(() => {
+    docsLoadedRef.current = false;
     loadDocuments();
   }, [loadDocuments]);
 
@@ -134,17 +168,14 @@ export default function ImportDetailPage() {
         </div>
       )}
 
-      {/* Fortschrittsanzeige + Debug nebeneinander */}
-      <div className="grid gap-4 lg:grid-cols-2">
-        <ProgressPanel
-          batchId={batchId}
-          initialStatus={batch.status}
-          initialTotal={batch.total_docs}
-          initialProcessed={batch.processed_docs}
-          onDone={handleImportDone}
-        />
-        <DebugWindow batchId={batchId} initialStatus={batch.status} />
-      </div>
+      {/* Fortschrittsanzeige */}
+      <ProgressPanel
+        batchId={batchId}
+        initialStatus={batch.status}
+        initialTotal={batch.total_docs}
+        initialProcessed={batch.processed_docs}
+        onDone={handleImportDone}
+      />
 
       {/* Während Import läuft: Hinweis statt Dokumententabelle */}
       {isActive && (
@@ -172,7 +203,7 @@ export default function ImportDetailPage() {
               )}
             </h2>
             <button
-              onClick={loadDocuments}
+              onClick={handleManualRefresh}
               disabled={docsLoading}
               className="rounded border border-gray-300 px-3 py-1 text-xs text-gray-600 hover:bg-gray-50 disabled:opacity-40"
             >
@@ -190,7 +221,7 @@ export default function ImportDetailPage() {
           {documents !== null && (
             <DocumentsTable
               documents={documents}
-              onRefresh={loadDocuments}
+              onRefresh={handleManualRefresh}
             />
           )}
         </div>
