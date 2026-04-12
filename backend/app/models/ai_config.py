@@ -46,6 +46,10 @@ class AIConfig(Base):
     # Temperatur für die Textgenerierung (0 = deterministisch, 1 = kreativ)
     temperature: Mapped[float] = mapped_column(Float, default=0.1, nullable=False)
 
+    # Reasoning-Modus: "off" | "low" | "medium" | "high" | "on"
+    # Wird als reasoning_effort an OpenAI-kompatible APIs übergeben (sofern != "off")
+    reasoning: Mapped[str] = mapped_column(String(20), default="off", server_default="off", nullable=False)
+
     # Erstellungs- und Änderungszeitpunkt
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False

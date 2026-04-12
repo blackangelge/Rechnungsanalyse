@@ -7,8 +7,11 @@ Trennt die API-Datenstruktur vom ORM-Modell:
 """
 
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, HttpUrl
+
+ReasoningLevel = Literal["off", "low", "medium", "high", "on"]
 
 
 class AIConfigBase(BaseModel):
@@ -28,6 +31,8 @@ class AIConfigBase(BaseModel):
     max_tokens: int = 2048
     # Temperatur (0 = deterministisch, 1 = kreativ)
     temperature: float = 0.1
+    # Reasoning-Modus für unterstützte Modelle
+    reasoning: ReasoningLevel = "off"
 
 
 class AIConfigCreate(AIConfigBase):

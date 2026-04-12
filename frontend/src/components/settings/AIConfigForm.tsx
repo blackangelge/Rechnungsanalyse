@@ -8,7 +8,7 @@
 "use client";
 
 import { useState } from "react";
-import { AIConfig, AIConfigCreate, aiConfigsApi } from "@/lib/api";
+import { AIConfig, AIConfigCreate, aiConfigsApi, ReasoningLevel } from "@/lib/api";
 
 interface Props {
   /** Vorhandene Konfiguration zum Bearbeiten (undefined = neue Konfiguration) */
@@ -28,6 +28,7 @@ export default function AIConfigForm({ initialData, onSaved, onCancel }: Props) 
   const [isDefault, setIsDefault] = useState(initialData?.is_default ?? false);
   const [maxTokens, setMaxTokens] = useState(initialData?.max_tokens ?? 2048);
   const [temperature, setTemperature] = useState(initialData?.temperature ?? 0.1);
+  const [reasoning, setReasoning] = useState<ReasoningLevel>(initialData?.reasoning ?? "off");
 
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -45,6 +46,7 @@ export default function AIConfigForm({ initialData, onSaved, onCancel }: Props) 
       is_default: isDefault,
       max_tokens: maxTokens,
       temperature,
+      reasoning,
     };
 
     try {
@@ -165,6 +167,27 @@ export default function AIConfigForm({ initialData, onSaved, onCancel }: Props) 
             onChange={(e) => setTemperature(parseFloat(e.target.value))}
           />
         </div>
+      </div>
+
+      {/* Reasoning */}
+      <div>
+        <label className="mb-1 block text-sm font-medium text-gray-700">
+          Reasoning
+        </label>
+        <select
+          value={reasoning}
+          onChange={(e) => setReasoning(e.target.value as ReasoningLevel)}
+          className="rounded border border-gray-300 bg-white px-3 py-2 text-sm focus:border-blue-500 focus:outline-none w-full"
+        >
+          <option value="off">off — deaktiviert (Standard)</option>
+          <option value="low">low — gering</option>
+          <option value="medium">medium — mittel</option>
+          <option value="high">high — hoch</option>
+          <option value="on">on — maximal</option>
+        </select>
+        <p className="mt-1 text-xs text-gray-400">
+          Wird als <span className="font-mono">reasoning_effort</span> an die API übergeben. Nur von bestimmten Modellen unterstützt.
+        </p>
       </div>
 
       {/* Standard-Konfiguration */}
