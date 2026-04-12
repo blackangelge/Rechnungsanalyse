@@ -1,24 +1,32 @@
 """
-Pydantic-Schema für Lieferanten-Stammdaten.
+Pydantic-Schemas für Lieferanten.
 """
 
 from datetime import datetime
-
 from pydantic import BaseModel, ConfigDict
 
 
-class SupplierRead(BaseModel):
-    """Lieferanten-Stammdaten (Lese-Schema)."""
-
-    id: int
+class SupplierBase(BaseModel):
     name: str
-    address: str | None
-    hrb_number: str | None
-    tax_number: str | None
-    vat_id: str | None
-    bank_name: str | None
-    iban: str | None
-    bic: str | None
+    street: str | None = None
+    zip_code: str | None = None
+    city: str | None = None
+    address: str | None = None
+    hrb_number: str | None = None
+    tax_number: str | None = None
+    vat_id: str | None = None
+    bank_name: str | None = None
+    iban: str | None = None
+    bic: str | None = None
+
+
+class SupplierUpdate(SupplierBase):
+    pass
+
+
+class SupplierRead(SupplierBase):
+    id: int
+    document_count: int = 0
     created_at: datetime
     updated_at: datetime
 

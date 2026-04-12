@@ -98,28 +98,29 @@ JSON-Struktur:
 
 # Timeout für einen einzelnen KI-API-Aufruf in Sekunden.
 # Lokale Modelle können bei langen PDFs länger brauchen.
-REQUEST_TIMEOUT_SECONDS = 120
+REQUEST_TIMEOUT_SECONDS = 900
 
 
-async def extract_invoice_data(
+def extract_invoice_data(
     images_b64: list[str],
     config: AIConfig,
     system_prompt_text: str | None = None,
-) -> tuple[dict[str, Any], list[dict[str, Any]], str]:
+) -> tuple[dict[str, Any], list[dict[str, Any]], str, dict]:
     """
     Sendet Rechnungsbilder an die Vision-LLM und gibt die extrahierten Daten zurück.
+
+    WICHTIG: Diese Funktion ist SYNCHRON und muss immer über asyncio.to_thread()
+    aufgerufen werden. Der gesamte HTTP-Request (inkl. JSON-Serialisierung,
+    Netzwerk-I/O und Response-Parsing) läuft im Thread — der Event-Loop wird
+    nie blockiert, egal wie groß die Payloads oder wie lang die KI braucht.
 
     Args:
         images_b64: Liste von Base64-kodierten PNG-Bildern (eine pro Seite).
         config: KI-Konfiguration mit API-URL, Modell-Name und Authentifizierung.
-        system_prompt_text: Optionaler System-Prompt-Text. Falls None, wird
-                            DEFAULT_SYSTEM_PROMPT verwendet.
+        system_prompt_text: Optionaler System-Prompt-Text.
 
     Returns:
-        Tuple aus:
-          - extracted_fields: Dict mit allen Rechnungsfeldern (ohne order_positions)
-          - order_positions: Liste von Dicts für die Bestellpositionen
-          - raw_response: Vollständige KI-Antwort als String (für Debugging)
+        Tuple: (extracted_fields, order_positions, raw_response, ki_stats)
 
     Raises nie eine Exception — gibt bei Fehlern leere Dicts zurück.
     """
@@ -127,130 +128,169 @@ async def extract_invoice_data(
         "Starte KI-Extraktion: Modell='%s', Seiten=%d", config.model_name, len(images_b64)
     )
 
-    # System-Prompt auswählen
     active_system_prompt = system_prompt_text if system_prompt_text else DEFAULT_SYSTEM_PROMPT
+    endpoint_type = getattr(config, "endpoint_type", "openai") or "openai"
+    base = config.api_url.rstrip("/")
+    reasoning = getattr(config, "reasoning", "off") or "off"
+    reasoning_value = "high" if reasoning == "on" else reasoning
 
-    # ─── Nachricht zusammenbauen ────────────────────────────────────────────
-    # Alle Seiten werden als separate image_url-Parts in EINER Nachricht gesendet.
-    content_parts: list[dict] = []
-
-    # Einleitungstext vor den Bildern
-    content_parts.append({
-        "type": "text",
-        "text": (
-            f"Die folgende Rechnung besteht aus {len(images_b64)} Seite(n). "
-            "Analysiere alle Seiten und extrahiere die Daten gemäß der Anweisung."
-        ),
-    })
-
-    # Jede Seite als Bild anhängen
-    for idx, data_url in enumerate(images_b64):
-        content_parts.append({
-            "type": "image_url",
-            "image_url": {
-                "url": data_url,
-                # "detail" weglassen — LM Studio und viele lokale APIs ignorieren
-                # oder lehnen diesen Parameter ab, was zu Channel-Warnungen führt.
-            },
-        })
-        logger.debug("  Seite %d/%d in Anfrage eingebettet", idx + 1, len(images_b64))
-
-    # ─── API-Aufruf ─────────────────────────────────────────────────────────
     headers = {"Content-Type": "application/json"}
     if config.api_key:
         headers["Authorization"] = f"Bearer {config.api_key}"
 
-    request_body: dict = {
-        "model": config.model_name,
-        "max_tokens": config.max_tokens,
-        "temperature": config.temperature,
-        "stream": False,  # Explizit deaktivieren — LM Studio löst sonst Channel-Warnungen aus
-        "messages": [
-            {"role": "system", "content": active_system_prompt},
-            {"role": "user", "content": content_parts},
-        ],
-    }
+    # ─── Request je nach Endpunkt-Typ aufbauen ───────────────────────────────
+    if endpoint_type == "lmstudio":
+        endpoint = base + "/api/v1/chat"
+        input_parts: list[dict] = []
+        for idx, data_url in enumerate(images_b64):
+            input_parts.append({"type": "image", "data_url": data_url})
+            logger.debug("  Seite %d/%d eingebettet", idx + 1, len(images_b64))
+        input_parts.append({
+            "type": "text",
+            "content": (
+                f"Die folgende Rechnung besteht aus {len(images_b64)} Seite(n). "
+                "Analysiere alle Seiten und extrahiere die Daten gemäß der Anweisung."
+            ),
+        })
+        request_body: dict = {
+            "model": config.model_name,
+            "input": input_parts,
+            "system_prompt": active_system_prompt,
+            "temperature": config.temperature,
+            "max_output_tokens": config.max_tokens,
+            "reasoning": reasoning_value,
+            "stream": False,
+        }
+        del input_parts
+    else:
+        endpoint = base + "/v1/chat/completions"
+        content_parts: list[dict] = [{
+            "type": "text",
+            "text": (
+                f"Die folgende Rechnung besteht aus {len(images_b64)} Seite(n). "
+                "Analysiere alle Seiten und extrahiere die Daten gemäß der Anweisung."
+            ),
+        }]
+        for idx, data_url in enumerate(images_b64):
+            content_parts.append({"type": "image_url", "image_url": {"url": data_url}})
+            logger.debug("  Seite %d/%d eingebettet", idx + 1, len(images_b64))
+        request_body = {
+            "model": config.model_name,
+            "max_tokens": config.max_tokens,
+            "temperature": config.temperature,
+            "reasoning": reasoning_value,
+            "stream": False,
+            "messages": [
+                {"role": "system", "content": active_system_prompt},
+                {"role": "user", "content": content_parts},
+            ],
+        }
+        del content_parts
 
-    # Reasoning-Modus an API weiterleiten (nur wenn aktiviert)
-    reasoning = getattr(config, "reasoning", "off") or "off"
-    if reasoning != "off":
-        # "on" wird als "high" übermittelt (OpenAI-kompatibel: low/medium/high)
-        request_body["reasoning_effort"] = "high" if reasoning == "on" else reasoning
+    logger.info("Sende Anfrage an: %s (Typ: %s)", endpoint, endpoint_type)
 
-    endpoint = config.api_url.rstrip("/") + "/chat/completions"
-    logger.debug("Sende Anfrage an: %s", endpoint)
-
+    # ─── Synchroner HTTP-Request (läuft im Thread, blockiert nie den Event-Loop) ─
     raw_text = ""
+    ki_stats: dict = {}
 
     try:
-        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as client:
-            response = await client.post(endpoint, json=request_body, headers=headers)
+        # JSON-Serialisierung: kann bei großen Bilddaten mehrere Sekunden dauern
+        serialized_body = json.dumps(request_body).encode("utf-8")
+        request_body.clear()  # Bilddaten sofort freigeben
+
+        with httpx.Client(timeout=REQUEST_TIMEOUT_SECONDS) as client:
+            response = client.post(endpoint, content=serialized_body, headers=headers)
+        del serialized_body
 
         status_code = response.status_code
-
-        # ─── HTTP-Fehlerbehandlung ohne raise_for_status ──────────────────
         if status_code == 200:
-            # Erfolg — normal verarbeiten
             pass
         elif status_code in (429, 503, 502, 504):
             raw_text = f"KI überlastet: HTTP {status_code}"
-            logger.warning("KI-API überlastet (HTTP %d): %s", status_code, endpoint)
-            return {}, [], raw_text
+            logger.warning("KI-API überlastet (HTTP %d)", status_code)
+            return {}, [], raw_text, {}
         elif status_code == 500:
-            raw_text = f"KI-Fehler: HTTP 500"
-            logger.error("KI-API interner Fehler (HTTP 500): %s", endpoint)
-            return {}, [], raw_text
+            raw_text = "KI-Fehler: HTTP 500"
+            logger.error("KI-API interner Fehler (HTTP 500)")
+            return {}, [], raw_text, {}
         else:
             raw_text = f"KI-Fehler: HTTP {status_code}"
-            logger.error("KI-API unerwarteter Status (HTTP %d): %s", status_code, endpoint)
-            return {}, [], raw_text
+            logger.error("KI-API unerwarteter Status (HTTP %d)", status_code)
+            return {}, [], raw_text, {}
 
-        # ─── Antwort auslesen ────────────────────────────────────────────
+        # ─── Response-Parsing ────────────────────────────────────────────────
         try:
-            response_data = response.json()
-            raw_text = (
-                response_data.get("choices", [{}])[0]
-                .get("message", {})
-                .get("content", "")
-            )
+            response_data = json.loads(response.content)
+            if endpoint_type == "lmstudio":
+                output_items = response_data.get("output") or []
+                raw_text = next(
+                    (item.get("content", "")
+                     for item in output_items if item.get("type") in ("text", "message")),
+                    "",
+                )
+                s = response_data.get("stats") or {}
+                ki_stats = {
+                    "input_tokens":        s.get("input_tokens"),
+                    "output_tokens":       s.get("total_output_tokens"),
+                    "reasoning_tokens":    s.get("reasoning_output_tokens"),
+                    "tokens_per_second":   s.get("tokens_per_second"),
+                    "time_to_first_token": s.get("time_to_first_token_seconds"),
+                }
+                logger.info(
+                    "LM Studio Stats: %s In, %s Out, %s Reasoning, %.1f tok/s",
+                    ki_stats["input_tokens"], ki_stats["output_tokens"],
+                    ki_stats["reasoning_tokens"], ki_stats["tokens_per_second"] or 0,
+                )
+            else:
+                raw_text = (
+                    response_data.get("choices", [{}])[0]
+                    .get("message", {})
+                    .get("content", "")
+                )
+                usage = response_data.get("usage") or {}
+                details = usage.get("completion_tokens_details") or {}
+                ki_stats = {
+                    "input_tokens":        usage.get("prompt_tokens"),
+                    "output_tokens":       usage.get("completion_tokens"),
+                    "reasoning_tokens":    details.get("reasoning_tokens"),
+                    "tokens_per_second":   None,
+                    "time_to_first_token": None,
+                }
         except Exception as parse_exc:
             raw_text = f"Antwort-Parse-Fehler: {parse_exc}"
             logger.error("Fehler beim Parsen der API-Antwort: %s", parse_exc)
-            return {}, [], raw_text
+            return {}, [], raw_text, {}
 
         logger.debug("KI-Antwort (erste 300 Zeichen): %s", raw_text[:300])
 
     except httpx.TimeoutException as exc:
         raw_text = f"KI-Timeout nach {REQUEST_TIMEOUT_SECONDS}s: {exc}"
         logger.error("KI-API Timeout: %s", exc)
-        return {}, [], raw_text
+        return {}, [], raw_text, {}
     except httpx.ConnectError as exc:
         raw_text = f"KI-Verbindungsfehler: {exc}"
         logger.error("KI-API Verbindungsfehler: %s", exc)
-        return {}, [], raw_text
+        return {}, [], raw_text, {}
     except Exception as exc:
         raw_text = f"Unerwarteter KI-Fehler: {exc}"
         logger.exception("Unerwarteter Fehler bei KI-API-Aufruf: %s", exc)
-        return {}, [], raw_text
+        return {}, [], raw_text, {}
 
-    # ─── JSON aus der Antwort extrahieren ────────────────────────────────────
+    # ─── JSON-Parsing + Normalisierung ───────────────────────────────────────
     try:
         parsed = _parse_json_response(raw_text)
     except Exception as exc:
         logger.error("JSON-Parse-Fehler: %s", exc)
-        return {}, [], raw_text
+        return {}, [], raw_text, ki_stats
 
-    # Währungswerte normalisieren: Dezimalkomma → Dezimalpunkt (79,99 → 79.99)
     parsed = _normalize_decimal_commas(parsed)
     raw_text = json.dumps(parsed, ensure_ascii=False, indent=2)
 
-    # Neues verschachteltes Format vs. altes flaches Format erkennen
     try:
         if "lieferant" in parsed or "rechnungsdaten" in parsed or "zahlungsinformationen" in parsed:
             extracted_fields, order_positions = _map_new_format(parsed)
         else:
-            # Altes flaches Format (Rückwärtskompatibilität)
-            order_positions: list[dict] = parsed.pop("order_positions", []) or []
+            order_positions = parsed.pop("order_positions", []) or []
             extracted_fields = _clean_flat_fields(parsed)
     except Exception as exc:
         logger.error("Fehler beim Verarbeiten der Felder: %s", exc)
@@ -261,8 +301,7 @@ async def extract_invoice_data(
         len([v for v in extracted_fields.values() if v is not None]),
         len(order_positions),
     )
-
-    return extracted_fields, order_positions, raw_text
+    return extracted_fields, order_positions, raw_text, ki_stats
 
 
 def _normalize_decimal_commas(obj):
@@ -410,6 +449,9 @@ def _map_new_format(data: dict) -> tuple[dict, list[dict]]:
         "bank_name":          _str(bank.get("bank_name")),
         "iban":               _str(bank.get("iban")),
         "bic":                _str(bank.get("bic")),
+        "supplier_street":    _str(anschrift.get("strasse")),
+        "supplier_zip":       _str(anschrift.get("plz")),
+        "supplier_city":      _str(anschrift.get("ort")),
         "customer_number":    _str(rechnung.get("kundennummer")),
         "invoice_number":     _str(rechnung.get("rechnungsnummer")),
         "invoice_date":       _date(rechnung.get("rechnungsdatum")),

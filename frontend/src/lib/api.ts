@@ -37,6 +37,28 @@ apiClient.defaults.paramsSerializer = (params) => {
   return parts.join("&");
 };
 
+/**
+ * Extrahiert eine lesbare Fehlermeldung aus einem Axios-Fehler.
+ * Liest bevorzugt das `detail`-Feld aus der FastAPI-Antwort.
+ */
+export function extractApiError(err: unknown, fallback = "Unbekannter Fehler"): string {
+  if (err && typeof err === "object") {
+    const e = err as {
+      response?: { data?: { detail?: unknown }; status?: number };
+      message?: string;
+    };
+    const detail = e.response?.data?.detail;
+    if (typeof detail === "string" && detail) return detail;
+    if (detail && typeof detail === "object") return JSON.stringify(detail);
+    const status = e.response?.status;
+    if (status === 0 || e.message === "Network Error")
+      return "Backend nicht erreichbar — bitte Container-Status prüfen";
+    if (status) return `HTTP ${status}: ${fallback}`;
+    if (e.message) return e.message;
+  }
+  return fallback;
+}
+
 // ─── Typen: Items (Platzhalter-CRUD) ─────────────────────────────────────────
 
 export interface Item {
@@ -65,6 +87,7 @@ export const itemsApi = {
 // ─── Typen: KI-Konfigurationen ───────────────────────────────────────────────
 
 export type ReasoningLevel = "off" | "low" | "medium" | "high" | "on";
+export type EndpointType = "openai" | "lmstudio";
 
 export interface AIConfig {
   id: number;
@@ -76,6 +99,7 @@ export interface AIConfig {
   max_tokens: number;
   temperature: number;
   reasoning: ReasoningLevel;
+  endpoint_type: EndpointType;
   created_at: string;
   updated_at: string;
 }
@@ -89,6 +113,7 @@ export interface AIConfigCreate {
   max_tokens?: number;
   temperature?: number;
   reasoning?: ReasoningLevel;
+  endpoint_type?: EndpointType;
 }
 
 export const aiConfigsApi = {
@@ -392,16 +417,94 @@ export interface SystemLog {
   created_at: string;
 }
 
+export interface KiStats {
+  total_extractions: number;
+  ki_requests: number;
+  sum_input_tokens: number | null;
+  sum_output_tokens: number | null;
+  sum_reasoning_tokens: number | null;
+  avg_tokens_per_second: number | null;
+  avg_time_to_first_token: number | null;
+  avg_input_tokens: number | null;
+  avg_output_tokens: number | null;
+}
+
 export const logsApi = {
   /** Log-Einträge laden (neueste zuerst) */
   list: (params?: { category?: string; level?: string; limit?: number }) =>
     apiClient.get<SystemLog[]>("/api/logs", { params }).then((r) => r.data),
+
+  /** Aggregierte KI-Statistiken */
+  kiStats: () =>
+    apiClient.get<KiStats>("/api/logs/ki-stats").then((r) => r.data),
 
   /** Alle oder kategoriegefilterte Logs löschen */
   clear: (category?: string) =>
     apiClient
       .delete<{ deleted: number }>("/api/logs", { params: category ? { category } : undefined })
       .then((r) => r.data),
+};
+
+// ─── Typen: Lieferanten ───────────────────────────────────────────────────────
+
+export interface Supplier {
+  id: number;
+  name: string;
+  street: string | null;
+  zip_code: string | null;
+  city: string | null;
+  address: string | null;
+  hrb_number: string | null;
+  tax_number: string | null;
+  vat_id: string | null;
+  bank_name: string | null;
+  iban: string | null;
+  bic: string | null;
+  document_count: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface SupplierUpdate {
+  name: string;
+  street?: string | null;
+  zip_code?: string | null;
+  city?: string | null;
+  address?: string | null;
+  hrb_number?: string | null;
+  tax_number?: string | null;
+  vat_id?: string | null;
+  bank_name?: string | null;
+  iban?: string | null;
+  bic?: string | null;
+}
+
+export const suppliersApi = {
+  list: () => apiClient.get<Supplier[]>("/api/suppliers/").then((r) => r.data),
+  get: (id: number) => apiClient.get<Supplier>(`/api/suppliers/${id}`).then((r) => r.data),
+  update: (id: number, data: SupplierUpdate) =>
+    apiClient.put<Supplier>(`/api/suppliers/${id}`, data).then((r) => r.data),
+  delete: (id: number) => apiClient.delete(`/api/suppliers/${id}`),
+  duplicates: () =>
+    apiClient.get<Supplier[][]>("/api/suppliers/duplicates/").then((r) => r.data),
+};
+
+// ─── Backup / Restore ─────────────────────────────────────────────────────────
+
+export const backupApi = {
+  download: () =>
+    apiClient.get("/api/settings/backup/", { responseType: "blob" }).then((r) => r.data),
+  restore: (file: File) => {
+    const form = new FormData();
+    form.append("file", file);
+    return apiClient
+      .post<{ restored: Record<string, number>; message: string }>(
+        "/api/settings/restore/",
+        form,
+        { headers: { "Content-Type": "multipart/form-data" } }
+      )
+      .then((r) => r.data);
+  },
 };
 
 // ─── Typen: SSE-Fortschritts-Event ───────────────────────────────────────────

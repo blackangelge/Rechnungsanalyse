@@ -10,8 +10,10 @@ Bei einem Match werden vorhandene Felder nur durch nicht-leere neue Werte aktual
 
 import logging
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
+from app.models.invoice_extraction import InvoiceExtraction
 from app.models.supplier import Supplier
 
 logger = logging.getLogger(__name__)
@@ -29,10 +31,73 @@ def _update_if_better(existing_val: str | None, new_val: str | None) -> str | No
     return existing_val
 
 
+def get_all(db: Session) -> list[Supplier]:
+    """Gibt alle Lieferanten zurück, sortiert nach Name."""
+    return db.query(Supplier).order_by(Supplier.name).all()
+
+
+def get_by_id(db: Session, supplier_id: int) -> Supplier | None:
+    """Gibt einen Lieferanten anhand seiner ID zurück oder None."""
+    return db.get(Supplier, supplier_id)
+
+
+def get_document_count(db: Session, supplier_id: int) -> int:
+    """Gibt die Anzahl der Dokumente zurück, die diesem Lieferanten zugeordnet sind."""
+    return (
+        db.query(func.count(InvoiceExtraction.id))
+        .filter(InvoiceExtraction.supplier_id == supplier_id)
+        .scalar()
+        or 0
+    )
+
+
+def update(db: Session, supplier_id: int, data: dict) -> Supplier | None:
+    """Aktualisiert einen Lieferanten mit den übergebenen Feldern."""
+    obj = db.get(Supplier, supplier_id)
+    if obj is None:
+        return None
+    for field, value in data.items():
+        if hasattr(obj, field):
+            setattr(obj, field, value if value != "" else None)
+    db.commit()
+    db.refresh(obj)
+    return obj
+
+
+def delete(db: Session, supplier_id: int) -> bool:
+    """Löscht einen Lieferanten (setzt supplier_id in Extraktionen auf NULL)."""
+    obj = db.get(Supplier, supplier_id)
+    if obj is None:
+        return False
+    # Zugehörige Extraktionen auf supplier_id=NULL setzen
+    db.query(InvoiceExtraction).filter(
+        InvoiceExtraction.supplier_id == supplier_id
+    ).update({"supplier_id": None})
+    db.delete(obj)
+    db.commit()
+    return True
+
+
+def find_duplicates(db: Session) -> list[list[Supplier]]:
+    """
+    Findet potenzielle Duplikate anhand von Name-Ähnlichkeit.
+    Gibt Gruppen von Lieferanten zurück, die denselben bereinigten Namen haben.
+    """
+    all_suppliers = db.query(Supplier).all()
+    groups: dict[str, list[Supplier]] = {}
+    for s in all_suppliers:
+        key = s.name.strip().lower() if s.name else ""
+        groups.setdefault(key, []).append(s)
+    return [group for group in groups.values() if len(group) > 1]
+
+
 def find_or_create(
     db: Session,
     name: str | None,
     address: str | None = None,
+    street: str | None = None,
+    zip_code: str | None = None,
+    city: str | None = None,
     hrb_number: str | None = None,
     tax_number: str | None = None,
     vat_id: str | None = None,
@@ -82,6 +147,9 @@ def find_or_create(
         # Vorhandene leere Felder mit neuen Werten befüllen (nicht überschreiben)
         supplier.name = _update_if_better(supplier.name, name)
         supplier.address = _update_if_better(supplier.address, address)
+        supplier.street = _update_if_better(supplier.street, street)
+        supplier.zip_code = _update_if_better(supplier.zip_code, zip_code)
+        supplier.city = _update_if_better(supplier.city, city)
         supplier.hrb_number = _update_if_better(supplier.hrb_number, hrb_number)
         supplier.tax_number = _update_if_better(supplier.tax_number, tax_number)
         supplier.vat_id = _update_if_better(supplier.vat_id, vat_id)
@@ -96,6 +164,9 @@ def find_or_create(
     supplier = Supplier(
         name=name.strip(),
         address=address if _is_set(address) else None,
+        street=street if _is_set(street) else None,
+        zip_code=zip_code if _is_set(zip_code) else None,
+        city=city if _is_set(city) else None,
         hrb_number=hrb_number if _is_set(hrb_number) else None,
         tax_number=tax_number if _is_set(tax_number) else None,
         vat_id=vat_id if _is_set(vat_id) else None,

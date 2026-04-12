@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
-import { AIConfig, aiConfigsApi, importsApi, importSettingsApi, SystemPrompt, systemPromptsApi } from "@/lib/api";
+import { AIConfig, aiConfigsApi, extractApiError, importsApi, importSettingsApi, SystemPrompt, systemPromptsApi } from "@/lib/api";
 
 export default function ImportForm() {
   const router = useRouter();
@@ -67,8 +67,7 @@ export default function ImportForm() {
       });
       router.push(`/imports/${batch.id}`);
     } catch (err: unknown) {
-      const axiosError = err as { response?: { data?: { detail?: string } } };
-      setError(axiosError.response?.data?.detail ?? "Fehler beim Starten des Imports");
+      setError(extractApiError(err, "Fehler beim Starten des Imports"));
     } finally {
       setLoading(false);
     }

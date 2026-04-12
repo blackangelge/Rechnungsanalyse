@@ -2,8 +2,11 @@
 CRUD-Operationen für importierte Dokumente.
 """
 
+import logging
 from datetime import datetime, timezone
 from decimal import Decimal
+
+logger = logging.getLogger(__name__)
 
 from sqlalchemy import outerjoin
 from sqlalchemy.orm import Session, joinedload
@@ -188,6 +191,7 @@ def save_extraction(
     positions: list[dict],
     raw_response: str,
     supplier_id: int | None = None,
+    ki_stats: dict | None = None,
 ) -> InvoiceExtraction:
     """
     Speichert extrahierte Rechnungsdaten und Bestellpositionen.
@@ -199,6 +203,7 @@ def save_extraction(
         positions: Liste von Dicts für die Bestellpositionen
         raw_response: vollständige KI-Antwort als String (für Debugging)
         supplier_id: optionale ID des verknüpften Lieferanten-Stammdatensatzes
+        ki_stats: optionale KI-Statistiken (Token-Counts, Geschwindigkeit)
     """
     # Vorhandene Extraktion löschen (falls Wiederholung)
     db.query(InvoiceExtraction).filter(
@@ -208,11 +213,19 @@ def save_extraction(
         OrderPosition.document_id == doc_id
     ).delete()
 
-    # Neue Extraktion speichern
+    # KI-Statistiken auspacken
+    stats = ki_stats or {}
+
+    # Neue Extraktion speichern — erst mit KI-Stats, bei DB-Fehler ohne Retry
     extraction = InvoiceExtraction(
         document_id=doc_id,
         raw_response=raw_response,
         supplier_id=supplier_id,
+        ki_input_tokens=stats.get("input_tokens"),
+        ki_output_tokens=stats.get("output_tokens"),
+        ki_reasoning_tokens=stats.get("reasoning_tokens"),
+        ki_tokens_per_second=stats.get("tokens_per_second"),
+        ki_time_to_first_token=stats.get("time_to_first_token"),
         **extracted_data,
     )
     db.add(extraction)
@@ -226,6 +239,37 @@ def save_extraction(
         )
         db.add(order_pos)
 
-    db.commit()
+    try:
+        db.commit()
+    except Exception as commit_exc:
+        # Fallback: ohne KI-Stats speichern (z.B. wenn Migration noch nicht gelaufen)
+        logger.warning(
+            "Commit mit KI-Stats fehlgeschlagen (Migration ausstehend?), "
+            "Retry ohne Stats: %s", commit_exc
+        )
+        db.rollback()
+        # Nochmal löschen, da der rollback die deletes rückgängig macht
+        db.query(InvoiceExtraction).filter(
+            InvoiceExtraction.document_id == doc_id
+        ).delete()
+        db.query(OrderPosition).filter(
+            OrderPosition.document_id == doc_id
+        ).delete()
+        extraction = InvoiceExtraction(
+            document_id=doc_id,
+            raw_response=raw_response,
+            supplier_id=supplier_id,
+            **extracted_data,
+        )
+        db.add(extraction)
+        for idx, pos in enumerate(positions):
+            order_pos = OrderPosition(
+                document_id=doc_id,
+                position_index=idx,
+                **pos,
+            )
+            db.add(order_pos)
+        db.commit()
+
     db.refresh(extraction)
     return extraction

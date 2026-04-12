@@ -12,6 +12,9 @@ asyncpg==0.30.0            # Asynchroner PostgreSQL-Treiber (für AsyncSession)
 pydantic-settings==2.7.0
 python-dotenv==1.0.1
 
+# Datei-Upload (UploadFile / multipart/form-data)
+python-multipart==0.0.20
+
 # Echtzeit-Streaming (Server-Sent Events)
 sse-starlette==2.1.3
 

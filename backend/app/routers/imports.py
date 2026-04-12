@@ -9,16 +9,17 @@ Endpunkte:
 
 import asyncio
 import logging
+from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
 from app import crud
-from app.database import get_db
+from app.database import SessionLocal, get_db
 from app.schemas.import_batch import ImportBatchCreate, ImportBatchRead, ImportBatchWithDocuments
 from app.services.import_service import (
+    _run_import_io,
     list_pdf_files,
-    parse_folder_name,
     run_import,
     validate_import_path,
 )
@@ -28,18 +29,14 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/imports", tags=["Imports"])
 
 
-async def _delete_source_files(batch_id: int, import_folder: str) -> None:
-    """
-    Löscht die Original-PDFs aus dem Import-Ordner, die erfolgreich kopiert wurden.
-    Es werden nur Dateien gelöscht, für die ein DB-Eintrag mit stored_filename existiert.
-    """
-    from pathlib import Path
-    from app.database import SessionLocal
+# ─── Sync DB-Hilfsfunktionen (laufen via asyncio.to_thread) ─────────────────
 
+def _db_get_source_filenames(batch_id: int) -> list[str]:
+    """Gibt die original_filename aller erfolgreich kopierten Dokumente zurück."""
     db = SessionLocal()
     try:
         batch = crud.import_batch.get_by_id(db, batch_id)
-        original_names = [
+        return [
             d.original_filename
             for d in (batch.documents if batch else [])
             if d.stored_filename and d.original_filename
@@ -47,6 +44,64 @@ async def _delete_source_files(batch_id: int, import_folder: str) -> None:
     finally:
         db.close()
 
+
+def _db_get_analyze_setup(
+    batch_id: int,
+    ai_config_id: int | None,
+    system_prompt_id: int | None,
+) -> dict | None:
+    """
+    Löst KI-Config, Systemprompt und Dokument-IDs für die KI-Analyse auf.
+    Gibt None zurück, wenn keine KI-Konfiguration gefunden wurde.
+    """
+    db = SessionLocal()
+    try:
+        if ai_config_id:
+            resolved_config = crud.ai_config.get_by_id(db, ai_config_id)
+        else:
+            resolved_config = crud.ai_config.get_default(db)
+
+        if resolved_config is None:
+            logger.warning(
+                "Batch #%d: Keine KI-Konfiguration gefunden — KI-Analyse übersprungen",
+                batch_id,
+            )
+            return None
+
+        if system_prompt_id:
+            sp = crud.system_prompt.get_by_id(db, system_prompt_id)
+            system_prompt_text = sp.content if sp else None
+        else:
+            default_sp = crud.system_prompt.get_default(db)
+            system_prompt_text = default_sp.content if default_sp else None
+
+        batch = crud.import_batch.get_by_id(db, batch_id)
+        doc_ids = [d.id for d in (batch.documents if batch else []) if d.stored_filename]
+
+        return {
+            "ai_config_id": resolved_config.id,
+            "system_prompt_text": system_prompt_text,
+            "doc_ids": doc_ids,
+        }
+    finally:
+        db.close()
+
+
+def _db_set_processing(doc_ids: list[int]) -> None:
+    """Setzt alle angegebenen Dokumente auf Status 'processing'."""
+    db = SessionLocal()
+    try:
+        for doc_id in doc_ids:
+            crud.document.update_status(db, doc_id, "processing")
+    finally:
+        db.close()
+
+
+def _sync_delete_source_files(import_folder: str, original_names: list[str]) -> tuple[int, int]:
+    """
+    Sync: Löscht Quelldateien aus dem Import-Ordner.
+    Gibt (deleted, failed) zurück. Läuft via _run_import_io().
+    """
     folder = Path(import_folder)
     deleted, failed = 0, 0
     for name in original_names:
@@ -61,6 +116,24 @@ async def _delete_source_files(batch_id: int, import_folder: str) -> None:
         except Exception as exc:
             failed += 1
             logger.warning("Konnte Quelldatei nicht löschen %s: %s", src, exc)
+    return deleted, failed
+
+
+async def _delete_source_files(batch_id: int, import_folder: str) -> None:
+    """
+    Löscht die Original-PDFs aus dem Import-Ordner, die erfolgreich kopiert wurden.
+    Es werden nur Dateien gelöscht, für die ein DB-Eintrag mit stored_filename existiert.
+    DB-Abfrage und Filesystem-Operationen laufen in Thread-Pools (nicht-blockierend).
+    """
+    # DB-Abfrage im Thread
+    original_names = await asyncio.to_thread(_db_get_source_filenames, batch_id)
+
+    if not original_names:
+        logger.debug("Batch #%d: Keine Quelldateien zum Löschen", batch_id)
+        return
+
+    # Filesystem-Operationen im Import-IO-Pool
+    deleted, failed = await _run_import_io(_sync_delete_source_files, import_folder, original_names)
 
     logger.info(
         "Batch #%d: Quelldateien gelöscht=%d, fehlgeschlagen=%d", batch_id, deleted, failed
@@ -83,8 +156,8 @@ async def _import_then_analyze(
     """
     Führt zuerst den Import durch, danach startet automatisch die KI-Analyse
     für alle erfolgreich importierten Dokumente.
+    Alle DB- und Filesystem-Operationen laufen in Thread-Pools (nicht-blockierend).
     """
-    from app.database import SessionLocal
     from app.routers.documents import _run_analysis
 
     # 1. Import abwarten
@@ -94,46 +167,21 @@ async def _import_then_analyze(
     if delete_source_files:
         await _delete_source_files(batch_id, import_folder)
 
-    # 3. KI-Konfiguration und Systemprompt auflösen
-    db = SessionLocal()
-    try:
-        # KI-Config
-        if ai_config_id:
-            resolved_config = crud.ai_config.get_by_id(db, ai_config_id)
-        else:
-            resolved_config = crud.ai_config.get_default(db)
-        if resolved_config is None:
-            logger.warning("Batch #%d: Keine KI-Konfiguration gefunden — KI-Analyse übersprungen", batch_id)
-            return
-        resolved_config_id = resolved_config.id
+    # 3. KI-Konfiguration + Systemprompt + Dokument-IDs auflösen (im Thread)
+    setup = await asyncio.to_thread(_db_get_analyze_setup, batch_id, ai_config_id, system_prompt_id)
+    if setup is None:
+        return
 
-        # Systemprompt
-        if system_prompt_id:
-            sp = crud.system_prompt.get_by_id(db, system_prompt_id)
-            system_prompt_text = sp.content if sp else None
-        else:
-            default_sp = crud.system_prompt.get_default(db)
-            system_prompt_text = default_sp.content if default_sp else None
-
-        batch = crud.import_batch.get_by_id(db, batch_id)
-        doc_ids = [d.id for d in (batch.documents if batch else []) if d.stored_filename]
-    finally:
-        db.close()
-
+    doc_ids: list[int] = setup["doc_ids"]
     if not doc_ids:
         logger.info("Batch #%d: Keine Dokumente für KI-Analyse", batch_id)
         return
 
-    # 4. Dokumente auf "processing" setzen
-    db = SessionLocal()
-    try:
-        for doc_id in doc_ids:
-            crud.document.update_status(db, doc_id, "processing")
-    finally:
-        db.close()
+    # 4. Dokumente auf "processing" setzen (im Thread)
+    await asyncio.to_thread(_db_set_processing, doc_ids)
 
     logger.info("Batch #%d: KI-Analyse für %d Dokument(e) gestartet", batch_id, len(doc_ids))
-    await _run_analysis(doc_ids, resolved_config_id, system_prompt_text)
+    await _run_analysis(doc_ids, setup["ai_config_id"], setup["system_prompt_text"])
 
 
 @router.get("", response_model=list[ImportBatchRead])

@@ -16,7 +16,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
@@ -24,7 +24,7 @@ from sqlalchemy.orm import Session
 from app import crud
 from app.config import settings
 from app.database import SessionLocal, get_db
-from app.schemas.document import DocumentCommentUpdate, DocumentDetail, DocumentListRead, DocumentRead
+from app.schemas.document import DocumentCommentUpdate, DocumentDetail, DocumentListRead
 from app.services import ai_service, pdf_service
 
 logger = logging.getLogger(__name__)
@@ -189,232 +189,294 @@ async def analyze_documents(
     )
 
 
+def _db_analyze_read(doc_id: int, ai_config_id: int) -> dict | None:
+    """
+    Phase 1 (sync, für asyncio.to_thread): Liest alle für die KI-Analyse
+    benötigten Daten aus der DB und gibt sie als Dict zurück.
+    Gibt None zurück, wenn Dokument oder KI-Konfiguration nicht gefunden.
+    """
+    from app.models.document import Document as DocModel
+    db = SessionLocal()
+    try:
+        doc = db.get(DocModel, doc_id)
+        if doc is None:
+            logger.error("Dokument #%d nicht in DB gefunden", doc_id)
+            return None
+
+        ai_config = crud.ai_config.get_by_id(db, ai_config_id)
+        if ai_config is None:
+            logger.error("KI-Konfiguration #%d nicht in DB gefunden", ai_config_id)
+            crud.document.update_status(db, doc_id, "error",
+                                        error_message="KI-Konfiguration nicht gefunden")
+            return None
+
+        subfolder = f"{doc.company}_{doc.year}"
+        pdf_path = Path(settings.storage_path) / subfolder / doc.stored_filename
+
+        if not pdf_path.exists():
+            logger.error("PDF nicht gefunden: %s", pdf_path)
+            crud.document.update_status(db, doc_id, "error",
+                                        error_message=f"PDF nicht gefunden: {pdf_path}")
+            return None
+
+        img_settings = crud.image_settings.get_or_create(db)
+
+        return {
+            "pdf_path": pdf_path,
+            "original_filename": doc.original_filename,
+            "batch_id": doc.batch_id,
+            "img_dpi": img_settings.dpi,
+            "img_format": img_settings.image_format,
+            "img_quality": img_settings.jpeg_quality,
+            "ai_api_url": ai_config.api_url,
+            "ai_api_key": ai_config.api_key,
+            "ai_model_name": ai_config.model_name,
+            "ai_max_tokens": ai_config.max_tokens,
+            "ai_temperature": ai_config.temperature,
+            "ai_reasoning": getattr(ai_config, "reasoning", "off") or "off",
+            "ai_endpoint_type": getattr(ai_config, "endpoint_type", "openai") or "openai",
+        }
+    except Exception as exc:
+        logger.exception("Phase 1 DB-Fehler bei Dokument #%d: %s", doc_id, exc)
+        try:
+            db.rollback()
+            crud.document.update_status(db, doc_id, "error",
+                                        error_message=f"DB-Fehler (Phase 1): {exc}")
+        except Exception:
+            pass
+        return None
+    finally:
+        db.close()
+
+
+def _db_analyze_write(
+    doc_id: int,
+    original_filename: str,
+    batch_id: int | None,
+    ai_model_name: str,
+    page_count: int,
+    extracted_fields: dict,
+    order_positions: list,
+    raw_response: str,
+    ki_stats: dict | None = None,
+) -> None:
+    """
+    Phase 4 (sync, für asyncio.to_thread): Schreibt KI-Ergebnisse in die DB.
+    """
+    db = SessionLocal()
+    try:
+        crud.system_log.add(
+            db, category="ki", level="info",
+            message=(f"KI-Analyse gestartet: {original_filename} — "
+                     f"Modell: {ai_model_name}, {page_count} Seite(n)"),
+            batch_id=batch_id, document_id=doc_id,
+        )
+
+        # Lieferant deduplizieren
+        supplier_id: int | None = None
+        try:
+            supplier = crud.supplier.find_or_create(
+                db=db,
+                name=extracted_fields.get("supplier_name"),
+                address=extracted_fields.get("supplier_address"),
+                street=extracted_fields.get("supplier_street"),
+                zip_code=extracted_fields.get("supplier_zip"),
+                city=extracted_fields.get("supplier_city"),
+                hrb_number=extracted_fields.get("hrb_number"),
+                tax_number=extracted_fields.get("tax_number"),
+                vat_id=extracted_fields.get("vat_id"),
+                bank_name=extracted_fields.get("bank_name"),
+                iban=extracted_fields.get("iban"),
+                bic=extracted_fields.get("bic"),
+            )
+            if supplier is not None:
+                supplier_id = supplier.id
+        except Exception as exc:
+            logger.warning("Supplier-Lookup für #%d fehlgeschlagen: %s", doc_id, exc)
+
+        # Felder entfernen, die nur für den Supplier-Lookup genutzt werden
+        # und KEINE Spalten in invoice_extractions sind
+        _SUPPLIER_ONLY_KEYS = {"supplier_street", "supplier_zip", "supplier_city"}
+        extraction_data = {k: v for k, v in extracted_fields.items()
+                           if k not in _SUPPLIER_ONLY_KEYS}
+
+        crud.document.save_extraction(
+            db=db,
+            doc_id=doc_id,
+            extracted_data=extraction_data,
+            positions=order_positions,
+            raw_response=raw_response,
+            supplier_id=supplier_id,
+            ki_stats=ki_stats,
+        )
+
+        # Seitenanzahl aus der KI-Analyse (= Anzahl gerenderter Bilder) setzen
+        if page_count > 0:
+            from app.models.document import Document as _DocModel
+            _doc = db.get(_DocModel, doc_id)
+            if _doc is not None:
+                _doc.page_count = page_count
+                db.commit()
+
+        is_ki_error = any(raw_response.startswith(p) for p in (
+            "KI überlastet:", "KI-Fehler:", "KI-Timeout",
+            "KI-Verbindungsfehler", "Unerwarteter KI-Fehler",
+        ))
+        if is_ki_error:
+            crud.document.update_status(db, doc_id, "error", error_message=raw_response)
+            crud.system_log.add(
+                db, category="ki", level="error",
+                message=f"KI-Fehler: {original_filename} — {raw_response[:200]}",
+                batch_id=batch_id, document_id=doc_id,
+            )
+            logger.warning("Dokument #%d: KI-Fehler — %s", doc_id, raw_response[:100])
+        else:
+            filled = len([v for v in extracted_fields.values() if v is not None])
+            crud.document.update_status(db, doc_id, "done")
+            crud.system_log.add(
+                db, category="ki", level="info",
+                message=(f"KI-Analyse erfolgreich: {original_filename} — "
+                         f"{filled} Felder, {len(order_positions)} Positionen, {page_count} Seite(n)"),
+                batch_id=batch_id, document_id=doc_id,
+            )
+            logger.info("Dokument #%d erfolgreich analysiert (%d Seiten)", doc_id, page_count)
+
+    except Exception as exc:
+        logger.exception("Phase 4 DB-Fehler bei Dokument #%d: %s", doc_id, exc)
+        try:
+            db.rollback()
+            crud.document.update_status(db, doc_id, "error",
+                                        error_message=f"Speicherfehler: {exc}")
+        except Exception:
+            _set_error(doc_id, f"Speicherfehler (Fallback): {exc}")
+    finally:
+        db.close()
+
+
 async def _run_analysis(
     document_ids: list[int],
     ai_config_id: int,
     system_prompt_text: str | None,
 ) -> None:
     """
-    Hintergrund-Coroutine: Analysiert alle Dokumente parallel.
-    Parallelität wird aus den ProcessingSettings gelesen (Standard: 4).
-    Öffnet eigene DB-Session (läuft unabhängig vom Request-Lifecycle).
+    Hintergrund-Coroutine: Analysiert alle Dokumente nacheinander (sequenziell).
+
+    Warum sequenziell statt parallel?
+    - Lokale Modelle (LM Studio, Ollama) verarbeiten ohnehin nur eine Anfrage gleichzeitig.
+    - Parallele PDF-Renderungen + JSON-Serialisierungen erschöpfen den Thread-Pool und
+      den Arbeitsspeicher des NAS.
+    - Sequenziell ist auf einem NAS mit lokalem Modell genauso schnell, aber stabil.
     """
-    # KI-Parallelität aus DB lesen
-    try:
-        _db = SessionLocal()
+    logger.info("KI-Analyse gestartet: %d Dokument(e) werden nacheinander verarbeitet", len(document_ids))
+
+    for doc_id in document_ids:
         try:
-            proc_settings = crud.processing_settings.get_or_create(_db)
-            ai_concurrency = proc_settings.ai_concurrency
-        finally:
-            _db.close()
-    except Exception:
-        ai_concurrency = 4
-    logger.info("KI-Analyse-Parallelität: %d gleichzeitige Aufrufe", ai_concurrency)
-    semaphore = asyncio.Semaphore(ai_concurrency)
-    tasks = [
-        _analyze_single(
-            doc_id=doc_id,
-            ai_config_id=ai_config_id,
-            system_prompt_text=system_prompt_text,
-            semaphore=semaphore,
-        )
-        for doc_id in document_ids
-    ]
-    await asyncio.gather(*tasks)
-    logger.info("KI-Analyse-Batch abgeschlossen (%d Dokumente)", len(document_ids))
+            await _analyze_single(doc_id, ai_config_id, system_prompt_text)
+        except Exception as exc:
+            logger.exception("Unbehandelter Fehler bei Dokument #%d: %s", doc_id, exc)
+            await asyncio.to_thread(_set_error, doc_id, f"Unerwarteter Fehler: {exc}")
+
+    logger.info("KI-Analyse abgeschlossen (%d Dokumente)", len(document_ids))
 
 
 async def _analyze_single(
     doc_id: int,
     ai_config_id: int,
     system_prompt_text: str | None,
-    semaphore: asyncio.Semaphore,
 ) -> None:
     """
     Analysiert ein einzelnes Dokument mit KI-Extraktion.
 
-    Phasen-Ansatz: DB-Session wird sofort geschlossen bevor langlaufende
-    IO-Operationen (PDF-Rendering, KI-API) starten. Dadurch wird der
-    gemeinsame Thread-Pool nicht blockiert und GET-Endpunkte bleiben
-    während der Analyse erreichbar.
+    ARCHITEKTUR — Event-Loop-Schutz:
+      Alle DB-Operationen laufen via asyncio.to_thread() in Threads.
+      Alle IO-Operationen (PDF-Rendering) laufen via _run_ki_io() im KI-Pool.
+      Der Event-Loop-Thread macht KEINE blockierenden Aufrufe.
+
+    Phase 1: DB-Daten lesen         → asyncio.to_thread(_db_analyze_read)
+    Phase 2: PDF → Bilder           → _run_ki_io() (dedizierter Pool)
+    Phase 3: KI-API-Aufruf          → asyncio.to_thread (sync httpx.Client, im Thread)
+    Phase 4: Ergebnisse in DB       → asyncio.to_thread(_db_analyze_write)
     """
-    async with semaphore:
-        from app.models.document import Document as DocModel
+    # ── Phase 1: Alle Daten aus DB lesen (im Thread, nicht-blockierend) ──
+    data = await asyncio.to_thread(_db_analyze_read, doc_id, ai_config_id)
+    if data is None:
+        return  # Fehler wurde bereits von _db_analyze_read in DB geschrieben
 
-        # ── Phase 1: Benötigte Daten aus DB lesen, Session sofort schließen ──
-        pdf_path: Path | None = None
-        original_filename: str = f"dok_{doc_id}"
-        batch_id: int | None = None
-        img_dpi: int = 150
-        img_format: str = "PNG"
-        img_quality: int = 85
-        ai_api_url: str = ""
-        ai_api_key: str | None = None
-        ai_model_name: str = ""
-        ai_max_tokens: int = 4096
-        ai_temperature: float = 0.1
+    pdf_path: Path = data["pdf_path"]
+    original_filename: str = data["original_filename"]
+    batch_id: int | None = data["batch_id"]
+    img_dpi: int = data["img_dpi"]
+    img_format: str = data["img_format"]
+    img_quality: int = data["img_quality"]
+    ai_api_url: str = data["ai_api_url"]
+    ai_api_key: str | None = data["ai_api_key"]
+    ai_model_name: str = data["ai_model_name"]
+    ai_max_tokens: int = data["ai_max_tokens"]
+    ai_temperature: float = data["ai_temperature"]
+    ai_reasoning: str = data["ai_reasoning"]
+    ai_endpoint_type: str = data["ai_endpoint_type"]
 
-        db: Session = SessionLocal()
-        try:
-            doc = db.get(DocModel, doc_id)
-            if doc is None:
-                logger.error("Dokument #%d nicht in DB gefunden", doc_id)
-                return
-
-            ai_config = crud.ai_config.get_by_id(db, ai_config_id)
-            if ai_config is None:
-                logger.error("KI-Konfiguration #%d nicht in DB gefunden", ai_config_id)
-                crud.document.update_status(
-                    db, doc_id, "error", error_message="KI-Konfiguration nicht gefunden"
-                )
-                return
-
-            subfolder = f"{doc.company}_{doc.year}"
-            pdf_path = Path(settings.storage_path) / subfolder / doc.stored_filename
-
-            if not pdf_path.exists():
-                logger.error("PDF nicht gefunden: %s", pdf_path)
-                crud.document.update_status(
-                    db, doc_id, "error", error_message=f"PDF nicht gefunden: {pdf_path}"
-                )
-                return
-
-            original_filename = doc.original_filename
-            batch_id = doc.batch_id
-
-            img_settings = crud.image_settings.get_or_create(db)
-            img_dpi = img_settings.dpi
-            img_format = img_settings.image_format
-            img_quality = img_settings.jpeg_quality
-
-            ai_api_url = ai_config.api_url
-            ai_api_key = ai_config.api_key
-            ai_model_name = ai_config.model_name
-            ai_max_tokens = ai_config.max_tokens
-            ai_temperature = ai_config.temperature
-
-        except Exception as exc:
-            logger.exception("Phase 1 Fehler bei Dokument #%d: %s", doc_id, exc)
-            try:
-                db.rollback()
-                crud.document.update_status(db, doc_id, "error", error_message=f"DB-Fehler (Phase 1): {exc}")
-            except Exception:
-                _set_error(doc_id, f"DB-Fehler (Phase 1): {exc}")
-            return
-        finally:
-            db.close()  # ← Session freigeben BEVOR IO beginnt
-
-        # ── Phase 2: PDF → Bilder (blockierende IO, kein DB-Handle offen) ────
-        logger.info("Rendere PDF für Dokument #%d: %s", doc_id, pdf_path.name)
-        try:
-            images_b64: list = await _run_ki_io(
-                pdf_service.pdf_to_base64_images,
-                pdf_path,
-                img_dpi,
-                img_format,
-                img_quality,
-            )
-        except Exception as exc:
-            logger.error("Fehler beim Rendern von #%d: %s", doc_id, exc)
-            _set_error(doc_id, f"PDF-Rendering-Fehler: {exc}")
-            return
-
-        if not images_b64:
-            _set_error(doc_id, "PDF konnte nicht gerendert werden")
-            return
-
-        # ── Phase 3: KI-API-Aufruf (async httpx, kein DB-Handle offen) ───────
-        logger.info("Starte KI-Extraktion für Dokument #%d (%d Seite(n))", doc_id, len(images_b64))
-
-        # Minimales Config-Proxy-Objekt für ai_service (nur benötigte Felder)
-        class _ConfigProxy:
-            def __init__(self):
-                self.api_url = ai_api_url
-                self.api_key = ai_api_key
-                self.model_name = ai_model_name
-                self.max_tokens = ai_max_tokens
-                self.temperature = ai_temperature
-
-        extracted_fields, order_positions, raw_response = await ai_service.extract_invoice_data(
-            images_b64=images_b64,
-            config=_ConfigProxy(),
-            system_prompt_text=system_prompt_text,
+    # ── Phase 2: PDF → Bilder (blockierende IO, kein DB-Handle offen) ────
+    logger.info("Rendere PDF für Dokument #%d: %s", doc_id, pdf_path.name)
+    try:
+        images_b64: list = await _run_ki_io(
+            pdf_service.pdf_to_base64_images,
+            pdf_path,
+            img_dpi,
+            img_format,
+            img_quality,
         )
+    except Exception as exc:
+        logger.error("Fehler beim Rendern von #%d: %s", doc_id, exc)
+        _set_error(doc_id, f"PDF-Rendering-Fehler: {exc}")
+        return
 
-        # ── Phase 4: Ergebnisse in DB schreiben (neue Session) ───────────────
-        db = SessionLocal()
-        try:
-            # Vorher-Log
-            crud.system_log.add(
-                db, category="ki", level="info",
-                message=f"KI-Analyse gestartet: {original_filename} — Modell: {ai_model_name}, {len(images_b64)} Seite(n)",
-                batch_id=batch_id, document_id=doc_id,
-            )
+    if not images_b64:
+        _set_error(doc_id, "PDF konnte nicht gerendert werden")
+        return
 
-            # Lieferant deduplizieren
-            supplier_id: int | None = None
-            try:
-                supplier = crud.supplier.find_or_create(
-                    db=db,
-                    name=extracted_fields.get("supplier_name"),
-                    address=extracted_fields.get("supplier_address"),
-                    hrb_number=extracted_fields.get("hrb_number"),
-                    tax_number=extracted_fields.get("tax_number"),
-                    vat_id=extracted_fields.get("vat_id"),
-                    bank_name=extracted_fields.get("bank_name"),
-                    iban=extracted_fields.get("iban"),
-                    bic=extracted_fields.get("bic"),
-                )
-                if supplier is not None:
-                    supplier_id = supplier.id
-            except Exception as exc:
-                logger.warning("Fehler beim Supplier-Lookup für #%d: %s", doc_id, exc)
+    # ── Phase 3: KI-API-Aufruf (sync httpx.Client im Thread, kein DB-Handle offen) ─
+    logger.info("Starte KI-Extraktion für Dokument #%d (%d Seite(n))", doc_id, len(images_b64))
 
-            # Extraktion speichern
-            crud.document.save_extraction(
-                db=db,
-                doc_id=doc_id,
-                extracted_data=extracted_fields,
-                positions=order_positions,
-                raw_response=raw_response,
-                supplier_id=supplier_id,
-            )
+    # Minimales Config-Proxy-Objekt für ai_service (nur benötigte Felder)
+    class _ConfigProxy:
+        def __init__(self):
+            self.api_url = ai_api_url
+            self.api_key = ai_api_key
+            self.model_name = ai_model_name
+            self.max_tokens = ai_max_tokens
+            self.temperature = ai_temperature
+            self.reasoning = ai_reasoning
+            self.endpoint_type = ai_endpoint_type
 
-            # Status + Abschluss-Log
-            is_ki_error = (
-                raw_response.startswith("KI überlastet:")
-                or raw_response.startswith("KI-Fehler:")
-                or raw_response.startswith("KI-Timeout")
-                or raw_response.startswith("KI-Verbindungsfehler")
-                or raw_response.startswith("Unerwarteter KI-Fehler")
-            )
-            if is_ki_error:
-                crud.document.update_status(db, doc_id, "error", error_message=raw_response)
-                crud.system_log.add(
-                    db, category="ki", level="error",
-                    message=f"KI-Fehler: {original_filename} — {raw_response[:200]}",
-                    batch_id=batch_id, document_id=doc_id,
-                )
-                logger.warning("Dokument #%d: KI-Fehler — %s", doc_id, raw_response)
-            else:
-                filled = len([v for v in extracted_fields.values() if v is not None])
-                crud.document.update_status(db, doc_id, "done")
-                crud.system_log.add(
-                    db, category="ki", level="info",
-                    message=f"KI-Analyse erfolgreich: {original_filename} — {filled} Felder, {len(order_positions)} Positionen",
-                    batch_id=batch_id, document_id=doc_id,
-                )
-                logger.info("Dokument #%d erfolgreich analysiert", doc_id)
+    # extract_invoice_data ist synchron — komplett im Thread ausführen.
+    # Der Event-Loop berührt NICHTS davon (JSON-Dump, HTTP, Parsing).
+    config_proxy = _ConfigProxy()
+    extracted_fields, order_positions, raw_response, ki_stats = (
+        await asyncio.to_thread(
+            ai_service.extract_invoice_data,
+            images_b64,
+            config_proxy,
+            system_prompt_text,
+        )
+    )
+    # Seitenanzahl merken und Bilddaten sofort freigeben
+    page_count = len(images_b64)
+    del images_b64
 
-        except Exception as exc:
-            logger.exception("Phase 4 Fehler bei Analyse von #%d: %s", doc_id, exc)
-            try:
-                db.rollback()
-                crud.document.update_status(db, doc_id, "error", error_message=f"Speicherfehler: {exc}")
-            except Exception:
-                _set_error(doc_id, f"Speicherfehler (Fallback): {exc}")
-        finally:
-            db.close()
+    # ── Phase 4: Ergebnisse in DB schreiben (im Thread, nicht-blockierend) ─
+    await asyncio.to_thread(
+        _db_analyze_write,
+        doc_id,
+        original_filename,
+        batch_id,
+        ai_model_name,
+        page_count,
+        extracted_fields,
+        order_positions,
+        raw_response,
+        ki_stats,
+    )
 
 
 # ─── DELETE /api/documents/{id} — Soft-Delete ───────────────────────────────
