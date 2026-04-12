@@ -25,7 +25,6 @@ const NAV_LINKS = [
   { href: "/settings/prompts", label: "Systemprompts" },
   { href: "/settings/image", label: "Bildeinstellungen" },
   { href: "/settings/processing", label: "Einstellungen" },
-  { href: "/settings/backup", label: "Backup / Restore" },
   { href: "/logs", label: "Logs" },
 ];
 

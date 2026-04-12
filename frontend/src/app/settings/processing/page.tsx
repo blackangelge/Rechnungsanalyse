@@ -1,7 +1,7 @@
 "use client";
 
-import { useEffect, useState } from "react";
-import { ProcessingSettings, processingSettingsApi } from "@/lib/api";
+import { useEffect, useRef, useState } from "react";
+import { ProcessingSettings, processingSettingsApi, backupApi, extractApiError } from "@/lib/api";
 
 export default function ProcessingSettingsPage() {
   const [settings, setSettings] = useState<ProcessingSettings | null>(null);
@@ -11,6 +11,54 @@ export default function ProcessingSettingsPage() {
   const [saving, setSaving] = useState(false);
   const [successMsg, setSuccessMsg] = useState<string | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+
+  // Backup / Restore
+  const [downloading, setDownloading] = useState(false);
+  const [restoring, setRestoring] = useState(false);
+  const [restoreResult, setRestoreResult] = useState<string | null>(null);
+  const [backupError, setBackupError] = useState<string | null>(null);
+  const fileRef = useRef<HTMLInputElement>(null);
+
+  async function handleDownload() {
+    setDownloading(true);
+    setBackupError(null);
+    setRestoreResult(null);
+    try {
+      const blob = await backupApi.download();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `rechnungsanalyse-backup-${new Date().toISOString().slice(0, 10)}.json`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      setBackupError(extractApiError(err, "Fehler beim Erstellen des Backups"));
+    } finally {
+      setDownloading(false);
+    }
+  }
+
+  async function handleRestore(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    if (!confirm("Alle bestehenden KI-Konfigurationen und Systemprompts werden durch die Backup-Daten ersetzt. Fortfahren?")) {
+      e.target.value = "";
+      return;
+    }
+    setRestoring(true);
+    setBackupError(null);
+    setRestoreResult(null);
+    try {
+      const result = await backupApi.restore(file);
+      const counts = Object.entries(result.restored).map(([k, v]) => `${k}: ${v}`).join(", ");
+      setRestoreResult(`✓ ${result.message} (${counts})`);
+    } catch (err) {
+      setBackupError(extractApiError(err, "Fehler beim Wiederherstellen des Backups"));
+    } finally {
+      setRestoring(false);
+      e.target.value = "";
+    }
+  }
 
   useEffect(() => {
     (async () => {
@@ -224,6 +272,60 @@ export default function ProcessingSettingsPage() {
           </div>
         </form>
       )}
+
+      {/* ── Backup / Restore ───────────────────────────────────────────────── */}
+      <div className="mt-10 border-t pt-8">
+        <h2 className="mb-1 text-xl font-bold text-gray-900">Backup / Restore</h2>
+        <p className="mb-6 text-sm text-gray-500">
+          Einstellungen sichern und wiederherstellen: KI-Konfigurationen, Systemprompts,
+          Bild- und Verarbeitungseinstellungen.
+        </p>
+
+        {backupError && (
+          <div className="mb-4 rounded bg-red-50 px-4 py-3 text-sm text-red-600">{backupError}</div>
+        )}
+        {restoreResult && (
+          <div className="mb-4 rounded bg-green-50 px-4 py-3 text-sm text-green-700">{restoreResult}</div>
+        )}
+
+        <div className="space-y-4">
+          {/* Backup herunterladen */}
+          <div className="rounded-lg border bg-white p-6 shadow-sm">
+            <h3 className="mb-1 text-base font-semibold text-gray-900">Backup herunterladen</h3>
+            <p className="mb-4 text-sm text-gray-500">
+              Exportiert alle KI-Konfigurationen, Systemprompts, Bildeinstellungen und
+              Verarbeitungseinstellungen als JSON-Datei.
+            </p>
+            <button
+              onClick={handleDownload}
+              disabled={downloading}
+              className="rounded bg-blue-600 px-5 py-2.5 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-50 transition-colors"
+            >
+              {downloading ? "Wird erstellt..." : "⬇ Backup herunterladen"}
+            </button>
+          </div>
+
+          {/* Backup wiederherstellen */}
+          <div className="rounded-lg border bg-white p-6 shadow-sm">
+            <h3 className="mb-1 text-base font-semibold text-gray-900">Backup wiederherstellen</h3>
+            <p className="mb-1 text-sm text-gray-500">
+              Stellt Einstellungen aus einer Backup-Datei wieder her.
+            </p>
+            <p className="mb-4 rounded bg-amber-50 px-3 py-2 text-xs text-amber-700">
+              ⚠ Achtung: Alle bestehenden KI-Konfigurationen und Systemprompts werden durch
+              die Backup-Daten ersetzt.
+            </p>
+            <input ref={fileRef} type="file" accept=".json" onChange={handleRestore} className="hidden" />
+            <button
+              onClick={() => fileRef.current?.click()}
+              disabled={restoring}
+              className="rounded bg-amber-500 px-5 py-2.5 text-sm font-medium text-white hover:bg-amber-600 disabled:opacity-50 transition-colors"
+            >
+              {restoring ? "Wird wiederhergestellt..." : "⬆ Backup hochladen & wiederherstellen"}
+            </button>
+          </div>
+        </div>
+      </div>
     </div>
   );
 }
