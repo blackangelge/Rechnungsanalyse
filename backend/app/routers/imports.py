@@ -2,16 +2,19 @@
 Router für Import-Batches.
 
 Endpunkte:
-  GET  /api/imports/      — alle Batches (optional gefiltert)
-  POST /api/imports/      — neuen Import starten
-  GET  /api/imports/{id}  — Batch-Details mit Dokumentliste
+  GET  /api/imports/              — alle Batches (optional gefiltert)
+  POST /api/imports/              — neuen Import starten
+  GET  /api/imports/{id}          — Batch-Details mit Dokumentliste
+  GET  /api/imports/{id}/export   — Excel-Export aller Dokumente des Batches
 """
 
 import asyncio
+import io
 import logging
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
 from app import crud
@@ -325,3 +328,205 @@ def delete_import(batch_id: int, db: Session = Depends(get_db)):
 
     # DB-Eintrag löschen (CASCADE zu Dokumenten, Extraktionen, Positionen)
     crud.import_batch.delete(db, batch_id)
+
+
+# ─── GET /api/imports/{batch_id}/export ──────────────────────────────────────
+
+@router.get("/{batch_id}/export")
+def export_batch_excel(batch_id: int, db: Session = Depends(get_db)):
+    """
+    Exportiert alle nicht-gelöschten Dokumente eines Import-Batches als Excel-Datei.
+
+    Sheet 1 „Rechnungen": Rechnungsdaten pro Dokument (Lieferant, Beträge, Daten …)
+    Sheet 2 „Positionen": Alle Bestellpositionen aller Dokumente des Batches
+    """
+    from sqlalchemy.orm import joinedload as _jl
+    from app.models.document import Document as _Doc
+    from app.models.import_batch import ImportBatch as _Batch
+
+    batch = db.get(_Batch, batch_id)
+    if batch is None:
+        raise HTTPException(status_code=404, detail="Import-Batch nicht gefunden")
+
+    docs = (
+        db.query(_Doc)
+        .options(_jl(_Doc.extraction), _jl(_Doc.order_positions))
+        .filter(_Doc.batch_id == batch_id, _Doc.deleted_at.is_(None))
+        .order_by(_Doc.id)
+        .all()
+    )
+
+    excel_bytes = _build_export_excel(batch, docs)
+    safe = f"{batch.company_name}_{batch.year}".replace(" ", "_")
+    filename = f"Export_{safe}.xlsx"
+
+    return StreamingResponse(
+        io.BytesIO(excel_bytes),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+def _build_export_excel(batch, docs) -> bytes:
+    """
+    Erstellt eine formatierte Excel-Datei mit zwei Sheets:
+    - „Rechnungen": alle Rechnungsfelder pro Dokument
+    - „Positionen": alle Bestellpositionen
+    """
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.utils import get_column_letter
+
+    wb = Workbook()
+
+    # ── Styles ────────────────────────────────────────────────────────────────
+    hdr_font  = Font(name="Arial", size=10, bold=True, color="FFFFFF")
+    hdr_fill  = PatternFill("solid", fgColor="2D3748")
+    hdr_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    data_font = Font(name="Arial", size=10)
+    fill_a    = PatternFill("solid", fgColor="FFFFFF")
+    fill_b    = PatternFill("solid", fgColor="F0F4F8")
+    center    = Alignment(horizontal="center", vertical="center")
+    fmt_eur   = '#,##0.00 €'
+    fmt_date  = 'DD.MM.YYYY'
+    fmt_dt    = 'DD.MM.YYYY HH:MM'
+
+    def _header_row(ws, headers: list[str], row: int = 1):
+        for c, h in enumerate(headers, 1):
+            cell = ws.cell(row=row, column=c, value=h)
+            cell.font = hdr_font
+            cell.fill = hdr_fill
+            cell.alignment = hdr_align
+        ws.row_dimensions[row].height = 28
+
+    def _set_widths(ws, widths: list[int]):
+        for i, w in enumerate(widths, 1):
+            ws.column_dimensions[get_column_letter(i)].width = w
+
+    def _row_fill(row_idx: int) -> PatternFill:
+        return fill_a if row_idx % 2 == 0 else fill_b
+
+    # ── Sheet 1: Rechnungen ───────────────────────────────────────────────────
+    ws1 = wb.active
+    ws1.title = "Rechnungen"
+
+    # Titelzeile
+    ws1.merge_cells("A1:V1")
+    ws1["A1"] = f"Export: {batch.company_name} {batch.year}"
+    ws1["A1"].font = Font(name="Arial", size=13, bold=True)
+    ws1["A1"].alignment = Alignment(vertical="center")
+    ws1.row_dimensions[1].height = 24
+
+    _header_row(ws1, [
+        "Beleg-Nr.", "Dateiname", "Status", "Seiten",
+        "Rechnungsnr.", "Rechnungsdatum", "Fälligkeit",
+        "Lieferant", "Anschrift", "USt-IdNr.", "Steuernr.", "HRB-Nr.", "Kundennr.",
+        "Bank", "IBAN", "BIC",
+        "Gesamtbetrag (€)", "Rabatt (€)", "Skonto (€)",
+        "Zahlungsbedingungen", "Kommentar", "Importiert am",
+    ], row=2)
+
+    def _f(val):
+        """Decimal / int → float, None bleibt None."""
+        return float(val) if val is not None else None
+
+    def _dt(val):
+        """Timezone-aware datetime → naive (openpyxl verträgt keine tz-aware Objekte)."""
+        return val.replace(tzinfo=None) if val and hasattr(val, "tzinfo") and val.tzinfo else val
+
+    for r, doc in enumerate(docs, start=3):
+        ex   = doc.extraction
+        fill = _row_fill(r)
+
+        row_vals = [
+            doc.id,
+            doc.original_filename,
+            doc.status,
+            doc.page_count or None,
+            ex.invoice_number      if ex else None,
+            ex.invoice_date        if ex else None,
+            ex.due_date            if ex else None,
+            ex.supplier_name       if ex else None,
+            ex.supplier_address    if ex else None,
+            ex.vat_id              if ex else None,
+            ex.tax_number          if ex else None,
+            ex.hrb_number          if ex else None,
+            ex.customer_number     if ex else None,
+            ex.bank_name           if ex else None,
+            ex.iban                if ex else None,
+            ex.bic                 if ex else None,
+            _f(ex.total_amount)         if ex else None,
+            _f(ex.discount_amount)      if ex else None,
+            _f(ex.cash_discount_amount) if ex else None,
+            ex.payment_terms       if ex else None,
+            doc.comment,
+            _dt(doc.created_at),
+        ]
+
+        for c, val in enumerate(row_vals, 1):
+            cell = ws1.cell(row=r, column=c, value=val)
+            cell.font = data_font
+            cell.fill = fill
+            if c in (17, 18, 19):
+                cell.number_format = fmt_eur
+            elif c in (6, 7):
+                cell.number_format = fmt_date
+            elif c == 22:
+                cell.number_format = fmt_dt
+            elif c == 4:
+                cell.alignment = center
+
+    _set_widths(ws1, [10, 36, 12, 8, 22, 14, 14, 32, 36, 18, 16, 14, 14, 26, 26, 12, 17, 13, 13, 42, 30, 18])
+    ws1.freeze_panes = "A3"
+
+    # ── Sheet 2: Positionen ───────────────────────────────────────────────────
+    ws2 = wb.create_sheet("Positionen")
+
+    _header_row(ws2, [
+        "Beleg-Nr.", "Rechnungsnr.", "Lieferant", "Pos.",
+        "Artikelbezeichnung", "Artikelnummer",
+        "Menge", "Einheit", "Einzelpreis (€)", "Gesamtpreis (€)", "Nachlass",
+    ])
+
+    r = 2
+    for doc in docs:
+        ex = doc.extraction
+        for pos in doc.order_positions:
+            fill = _row_fill(r)
+            row_vals = [
+                doc.id,
+                ex.invoice_number   if ex else None,
+                ex.supplier_name    if ex else None,
+                pos.position_index + 1,
+                pos.product_description,
+                pos.article_number,
+                float(pos.quantity)   if pos.quantity   is not None else None,
+                pos.unit,
+                float(pos.unit_price) if pos.unit_price is not None else None,
+                float(pos.total_price) if pos.total_price is not None else None,
+                pos.discount,
+            ]
+            for c, val in enumerate(row_vals, 1):
+                cell = ws2.cell(row=r, column=c, value=val)
+                cell.font = data_font
+                cell.fill = fill
+                if c in (9, 10):
+                    cell.number_format = fmt_eur
+                elif c in (4,):
+                    cell.alignment = center
+            r += 1
+
+    if r == 2:
+        # Keine Positionen vorhanden — Hinweis
+        ws2.cell(row=2, column=1, value="Keine Positionen vorhanden").font = Font(
+            name="Arial", size=10, color="888888", italic=True
+        )
+
+    _set_widths(ws2, [10, 22, 32, 8, 52, 20, 12, 12, 17, 17, 22])
+    ws2.freeze_panes = "A2"
+
+    # ── Bytes zurückgeben ─────────────────────────────────────────────────────
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf.read()
