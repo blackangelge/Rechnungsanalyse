@@ -63,7 +63,9 @@ app/
 │   └── system_prompt.py
 ├── routers/                # API-Endpunkte
 │   ├── imports.py          # GET/POST /api/imports, DELETE löscht auch Dateien
+│   │                       # GET /api/imports/{id}/export → Excel-Download
 │   │                       # _import_then_analyze, _delete_source_files
+│   │                       # _build_export_excel (openpyxl, 2 Sheets)
 │   ├── documents.py        # GET /api/documents, POST /analyze, GET/{id}, preview, comment
 │   │                       # _KI_IO_EXECUTOR, _analyze_single (phasenbasiert, sequenziell)
 │   ├── ai_configs.py       # CRUD /api/ai-configs, POST set-default
@@ -268,6 +270,44 @@ IMPORT_BASE_PATH=/volume1/docker/_rechnungsanalyse/import
 STORAGE_PATH=/volume1/docker/_rechnungsanalyse/storage
 ```
 
+### Excel-Export (`routers/imports.py`)
+
+`GET /api/imports/{id}/export` — gibt eine `.xlsx`-Datei zurück (StreamingResponse).
+Lädt alle **nicht-soft-gelöschten** Dokumente des Batches via `joinedload` für
+`extraction`, `extraction.supplier` und `order_positions`.
+
+**Sheet „Rechnungen"** (26 Spalten):
+
+| Spalten | Quelle |
+|---|---|
+| Beleg-Nr., Dateiname, Status, Seiten | `Document` |
+| Rechnungsnr., Rechnungsdatum, Fälligkeit | `InvoiceExtraction` |
+| Lieferant, Straße, PLZ, Ort | `InvoiceExtraction.supplier_name` + `Supplier.street/zip_code/city` |
+| USt-IdNr., Steuernr., HRB-Nr., Kundennr. | `InvoiceExtraction` |
+| Bank, IBAN, BIC | `InvoiceExtraction` |
+| Gesamtbetrag (€), Rabatt (€) | `InvoiceExtraction` |
+| Skonto (€), Skonto (%), Skonto Frist (Tage) | `InvoiceExtraction.cash_discount_amount` + `raw_response → zahlungsinformationen.skonto` |
+| Zahlungsbedingungen, Kommentar, Importiert am | `InvoiceExtraction` / `Document` |
+
+**Sheet „Positionen"** (12 Spalten):
+
+| Spalten | Quelle |
+|---|---|
+| Beleg-Nr., Rechnungsnr., Lieferant, Pos. | `Document` / `InvoiceExtraction` |
+| Artikelbezeichnung, Artikelnummer, Menge, Einheit | `OrderPosition` |
+| Einzelpreis (€), Gesamtpreis (€) | `OrderPosition` |
+| Steuersatz (%) | `raw_response → positionen[i].steuersatz` (Index = `position_index`) |
+| Nachlass | `OrderPosition` |
+
+**Wichtig:** Straße/PLZ/Ort sind nur befüllt wenn ein `Supplier`-Datensatz existiert
+(erfordert KI-Analyse). Steuersatz und Skonto-Details nur im neuen verschachtelten
+KI-JSON-Format vorhanden. `_parse_raw()` parst `raw_response` sicher (keine Exception
+bei leerem oder ungültigem JSON).
+
+**Frontend:** `<a href="/api/imports/{id}/export/" download>` auf der Import-Detailseite
+(grüner Button „↓ Excel exportieren" neben „Aktualisieren", nur sichtbar wenn Import
+abgeschlossen).
+
 ### Wichtige Abhängigkeiten
 
 ```
@@ -277,6 +317,7 @@ pypdfium2      # PDF → Bilder (kein Poppler nötig)
 pypdf          # Seitenanzahl auslesen (nur in pdf_service, nicht mehr im Import)
 Pillow         # Bildbearbeitung / Base64
 sse-starlette  # Server-Sent Events
+openpyxl       # Excel-Export (GET /api/imports/{id}/export)
 pydantic-settings
 ```
 
@@ -384,6 +425,8 @@ Behandelt sowohl `number` als auch Strings wie `"719,99 €"`:
 - Nach Abschluss des Imports: Dokumentenliste wird automatisch geladen
 - `docsLoadedRef` verhindert doppeltes Laden der Dokumentenliste
 - `batchLoadedRef` verhindert Infinite-Loop in `useCallback`
+- **„↓ Excel exportieren"-Button** (grün) neben „Aktualisieren" — direkter Download-Link
+  auf `GET /api/imports/{id}/export/`, nur sichtbar wenn Import nicht mehr aktiv
 
 ### Logs-Seite (`logs/page.tsx`)
 

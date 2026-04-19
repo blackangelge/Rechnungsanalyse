@@ -209,6 +209,13 @@ export default function ImportDetailPage() {
             >
               {docsLoading ? "Lade…" : "↻ Aktualisieren"}
             </button>
+            <a
+              href={`/api/imports/${batchId}/export/`}
+              download
+              className="rounded border border-emerald-600 bg-emerald-50 px-3 py-1 text-xs font-medium text-emerald-700 hover:bg-emerald-100"
+            >
+              ↓ Excel exportieren
+            </a>
           </div>
 
           {docsLoading && !documents && (
