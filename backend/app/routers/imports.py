@@ -343,6 +343,7 @@ def export_batch_excel(batch_id: int, db: Session = Depends(get_db)):
     from sqlalchemy.orm import joinedload as _jl
     from app.models.document import Document as _Doc
     from app.models.import_batch import ImportBatch as _Batch
+    from app.models.invoice_extraction import InvoiceExtraction as _Ext
 
     batch = db.get(_Batch, batch_id)
     if batch is None:
@@ -350,7 +351,10 @@ def export_batch_excel(batch_id: int, db: Session = Depends(get_db)):
 
     docs = (
         db.query(_Doc)
-        .options(_jl(_Doc.extraction), _jl(_Doc.order_positions))
+        .options(
+            _jl(_Doc.extraction).joinedload(_Ext.supplier),
+            _jl(_Doc.order_positions),
+        )
         .filter(_Doc.batch_id == batch_id, _Doc.deleted_at.is_(None))
         .order_by(_Doc.id)
         .all()
@@ -370,9 +374,15 @@ def export_batch_excel(batch_id: int, db: Session = Depends(get_db)):
 def _build_export_excel(batch, docs) -> bytes:
     """
     Erstellt eine formatierte Excel-Datei mit zwei Sheets:
-    - „Rechnungen": alle Rechnungsfelder pro Dokument
-    - „Positionen": alle Bestellpositionen
+    - „Rechnungen": alle Rechnungsfelder pro Dokument inkl. Adresse (Straße/PLZ/Ort)
+                    und Skonto-Details (Betrag, Prozent, Frist)
+    - „Positionen": alle Bestellpositionen inkl. Steuersatz
+
+    Adress-Einzelfelder kommen aus dem verknüpften Supplier-Datensatz.
+    Steuersatz und Skonto-Details werden aus raw_response geparst.
     """
+    import json as _json
+
     from openpyxl import Workbook
     from openpyxl.styles import Alignment, Font, PatternFill
     from openpyxl.utils import get_column_letter
@@ -388,6 +398,7 @@ def _build_export_excel(batch, docs) -> bytes:
     fill_b    = PatternFill("solid", fgColor="F0F4F8")
     center    = Alignment(horizontal="center", vertical="center")
     fmt_eur   = '#,##0.00 €'
+    fmt_pct   = '0.00"%"'
     fmt_date  = 'DD.MM.YYYY'
     fmt_dt    = 'DD.MM.YYYY HH:MM'
 
@@ -406,12 +417,54 @@ def _build_export_excel(batch, docs) -> bytes:
     def _row_fill(row_idx: int) -> PatternFill:
         return fill_a if row_idx % 2 == 0 else fill_b
 
+    def _f(val):
+        """Decimal / int → float, None bleibt None."""
+        return float(val) if val is not None else None
+
+    def _dt(val):
+        """Timezone-aware datetime → naive (openpyxl verträgt keine tz-aware Objekte)."""
+        return val.replace(tzinfo=None) if val and getattr(val, "tzinfo", None) else val
+
+    def _parse_raw(raw_response: str | None) -> dict:
+        """Parst raw_response sicher als Dict. Gibt {} bei Fehler zurück."""
+        if not raw_response:
+            return {}
+        try:
+            result = _json.loads(raw_response)
+            return result if isinstance(result, dict) else {}
+        except (_json.JSONDecodeError, TypeError):
+            return {}
+
     # ── Sheet 1: Rechnungen ───────────────────────────────────────────────────
+    # Spalten (26 = A..Z):
+    # 1  Beleg-Nr.        9  Straße           17 Gesamtbetrag (€)   23 Skonto Frist
+    # 2  Dateiname        10 PLZ              18 Rabatt (€)          24 Zahlungsbedingungen
+    # 3  Status           11 Ort              19 Skonto (€)          25 Kommentar
+    # 4  Seiten           12 USt-IdNr.        20 Skonto (%)          26 Importiert am
+    # 5  Rechnungsnr.     13 Steuernr.        21 Skonto Frist (Tage)
+    # 6  Rechnungsdatum   14 HRB-Nr.
+    # 7  Fälligkeit       15 Kundennr.
+    # 8  Lieferant        16 Bank / IBAN / BIC → 16, 17(IBAN), 18(BIC) … warte,
+    #    neu gezählt:
+    # 8  Lieferant        14 HRB-Nr.          20 Skonto (%)
+    # 9  Straße           15 Kundennr.        21 Skonto Frist (Tage)
+    # 10 PLZ              16 Bank             22 Zahlungsbedingungen
+    # 11 Ort              17 IBAN             23 Kommentar
+    # 12 USt-IdNr.        18 BIC              24 Importiert am
+    # 13 Steuernr.        19 Gesamtbetrag (€)
+    #                     20 Rabatt (€)
+    #                     21 Skonto (€)
+    #                     22 Skonto (%)
+    #                     23 Skonto Frist (Tage)
+    #                     24 Zahlungsbedingungen
+    #                     25 Kommentar
+    #                     26 Importiert am
+    NUM_COLS_WS1 = 26
+
     ws1 = wb.active
     ws1.title = "Rechnungen"
 
-    # Titelzeile
-    ws1.merge_cells("A1:V1")
+    ws1.merge_cells(f"A1:{get_column_letter(NUM_COLS_WS1)}1")
     ws1["A1"] = f"Export: {batch.company_name} {batch.year}"
     ws1["A1"].font = Font(name="Arial", size=13, bold=True)
     ws1["A1"].alignment = Alignment(vertical="center")
@@ -420,45 +473,52 @@ def _build_export_excel(batch, docs) -> bytes:
     _header_row(ws1, [
         "Beleg-Nr.", "Dateiname", "Status", "Seiten",
         "Rechnungsnr.", "Rechnungsdatum", "Fälligkeit",
-        "Lieferant", "Anschrift", "USt-IdNr.", "Steuernr.", "HRB-Nr.", "Kundennr.",
+        "Lieferant", "Straße", "PLZ", "Ort",
+        "USt-IdNr.", "Steuernr.", "HRB-Nr.", "Kundennr.",
         "Bank", "IBAN", "BIC",
-        "Gesamtbetrag (€)", "Rabatt (€)", "Skonto (€)",
+        "Gesamtbetrag (€)", "Rabatt (€)",
+        "Skonto (€)", "Skonto (%)", "Skonto Frist (Tage)",
         "Zahlungsbedingungen", "Kommentar", "Importiert am",
     ], row=2)
 
-    def _f(val):
-        """Decimal / int → float, None bleibt None."""
-        return float(val) if val is not None else None
-
-    def _dt(val):
-        """Timezone-aware datetime → naive (openpyxl verträgt keine tz-aware Objekte)."""
-        return val.replace(tzinfo=None) if val and hasattr(val, "tzinfo") and val.tzinfo else val
-
     for r, doc in enumerate(docs, start=3):
         ex   = doc.extraction
+        sup  = ex.supplier if ex else None
         fill = _row_fill(r)
+
+        # Skonto-Details aus raw_response
+        raw      = _parse_raw(ex.raw_response if ex else None)
+        skonto   = (raw.get("zahlungsinformationen") or {}).get("skonto") or {}
+        skonto_p = _f(skonto.get("prozent"))
+        skonto_t = skonto.get("frist_tage")
+        if isinstance(skonto_t, float) and skonto_t.is_integer():
+            skonto_t = int(skonto_t)
 
         row_vals = [
             doc.id,
             doc.original_filename,
             doc.status,
             doc.page_count or None,
-            ex.invoice_number      if ex else None,
-            ex.invoice_date        if ex else None,
-            ex.due_date            if ex else None,
-            ex.supplier_name       if ex else None,
-            ex.supplier_address    if ex else None,
-            ex.vat_id              if ex else None,
-            ex.tax_number          if ex else None,
-            ex.hrb_number          if ex else None,
-            ex.customer_number     if ex else None,
-            ex.bank_name           if ex else None,
-            ex.iban                if ex else None,
-            ex.bic                 if ex else None,
-            _f(ex.total_amount)         if ex else None,
-            _f(ex.discount_amount)      if ex else None,
+            ex.invoice_number        if ex  else None,
+            ex.invoice_date          if ex  else None,
+            ex.due_date              if ex  else None,
+            ex.supplier_name         if ex  else None,
+            sup.street               if sup else None,
+            sup.zip_code             if sup else None,
+            sup.city                 if sup else None,
+            ex.vat_id                if ex  else None,
+            ex.tax_number            if ex  else None,
+            ex.hrb_number            if ex  else None,
+            ex.customer_number       if ex  else None,
+            ex.bank_name             if ex  else None,
+            ex.iban                  if ex  else None,
+            ex.bic                   if ex  else None,
+            _f(ex.total_amount)      if ex  else None,
+            _f(ex.discount_amount)   if ex  else None,
             _f(ex.cash_discount_amount) if ex else None,
-            ex.payment_terms       if ex else None,
+            skonto_p,
+            skonto_t,
+            ex.payment_terms         if ex  else None,
             doc.comment,
             _dt(doc.created_at),
         ]
@@ -467,43 +527,63 @@ def _build_export_excel(batch, docs) -> bytes:
             cell = ws1.cell(row=r, column=c, value=val)
             cell.font = data_font
             cell.fill = fill
-            if c in (17, 18, 19):
+            if c in (19, 20, 21):           # Beträge
                 cell.number_format = fmt_eur
-            elif c in (6, 7):
+            elif c == 22:                    # Skonto %
+                cell.number_format = fmt_pct
+            elif c in (6, 7):               # Datumsfelder
                 cell.number_format = fmt_date
-            elif c == 22:
+            elif c == 26:                   # Importiert am
                 cell.number_format = fmt_dt
-            elif c == 4:
+            elif c == 4:                    # Seiten — zentriert
                 cell.alignment = center
 
-    _set_widths(ws1, [10, 36, 12, 8, 22, 14, 14, 32, 36, 18, 16, 14, 14, 26, 26, 12, 17, 13, 13, 42, 30, 18])
+    _set_widths(ws1, [
+        10, 36, 12, 8,          # Beleg, Dateiname, Status, Seiten
+        22, 14, 14,             # Rechnungsnr., Datum, Fälligkeit
+        30, 28, 8, 20,          # Lieferant, Straße, PLZ, Ort
+        18, 16, 14, 14,         # USt-IdNr., Steuernr., HRB, Kundennr.
+        24, 26, 12,             # Bank, IBAN, BIC
+        17, 13, 13, 10, 12,     # Gesamtbetrag, Rabatt, Skonto€, Skonto%, Frist
+        42, 30, 18,             # Zahlungsbedingungen, Kommentar, Importiert am
+    ])
     ws1.freeze_panes = "A3"
 
     # ── Sheet 2: Positionen ───────────────────────────────────────────────────
+    # Steuersatz wird aus raw_response geparst (nicht im ORM-Modell)
     ws2 = wb.create_sheet("Positionen")
 
     _header_row(ws2, [
         "Beleg-Nr.", "Rechnungsnr.", "Lieferant", "Pos.",
         "Artikelbezeichnung", "Artikelnummer",
-        "Menge", "Einheit", "Einzelpreis (€)", "Gesamtpreis (€)", "Nachlass",
+        "Menge", "Einheit",
+        "Einzelpreis (€)", "Gesamtpreis (€)", "Steuersatz (%)", "Nachlass",
     ])
 
     r = 2
     for doc in docs:
         ex = doc.extraction
+
+        # Steuersätze aus raw_response: positionen[i].steuersatz
+        raw = _parse_raw(ex.raw_response if ex else None)
+        raw_pos_list = raw.get("positionen") or []
+        # Mapping: position_index → steuersatz
+        tax_map = {i: _f(p.get("steuersatz")) for i, p in enumerate(raw_pos_list)}
+
         for pos in doc.order_positions:
             fill = _row_fill(r)
             row_vals = [
                 doc.id,
-                ex.invoice_number   if ex else None,
-                ex.supplier_name    if ex else None,
+                ex.invoice_number    if ex else None,
+                ex.supplier_name     if ex else None,
                 pos.position_index + 1,
                 pos.product_description,
                 pos.article_number,
-                float(pos.quantity)   if pos.quantity   is not None else None,
+                _f(pos.quantity),
                 pos.unit,
-                float(pos.unit_price) if pos.unit_price is not None else None,
-                float(pos.total_price) if pos.total_price is not None else None,
+                _f(pos.unit_price),
+                _f(pos.total_price),
+                tax_map.get(pos.position_index),   # Steuersatz aus raw_response
                 pos.discount,
             ]
             for c, val in enumerate(row_vals, 1):
@@ -512,17 +592,18 @@ def _build_export_excel(batch, docs) -> bytes:
                 cell.fill = fill
                 if c in (9, 10):
                     cell.number_format = fmt_eur
-                elif c in (4,):
+                elif c == 11:               # Steuersatz %
+                    cell.number_format = fmt_pct
+                elif c == 4:
                     cell.alignment = center
             r += 1
 
     if r == 2:
-        # Keine Positionen vorhanden — Hinweis
         ws2.cell(row=2, column=1, value="Keine Positionen vorhanden").font = Font(
             name="Arial", size=10, color="888888", italic=True
         )
 
-    _set_widths(ws2, [10, 22, 32, 8, 52, 20, 12, 12, 17, 17, 22])
+    _set_widths(ws2, [10, 22, 30, 8, 52, 20, 12, 12, 17, 17, 14, 22])
     ws2.freeze_panes = "A2"
 
     # ── Bytes zurückgeben ─────────────────────────────────────────────────────
