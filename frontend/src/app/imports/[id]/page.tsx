@@ -13,7 +13,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useParams } from "next/navigation";
-import { ImportBatch, DocumentItem, importsApi } from "@/lib/api";
+import { BatchKiStats, ImportBatch, DocumentItem, importsApi } from "@/lib/api";
 import ProgressPanel from "@/components/imports/ProgressPanel";
 import DocumentsTable from "@/components/imports/DocumentsTable";
 
@@ -26,6 +26,8 @@ export default function ImportDetailPage() {
   // Dokumente — nur nach Abschluss des Imports
   const [documents, setDocuments] = useState<DocumentItem[] | null>(null);
   const [docsLoading, setDocsLoading] = useState(false);
+  // Aggregierte KI-Statistiken für diesen Batch
+  const [kiStats, setKiStats] = useState<BatchKiStats | null>(null);
 
   const [metaLoading, setMetaLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -62,6 +64,16 @@ export default function ImportDetailPage() {
     }
   }, [batchId]);
 
+  /** KI-Statistiken laden (Token-Summen + Gesamtdauer) */
+  const loadKiStats = useCallback(async () => {
+    try {
+      const stats = await importsApi.kiStats(batchId);
+      setKiStats(stats);
+    } catch {
+      // Fehler ignorieren — Stats sind optional
+    }
+  }, [batchId]);
+
   /** Dokumente laden — einmalig nach Import-Abschluss */
   const loadDocuments = useCallback(async () => {
     if (docsLoadedRef.current) return; // kein Doppel-Load
@@ -94,6 +106,7 @@ export default function ImportDetailPage() {
       try {
         const data = await importsApi.getStatus(batchId);
         setBatch(data);
+        loadKiStats(); // KI-Stats bei jedem Poll aktualisieren
         if (data.status === "done" || data.status === "error") {
           stopPolling();
           loadDocuments();
@@ -102,10 +115,11 @@ export default function ImportDetailPage() {
         // Netzwerkfehler ignorieren — nächster Poll-Versuch in 4 s
       }
     }, 4000);
-  }, [batchId, loadDocuments, stopPolling]);
+  }, [batchId, loadDocuments, loadKiStats, stopPolling]);
 
   // Initialer Ladevorgang
   useEffect(() => {
+    loadKiStats(); // KI-Stats direkt beim Laden holen
     loadMeta().then((data) => {
       if (!data) return;
       if (data.status === "done" || data.status === "error") {
@@ -117,13 +131,14 @@ export default function ImportDetailPage() {
       }
     });
     return () => stopPolling();
-  }, [loadMeta, loadDocuments, startPolling, stopPolling]);
+  }, [loadMeta, loadDocuments, loadKiStats, startPolling, stopPolling]);
 
   /** Callback vom ProgressPanel: Import ist abgeschlossen (via SSE) */
   const handleImportDone = useCallback(() => {
     stopPolling(); // Polling stoppen, SSE hat gewonnen
+    loadKiStats(); // Finale KI-Stats laden
     loadDocuments();
-  }, [loadDocuments, stopPolling]);
+  }, [loadDocuments, loadKiStats, stopPolling]);
 
   /** Manueller Refresh der Dokumentliste */
   const handleManualRefresh = useCallback(() => {
@@ -174,6 +189,7 @@ export default function ImportDetailPage() {
         initialStatus={batch.status}
         initialTotal={batch.total_docs}
         initialProcessed={batch.processed_docs}
+        kiStats={kiStats}
         onDone={handleImportDone}
       />
 

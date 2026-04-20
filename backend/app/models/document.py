@@ -99,3 +99,19 @@ class Document(Base):
     @property
     def supplier_name(self) -> str | None:
         return self.extraction.supplier_name if self.extraction else None
+
+    @property
+    def has_extraction(self) -> bool:
+        return self.extraction is not None
+
+    @property
+    def ki_input_tokens(self) -> int | None:
+        return self.extraction.ki_input_tokens if self.extraction else None
+
+    @property
+    def ki_output_tokens(self) -> int | None:
+        return self.extraction.ki_output_tokens if self.extraction else None
+
+    @property
+    def ki_total_duration(self) -> float | None:
+        return self.extraction.ki_total_duration if self.extraction else None

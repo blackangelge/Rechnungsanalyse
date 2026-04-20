@@ -111,6 +111,8 @@ class InvoiceExtraction(Base):
     ki_reasoning_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     ki_tokens_per_second: Mapped[float | None] = mapped_column(Float, nullable=True)
     ki_time_to_first_token: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # Gesamtdauer des KI-API-Aufrufs in Sekunden (Request gesendet → Response empfangen)
+    ki_total_duration: Mapped[float | None] = mapped_column(Float, nullable=True)
 
     # Erstellungs- und Änderungszeitpunkt
     created_at: Mapped[datetime] = mapped_column(

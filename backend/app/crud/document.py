@@ -141,13 +141,15 @@ def get_all_filtered(
     page_max: int | None = None,
     batch_ids: list[int] | None = None,
     include_deleted: bool = False,
+    has_extraction: bool | None = None,
+    supplier_name_filter: str | None = None,
+    doc_id: int | None = None,
 ) -> list[Document]:
     """
     Gibt alle Dokumente zurück, optional gefiltert.
 
-    Für Betragsfilter wird ein Outer Join auf invoice_extractions gemacht,
-    damit Dokumente ohne Extraktion weiterhin erscheinen (außer wenn ein
-    Betragsfilter aktiv ist, der eine vorhandene Extraktion voraussetzt).
+    Für Betragsfilter, KI-Filter und Lieferantenfilter wird ein Outer Join
+    auf invoice_extractions gemacht. Der Join wird nur einmal ausgeführt.
     """
     query = db.query(Document).options(joinedload(Document.extraction))
 
@@ -159,16 +161,36 @@ def get_all_filtered(
     if batch_ids:
         query = query.filter(Document.batch_id.in_(batch_ids))
 
-    # Betragsfilter benötigen den Join
-    if total_min is not None or total_max is not None:
+    # Prüfen ob ein Join auf InvoiceExtraction benötigt wird
+    needs_join = (
+        total_min is not None
+        or total_max is not None
+        or has_extraction is not None
+        or supplier_name_filter is not None
+    )
+    if needs_join:
         query = query.outerjoin(
             InvoiceExtraction,
             Document.id == InvoiceExtraction.document_id,
         )
-        if total_min is not None:
-            query = query.filter(InvoiceExtraction.total_amount >= Decimal(str(total_min)))
-        if total_max is not None:
-            query = query.filter(InvoiceExtraction.total_amount <= Decimal(str(total_max)))
+
+    # Betragsfilter
+    if total_min is not None:
+        query = query.filter(InvoiceExtraction.total_amount >= Decimal(str(total_min)))
+    if total_max is not None:
+        query = query.filter(InvoiceExtraction.total_amount <= Decimal(str(total_max)))
+
+    # KI-Filter: Extraktion vorhanden oder nicht
+    if has_extraction is True:
+        query = query.filter(InvoiceExtraction.id.isnot(None))
+    elif has_extraction is False:
+        query = query.filter(InvoiceExtraction.id.is_(None))
+
+    # Lieferantenname-Filter
+    if supplier_name_filter:
+        query = query.filter(
+            InvoiceExtraction.supplier_name.ilike(f"%{supplier_name_filter}%")
+        )
 
     if company:
         query = query.filter(Document.company.ilike(f"%{company}%"))
@@ -180,6 +202,8 @@ def get_all_filtered(
         query = query.filter(Document.page_count >= page_min)
     if page_max is not None:
         query = query.filter(Document.page_count <= page_max)
+    if doc_id is not None:
+        query = query.filter(Document.id == doc_id)
 
     return query.order_by(Document.id.desc()).all()
 
@@ -226,6 +250,7 @@ def save_extraction(
         ki_reasoning_tokens=stats.get("reasoning_tokens"),
         ki_tokens_per_second=stats.get("tokens_per_second"),
         ki_time_to_first_token=stats.get("time_to_first_token"),
+        ki_total_duration=stats.get("total_duration"),
         **extracted_data,
     )
     db.add(extraction)

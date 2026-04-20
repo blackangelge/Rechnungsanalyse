@@ -35,15 +35,27 @@ router = APIRouter(prefix="/api/imports", tags=["Imports"])
 # ─── Sync DB-Hilfsfunktionen (laufen via asyncio.to_thread) ─────────────────
 
 def _db_get_source_filenames(batch_id: int) -> list[str]:
-    """Gibt die original_filename aller erfolgreich kopierten Dokumente zurück."""
+    """
+    Gibt die original_filename aller erfolgreich kopierten Dokumente zurück.
+    Direkte Query statt Relationship-Zugriff für maximale Zuverlässigkeit.
+    """
+    from app.models.document import Document as _Doc
     db = SessionLocal()
     try:
-        batch = crud.import_batch.get_by_id(db, batch_id)
-        return [
-            d.original_filename
-            for d in (batch.documents if batch else [])
-            if d.stored_filename and d.original_filename
-        ]
+        rows = (
+            db.query(_Doc.original_filename)
+            .filter(
+                _Doc.batch_id == batch_id,
+                _Doc.stored_filename.isnot(None),
+                _Doc.original_filename.isnot(None),
+            )
+            .all()
+        )
+        names = [r.original_filename for r in rows]
+        logger.info(
+            "Batch #%d: %d Quelldatei(en) in DB gefunden", batch_id, len(names)
+        )
+        return names
     finally:
         db.close()
 
@@ -103,22 +115,24 @@ def _db_set_processing(doc_ids: list[int]) -> None:
 def _sync_delete_source_files(import_folder: str, original_names: list[str]) -> tuple[int, int]:
     """
     Sync: Löscht Quelldateien aus dem Import-Ordner.
-    Gibt (deleted, failed) zurück. Läuft via _run_import_io().
+    Gibt (deleted, failed) zurück.
     """
     folder = Path(import_folder)
     deleted, failed = 0, 0
+    logger.info(
+        "Lösche Quelldateien aus '%s': %d Datei(en)", import_folder, len(original_names)
+    )
     for name in original_names:
         src = folder / name
         try:
-            if src.exists():
-                src.unlink()
-                deleted += 1
-                logger.info("Quelldatei gelöscht: %s", src)
-            else:
-                logger.debug("Quelldatei bereits weg: %s", src)
+            src.unlink()  # Direkt löschen — FileNotFoundError bei fehlendem File
+            deleted += 1
+            logger.info("Quelldatei gelöscht: %s", src)
+        except FileNotFoundError:
+            logger.warning("Quelldatei nicht gefunden (bereits gelöscht?): %s", src)
         except Exception as exc:
             failed += 1
-            logger.warning("Konnte Quelldatei nicht löschen %s: %s", src, exc)
+            logger.error("Konnte Quelldatei nicht löschen %s: %s", src, exc)
     return deleted, failed
 
 
@@ -126,17 +140,25 @@ async def _delete_source_files(batch_id: int, import_folder: str) -> None:
     """
     Löscht die Original-PDFs aus dem Import-Ordner, die erfolgreich kopiert wurden.
     Es werden nur Dateien gelöscht, für die ein DB-Eintrag mit stored_filename existiert.
-    DB-Abfrage und Filesystem-Operationen laufen in Thread-Pools (nicht-blockierend).
     """
     # DB-Abfrage im Thread
     original_names = await asyncio.to_thread(_db_get_source_filenames, batch_id)
 
     if not original_names:
-        logger.debug("Batch #%d: Keine Quelldateien zum Löschen", batch_id)
+        logger.warning(
+            "Batch #%d: Keine Quelldateien in DB gefunden — nichts zu löschen", batch_id
+        )
         return
 
-    # Filesystem-Operationen im Import-IO-Pool
-    deleted, failed = await _run_import_io(_sync_delete_source_files, import_folder, original_names)
+    logger.info(
+        "Batch #%d: %d Quelldatei(en) werden aus '%s' gelöscht",
+        batch_id, len(original_names), import_folder,
+    )
+
+    # Filesystem-Operationen im Thread (einfaches asyncio.to_thread, kein spezieller Pool nötig)
+    deleted, failed = await asyncio.to_thread(
+        _sync_delete_source_files, import_folder, original_names
+    )
 
     logger.info(
         "Batch #%d: Quelldateien gelöscht=%d, fehlgeschlagen=%d", batch_id, deleted, failed
@@ -145,8 +167,13 @@ async def _delete_source_files(batch_id: int, import_folder: str) -> None:
 
 async def _import_and_delete(batch_id: int, import_folder: str) -> None:
     """Import durchführen und danach Quelldateien löschen (ohne KI-Analyse)."""
-    await run_import(batch_id)
-    await _delete_source_files(batch_id, import_folder)
+    try:
+        await run_import(batch_id)
+        await _delete_source_files(batch_id, import_folder)
+    except Exception as exc:
+        logger.error(
+            "Batch #%d: Fehler in _import_and_delete: %s", batch_id, exc, exc_info=True
+        )
 
 
 async def _import_then_analyze(
@@ -161,30 +188,36 @@ async def _import_then_analyze(
     für alle erfolgreich importierten Dokumente.
     Alle DB- und Filesystem-Operationen laufen in Thread-Pools (nicht-blockierend).
     """
-    from app.routers.documents import _run_analysis
+    try:
+        from app.routers.documents import _run_analysis
 
-    # 1. Import abwarten
-    await run_import(batch_id)
+        # 1. Import abwarten
+        await run_import(batch_id)
 
-    # 2. Quelldateien löschen (falls gewünscht), bevor KI läuft
-    if delete_source_files:
-        await _delete_source_files(batch_id, import_folder)
+        # 2. Quelldateien löschen (falls gewünscht), bevor KI läuft
+        if delete_source_files:
+            await _delete_source_files(batch_id, import_folder)
 
-    # 3. KI-Konfiguration + Systemprompt + Dokument-IDs auflösen (im Thread)
-    setup = await asyncio.to_thread(_db_get_analyze_setup, batch_id, ai_config_id, system_prompt_id)
-    if setup is None:
-        return
+        # 3. KI-Konfiguration + Systemprompt + Dokument-IDs auflösen (im Thread)
+        setup = await asyncio.to_thread(_db_get_analyze_setup, batch_id, ai_config_id, system_prompt_id)
+        if setup is None:
+            return
 
-    doc_ids: list[int] = setup["doc_ids"]
-    if not doc_ids:
-        logger.info("Batch #%d: Keine Dokumente für KI-Analyse", batch_id)
-        return
+        doc_ids: list[int] = setup["doc_ids"]
+        if not doc_ids:
+            logger.info("Batch #%d: Keine Dokumente für KI-Analyse", batch_id)
+            return
 
-    # 4. Dokumente auf "processing" setzen (im Thread)
-    await asyncio.to_thread(_db_set_processing, doc_ids)
+        # 4. Dokumente auf "processing" setzen (im Thread)
+        await asyncio.to_thread(_db_set_processing, doc_ids)
 
-    logger.info("Batch #%d: KI-Analyse für %d Dokument(e) gestartet", batch_id, len(doc_ids))
-    await _run_analysis(doc_ids, setup["ai_config_id"], setup["system_prompt_text"])
+        logger.info("Batch #%d: KI-Analyse für %d Dokument(e) gestartet", batch_id, len(doc_ids))
+        await _run_analysis(doc_ids, setup["ai_config_id"], setup["system_prompt_text"])
+
+    except Exception as exc:
+        logger.error(
+            "Batch #%d: Fehler in _import_then_analyze: %s", batch_id, exc, exc_info=True
+        )
 
 
 @router.get("", response_model=list[ImportBatchRead])
@@ -268,6 +301,34 @@ def get_import_status(batch_id: int, db: Session = Depends(get_db)):
     if obj is None:
         raise HTTPException(status_code=404, detail="Import-Batch nicht gefunden")
     return obj
+
+
+@router.get("/{batch_id}/ki-stats")
+def get_batch_ki_stats(batch_id: int, db: Session = Depends(get_db)):
+    """
+    Aggregierte KI-Statistiken für alle Dokumente eines Import-Batches.
+    Gibt die Summe von Input-Tokens, Output-Tokens und Gesamtdauer zurück.
+    """
+    from sqlalchemy import func as sqlfunc
+    from app.models.invoice_extraction import InvoiceExtraction as _Ext
+    from app.models.document import Document as _Doc
+
+    row = (
+        db.query(
+            sqlfunc.sum(_Ext.ki_input_tokens).label("total_input_tokens"),
+            sqlfunc.sum(_Ext.ki_output_tokens).label("total_output_tokens"),
+            sqlfunc.sum(_Ext.ki_total_duration).label("total_duration_seconds"),
+        )
+        .join(_Doc, _Ext.document_id == _Doc.id)
+        .filter(_Doc.batch_id == batch_id)
+        .first()
+    )
+
+    return {
+        "total_input_tokens": int(row.total_input_tokens or 0),
+        "total_output_tokens": int(row.total_output_tokens or 0),
+        "total_duration_seconds": float(row.total_duration_seconds or 0.0),
+    }
 
 
 @router.get("/{batch_id}", response_model=ImportBatchWithDocuments)

@@ -60,6 +60,25 @@ export default function AISettingsPage() {
     }
   }
 
+  /** Konfiguration duplizieren */
+  async function handleCopy(config: AIConfig) {
+    try {
+      await aiConfigsApi.create({
+        name: `Kopie von ${config.name}`,
+        api_url: config.api_url,
+        api_key: config.api_key ?? undefined,
+        model_name: config.model_name,
+        max_tokens: config.max_tokens,
+        temperature: config.temperature,
+        reasoning: config.reasoning,
+        endpoint_type: config.endpoint_type,
+      });
+      await load();
+    } catch (err) {
+      alert(extractApiError(err, "Fehler beim Kopieren der Konfiguration"));
+    }
+  }
+
   return (
     <div className="space-y-6">
       <div className="flex items-center justify-between">
@@ -139,6 +158,12 @@ export default function AISettingsPage() {
                 className="rounded px-2 py-1 text-xs text-gray-600 hover:bg-gray-100"
               >
                 Bearbeiten
+              </button>
+              <button
+                onClick={() => handleCopy(config)}
+                className="rounded px-2 py-1 text-xs text-gray-600 hover:bg-gray-100"
+              >
+                Kopieren
               </button>
               <button
                 onClick={() => handleDelete(config)}

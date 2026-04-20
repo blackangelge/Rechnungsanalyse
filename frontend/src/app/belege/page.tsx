@@ -1,6 +1,7 @@
 "use client";
 
 import React, { useCallback, useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import {
   AIConfig,
   AnalyzeRequest,
@@ -17,6 +18,15 @@ import {
 } from "@/lib/api";
 
 // ─── Hilfsfunktionen ────────────────────────────────────────────────────────
+
+/** Formatiert KI-Laufzeit in Sekunden als lesbare Zeichenfolge */
+function formatKiDuration(seconds: number | null | undefined): string {
+  if (seconds == null || seconds <= 0) return "–";
+  if (seconds < 60) return `${seconds.toFixed(1).replace(".", ",")} s`;
+  const m = Math.floor(seconds / 60);
+  const s = Math.round(seconds % 60);
+  return `${m}:${String(s).padStart(2, "0")} min`;
+}
 
 function formatCurrency(amount: number | null | undefined): string {
   if (amount == null) return "–";
@@ -43,11 +53,9 @@ function StatusBadge({ status }: { status: string }) {
   );
 }
 
-function KiBadge({ status }: { status: string }) {
-  if (status === "done") return <span className="text-xs font-medium text-green-700">✓ Ja</span>;
-  if (status === "processing") return <span className="text-xs font-medium text-blue-600">⟳ Läuft</span>;
-  if (status === "error") return <span className="text-xs font-medium text-red-600">✗ Fehler</span>;
-  return <span className="text-xs text-gray-400">–</span>;
+function KiBadge({ hasExtraction }: { hasExtraction: boolean }) {
+  if (hasExtraction) return <span className="text-xs font-medium text-green-700">Ja</span>;
+  return <span className="text-xs text-gray-400">Nein</span>;
 }
 
 // ─── Batch-Multiselect ───────────────────────────────────────────────────────
@@ -129,6 +137,9 @@ export default function BelegePage() {
   const [filterPageMax, setFilterPageMax] = useState("");
   const [selectedBatchIds, setSelectedBatchIds] = useState<Set<number>>(new Set());
   const [includeDeleted, setIncludeDeleted] = useState(false);
+  const [filterKi, setFilterKi] = useState<"" | "ja" | "nein">("");
+  const [filterSupplierName, setFilterSupplierName] = useState("");
+  const [filterDocId, setFilterDocId] = useState("");
   const [activeFilters, setActiveFilters] = useState<DocumentFilter>({});
 
   // Daten
@@ -154,6 +165,11 @@ export default function BelegePage() {
   // Infos-Inline-Ansicht (ersetzt Tabelle)
   const [infosDocId, setInfosDocId] = useState<number | null>(null);
   const infosContainerRef = useRef<HTMLDivElement>(null);
+  // Ref auf den Tabellen-/Vorschau-Container
+  const tableContainerRef = useRef<HTMLDivElement>(null);
+  // Aktuelle Y-Position der Tabellen-Oberkante relativ zum Viewport (für PDF-Panel-Top)
+  const [tableTop, setTableTop] = useState(300);
+  const NAV_HEIGHT = 60; // Höhe der Navigationsleiste in px
 
   // Analyse-Optionen
   const [aiConfigs, setAiConfigs] = useState<AIConfig[]>([]);
@@ -216,6 +232,26 @@ export default function BelegePage() {
     return () => { if (refreshTimerRef.current) { clearInterval(refreshTimerRef.current); refreshTimerRef.current = null; } };
   }, [documents, activeFilters, loadDocuments]);
 
+  // Scroll- und Resize-Listener: verfolgt die Y-Position der Tabellen-Oberkante
+  // PDF-Panel top = max(NAV_HEIGHT, tableTop) → startet an der Tabelle, rastet oben ein
+  useEffect(() => {
+    if (previewDocId === null) return;
+
+    function check() {
+      if (!tableContainerRef.current) return;
+      const rect = tableContainerRef.current.getBoundingClientRect();
+      setTableTop(rect.top);
+    }
+
+    check(); // Sofort beim Öffnen messen
+    window.addEventListener("scroll", check, { passive: true });
+    window.addEventListener("resize", check, { passive: true });
+    return () => {
+      window.removeEventListener("scroll", check);
+      window.removeEventListener("resize", check);
+    };
+  }, [previewDocId]);
+
   // ─── Filter-Logik ─────────────────────────────────────────────────────────
 
   function buildFilters(): DocumentFilter {
@@ -229,6 +265,10 @@ export default function BelegePage() {
     if (filterPageMax) f.page_max = parseInt(filterPageMax, 10);
     if (selectedBatchIds.size > 0) f.batch_ids = Array.from(selectedBatchIds);
     if (includeDeleted) f.include_deleted = true;
+    if (filterKi === "ja") f.has_extraction = true;
+    if (filterKi === "nein") f.has_extraction = false;
+    if (filterSupplierName.trim()) f.supplier_name = filterSupplierName.trim();
+    if (filterDocId.trim()) f.doc_id = parseInt(filterDocId.trim(), 10);
     return f;
   }
 
@@ -244,6 +284,7 @@ export default function BelegePage() {
     setFilterCompany(""); setFilterYear(""); setFilterStatus("");
     setFilterTotalMin(""); setFilterTotalMax(""); setFilterPageMin(""); setFilterPageMax("");
     setSelectedBatchIds(new Set()); setIncludeDeleted(false);
+    setFilterKi(""); setFilterSupplierName(""); setFilterDocId("");
     const f: DocumentFilter = {};
     setActiveFilters(f);
     setSelectedIds(new Set());
@@ -356,11 +397,16 @@ export default function BelegePage() {
   const allSelected = activeDocs.length > 0 && selectedIds.size === activeDocs.length;
   const someSelected = selectedIds.size > 0 && selectedIds.size < activeDocs.length;
   const availableYears = Array.from(new Set(documents.map((d) => d.year))).sort((a, b) => b - a);
+  const availableSuppliers = Array.from(
+    new Set(documents.map((d) => d.supplier_name).filter((s): s is string => !!s))
+  ).sort((a, b) => a.localeCompare(b, "de"));
   const infosIdx = infosDocId !== null ? documents.findIndex((d) => d.id === infosDocId) : -1;
 
   // ─── Render ───────────────────────────────────────────────────────────────
 
   const showPreview = previewDocId !== null;
+  // Top-Position für das PDF-Panel: startet an der Tabellen-Oberkante, rastet am Nav ein
+  const pdfPanelTop = showPreview ? Math.max(NAV_HEIGHT, tableTop) + 25 : NAV_HEIGHT;
   const previewDoc = showPreview ? documents.find((d) => d.id === previewDocId) : null;
 
   return (
@@ -408,6 +454,31 @@ export default function BelegePage() {
                 <option value="done">Fertig</option>
                 <option value="error">Fehler</option>
               </select>
+            </div>
+            <div className="flex flex-col gap-1">
+              <label className="text-xs font-medium text-gray-600">KI</label>
+              <select value={filterKi} onChange={(e) => setFilterKi(e.target.value as "" | "ja" | "nein")}
+                className="rounded border border-gray-300 px-3 py-1.5 text-sm focus:border-blue-500 focus:outline-none w-28">
+                <option value="">Alle</option>
+                <option value="ja">Ja</option>
+                <option value="nein">Nein</option>
+              </select>
+            </div>
+            <div className="flex flex-col gap-1">
+              <label className="text-xs font-medium text-gray-600">Lieferant</label>
+              <select value={filterSupplierName} onChange={(e) => setFilterSupplierName(e.target.value)}
+                className="rounded border border-gray-300 px-3 py-1.5 text-sm focus:border-blue-500 focus:outline-none w-48">
+                <option value="">Alle Lieferanten</option>
+                {availableSuppliers.map((s) => (
+                  <option key={s} value={s}>{s}</option>
+                ))}
+              </select>
+            </div>
+            <div className="flex flex-col gap-1">
+              <label className="text-xs font-medium text-gray-600">Beleg-ID</label>
+              <input type="number" value={filterDocId} onChange={(e) => setFilterDocId(e.target.value)}
+                placeholder="z.B. 42" min="1"
+                className="rounded border border-gray-300 px-3 py-1.5 text-sm focus:border-blue-500 focus:outline-none w-28" />
             </div>
             <div className="flex flex-col gap-1">
               <label className="text-xs font-medium text-gray-600">Betrag von (€)</label>
@@ -490,7 +561,7 @@ export default function BelegePage() {
       </div>{/* Ende Kopfbereich */}
 
       {/* ── Tabelle / Infos-Ansicht: volle Bildschirmbreite ─────────── */}
-      <div className="relative left-1/2 w-screen -translate-x-1/2 px-6 mt-4">
+      <div ref={tableContainerRef} className="relative left-1/2 w-screen -translate-x-1/2 px-6 mt-4">
 
         {viewMode === "infos" ? (
           /* ── Inline Infos-Ansicht (ersetzt Tabelle) ── */
@@ -570,11 +641,8 @@ export default function BelegePage() {
           {loading ? "Lade..." : `${documents.length} Beleg${documents.length !== 1 ? "e" : ""} gefunden`}
         </div>
 
-        {/* Split-View: Tabelle links, PDF rechts */}
-        <div className={showPreview ? "flex gap-4" : ""}>
-
-          {/* Tabelle */}
-          <div className={`overflow-x-auto rounded-lg border bg-white shadow-sm ${showPreview ? "w-1/2 shrink-0" : "w-full"}`}>
+        {/* Tabelle — bei geöffneter Vorschau auf halbe Breite beschränkt */}
+        <div className={`overflow-x-auto rounded-lg border bg-white shadow-sm ${showPreview ? "w-1/2" : "w-full"}`}>
             <table className="min-w-full divide-y divide-gray-200 text-sm">
               <thead className="bg-gray-50">
                 <tr>
@@ -592,6 +660,7 @@ export default function BelegePage() {
                   <th className="px-3 py-3 text-right font-medium text-gray-600">Betrag</th>
                   <th className="px-3 py-3 text-left font-medium text-gray-600">Status</th>
                   <th className="px-3 py-3 text-left font-medium text-gray-600">KI</th>
+                  <th className="px-3 py-3 text-right font-medium text-gray-600">KI-Zeit</th>
                   {!showPreview && (
                     <>
                       <th className="px-3 py-3 text-left font-medium text-gray-600">Rechnungsnr.</th>
@@ -654,7 +723,10 @@ export default function BelegePage() {
                         {formatCurrency(doc.total_amount)}
                       </td>
                       <td className="px-3 py-2.5"><StatusBadge status={doc.status} /></td>
-                      <td className="px-3 py-2.5"><KiBadge status={doc.status} /></td>
+                      <td className="px-3 py-2.5"><KiBadge hasExtraction={doc.has_extraction ?? false} /></td>
+                      <td className="px-3 py-2.5 text-right tabular-nums text-xs text-gray-500">
+                        {formatKiDuration(doc.ki_total_duration)}
+                      </td>
 
                       {/* Rechnungsnr. + Lieferant nur ohne Preview */}
                       {!showPreview && (
@@ -738,30 +810,35 @@ export default function BelegePage() {
             </table>
           </div>
 
-          {/* PDF-Vorschau rechts (50%) */}
-          {showPreview && (
-            <div className="flex w-1/2 shrink-0 flex-col rounded-lg border bg-white shadow-sm">
-              <div className="flex items-center justify-between border-b px-4 py-2">
-                <div className="flex items-center gap-2 min-w-0">
-                  <span className="text-sm font-medium text-gray-800 truncate">
-                    {previewDoc?.original_filename ?? `Dokument #${previewDocId}`}
-                  </span>
-                  <span className="shrink-0 text-xs text-gray-400">#{previewDocId}</span>
-                </div>
-                <button onClick={() => setPreviewDocId(null)}
-                  className="ml-3 shrink-0 text-sm text-gray-400 hover:text-gray-700">
-                  ✕
-                </button>
+        {/* PDF-Vorschau — fixed rechts via Portal (umgeht transform-Einschränkung des Containers).
+             top startet an der Tabellen-Oberkante und rastet beim Scrollen am Nav ein. */}
+        {showPreview && createPortal(
+          <div className="fixed right-0 bottom-0 z-40 flex w-1/2 flex-col border-l border-gray-200 bg-white shadow-2xl"
+               style={{ top: `${pdfPanelTop}px` }}>
+            {/* Header */}
+            <div className="flex shrink-0 items-center justify-between border-b bg-white px-4 py-2">
+              <div className="flex min-w-0 items-center gap-2">
+                <span className="truncate text-sm font-medium text-gray-800">
+                  {previewDoc?.original_filename ?? `Dokument #${previewDocId}`}
+                </span>
+                <span className="shrink-0 text-xs text-gray-400">#{previewDocId}</span>
               </div>
-              <iframe
-                src={documentsApi.previewUrl(previewDocId!)}
-                className="h-[calc(100vh-16rem)] min-h-[400px] w-full rounded-b-lg"
-                title={`PDF-Vorschau #${previewDocId}`}
-              />
+              <button
+                onClick={() => setPreviewDocId(null)}
+                className="ml-3 shrink-0 text-sm text-gray-400 hover:text-gray-700"
+              >
+                ✕
+              </button>
             </div>
-          )}
-
-        </div>{/* Ende Split-View */}
+            {/* PDF iframe — füllt den Rest der Höhe, Browser-native Scroll */}
+            <iframe
+              src={documentsApi.previewUrl(previewDocId!)}
+              className="w-full flex-1"
+              title={`PDF-Vorschau #${previewDocId}`}
+            />
+          </div>,
+          document.body
+        )}
         </>
         )}{/* Ende Tabelle/Infos-Conditional */}
       </div>{/* Ende volle Breite */}
@@ -792,7 +869,12 @@ export default function BelegePage() {
                 </div>
               )}
               {!viewLoading && viewedDoc && (
-                <KiRawView rawResponse={viewedDoc.extraction?.raw_response ?? null} />
+                <KiRawView
+                  rawResponse={viewedDoc.extraction?.raw_response ?? null}
+                  kiInputTokens={viewedDoc.extraction?.ki_input_tokens}
+                  kiOutputTokens={viewedDoc.extraction?.ki_output_tokens}
+                  kiTotalDuration={viewedDoc.extraction?.ki_total_duration}
+                />
               )}
               {!viewLoading && !viewedDoc && (
                 <p className="text-sm text-red-500">Dokument konnte nicht geladen werden.</p>
@@ -807,22 +889,52 @@ export default function BelegePage() {
 
 // ─── KI-Rohantwort-Ansicht ────────────────────────────────────────────────────
 
-function KiRawView({ rawResponse }: { rawResponse: string | null }) {
-  if (!rawResponse) {
-    return <p className="text-sm text-gray-400">Keine KI-Antwort gespeichert.</p>;
-  }
+function KiRawView({
+  rawResponse,
+  kiInputTokens,
+  kiOutputTokens,
+  kiTotalDuration,
+}: {
+  rawResponse: string | null;
+  kiInputTokens?: number | null;
+  kiOutputTokens?: number | null;
+  kiTotalDuration?: number | null;
+}) {
+  const hasStats = kiInputTokens != null || kiOutputTokens != null || kiTotalDuration != null;
 
-  let formatted = rawResponse;
-  try {
-    formatted = JSON.stringify(JSON.parse(rawResponse), null, 2);
-  } catch {
-    // Kein gültiges JSON → Rohantwort anzeigen
+  const statsLines = [
+    `Zeit          ${formatKiDuration(kiTotalDuration)}`,
+    `Input Token   ${kiInputTokens != null ? kiInputTokens.toLocaleString("de-DE") : "–"}`,
+    `Output Token  ${kiOutputTokens != null ? kiOutputTokens.toLocaleString("de-DE") : "–"}`,
+  ].join("\n");
+
+  let formatted = rawResponse ?? "";
+  if (rawResponse) {
+    try {
+      formatted = JSON.stringify(JSON.parse(rawResponse), null, 2);
+    } catch {
+      // Kein gültiges JSON → Rohantwort anzeigen
+    }
   }
 
   return (
-    <pre className="overflow-x-auto rounded-lg bg-gray-950 p-4 text-xs leading-relaxed text-green-300 whitespace-pre-wrap break-words">
-      {formatted}
-    </pre>
+    <div className="space-y-3">
+      {/* KI-Statistiken */}
+      {hasStats && (
+        <pre className="overflow-x-auto rounded-lg bg-slate-800 p-4 text-xs leading-relaxed text-cyan-300 whitespace-pre font-mono">
+          {statsLines}
+        </pre>
+      )}
+
+      {/* Rohantwort */}
+      {rawResponse ? (
+        <pre className="overflow-x-auto rounded-lg bg-gray-950 p-4 text-xs leading-relaxed text-green-300 whitespace-pre-wrap break-words">
+          {formatted}
+        </pre>
+      ) : (
+        <p className="text-sm text-gray-400">Keine KI-Antwort gespeichert.</p>
+      )}
+    </div>
   );
 }
 

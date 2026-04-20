@@ -36,6 +36,10 @@ class DocumentListRead(DocumentRead):
     total_amount: float | None = None
     invoice_number: str | None = None
     supplier_name: str | None = None
+    has_extraction: bool = False
+    ki_input_tokens: int | None = None
+    ki_output_tokens: int | None = None
+    ki_total_duration: float | None = None
 
     model_config = ConfigDict(from_attributes=True)
 

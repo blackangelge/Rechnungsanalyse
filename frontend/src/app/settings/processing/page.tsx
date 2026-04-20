@@ -6,7 +6,6 @@ import { ProcessingSettings, processingSettingsApi, backupApi, extractApiError }
 export default function ProcessingSettingsPage() {
   const [settings, setSettings] = useState<ProcessingSettings | null>(null);
   const [importConcurrency, setImportConcurrency] = useState(10);
-  const [aiConcurrency, setAiConcurrency] = useState(4);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [successMsg, setSuccessMsg] = useState<string | null>(null);
@@ -66,7 +65,6 @@ export default function ProcessingSettingsPage() {
         const data = await processingSettingsApi.get();
         setSettings(data);
         setImportConcurrency(data.import_concurrency);
-        setAiConcurrency(data.ai_concurrency);
       } catch {
         // Standardwerte behalten, Seite bleibt nutzbar
       } finally {
@@ -83,7 +81,7 @@ export default function ProcessingSettingsPage() {
     try {
       const updated = await processingSettingsApi.update({
         import_concurrency: importConcurrency,
-        ai_concurrency: aiConcurrency,
+        ai_concurrency: settings?.ai_concurrency ?? 1,  // Wert beibehalten (KI-Analyse ist sequenziell)
       });
       setSettings(updated);
       setSuccessMsg("Einstellungen gespeichert.");
@@ -177,76 +175,11 @@ export default function ProcessingSettingsPage() {
             </div>
           </div>
 
-          {/* ── KI-Analyse ─────────────────────────────────────────────────── */}
-          <div className="rounded-lg border bg-white p-6 shadow-sm">
-            <h2 className="mb-1 text-base font-semibold text-gray-800">KI-Analyse</h2>
-            <p className="mb-5 text-sm text-gray-500">
-              Maximale Anzahl gleichzeitiger KI-Anfragen. Bei lokalen Modellen
-              (LM Studio, Ollama) wird 1–2 empfohlen, da diese meist nur einen
-              Request gleichzeitig verarbeiten können.
-            </p>
-
-            <div className="flex items-end gap-6">
-              <div className="flex flex-col gap-1.5">
-                <label className="text-sm font-medium text-gray-700">
-                  Parallele KI-Aufrufe
-                </label>
-                <div className="flex items-center gap-3">
-                  <input
-                    type="range"
-                    min={1}
-                    max={16}
-                    value={aiConcurrency}
-                    onChange={(e) => setAiConcurrency(Number(e.target.value))}
-                    className="w-56 accent-blue-600"
-                  />
-                  <input
-                    type="number"
-                    min={1}
-                    max={16}
-                    value={aiConcurrency}
-                    onChange={(e) =>
-                      setAiConcurrency(
-                        Math.max(1, Math.min(16, Number(e.target.value)))
-                      )
-                    }
-                    className="w-20 rounded border border-gray-300 px-3 py-1.5 text-center text-sm font-semibold focus:border-blue-500 focus:outline-none"
-                  />
-                  <span className="text-sm text-gray-500">von max. 16</span>
-                </div>
-              </div>
-            </div>
-
-            {/* Hinweis-Badges */}
-            <div className="mt-4 flex gap-2 flex-wrap">
-              {aiConcurrency === 1 && (
-                <span className="inline-flex items-center rounded-full bg-blue-100 px-3 py-1 text-xs font-medium text-blue-800">
-                  Sequenziell — ideal für lokale Modelle
-                </span>
-              )}
-              {aiConcurrency >= 2 && aiConcurrency <= 4 && (
-                <span className="inline-flex items-center rounded-full bg-green-100 px-3 py-1 text-xs font-medium text-green-800">
-                  ✓ Empfohlen
-                </span>
-              )}
-              {aiConcurrency > 4 && aiConcurrency <= 8 && (
-                <span className="inline-flex items-center rounded-full bg-yellow-100 px-3 py-1 text-xs font-medium text-yellow-800">
-                  Hoch — nur für externe APIs geeignet
-                </span>
-              )}
-              {aiConcurrency > 8 && (
-                <span className="inline-flex items-center rounded-full bg-red-100 px-3 py-1 text-xs font-medium text-red-800">
-                  Sehr hoch — Ratelimits möglich
-                </span>
-              )}
-            </div>
-          </div>
-
           {/* ── Aktuelle Werte (Info) ───────────────────────────────────────── */}
           {settings && (
             <div className="rounded-lg border border-gray-200 bg-gray-50 px-5 py-3 text-sm text-gray-600">
-              <span className="font-medium">Gespeicherte Werte: </span>
-              Import {settings.import_concurrency}× parallel · KI {settings.ai_concurrency}× parallel
+              <span className="font-medium">Gespeicherter Wert: </span>
+              Import {settings.import_concurrency}× parallel
             </div>
           )}
 
@@ -261,13 +194,10 @@ export default function ProcessingSettingsPage() {
             </button>
             <button
               type="button"
-              onClick={() => {
-                setImportConcurrency(10);
-                setAiConcurrency(4);
-              }}
+              onClick={() => setImportConcurrency(10)}
               className="rounded border border-gray-300 px-4 py-2 text-sm font-medium text-gray-600 hover:bg-gray-100 transition-colors"
             >
-              Auf Standard zurücksetzen (10 / 4)
+              Auf Standard zurücksetzen (10)
             </button>
           </div>
         </form>
