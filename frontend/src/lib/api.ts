@@ -172,6 +172,12 @@ export interface ImportBatchCreate {
   delete_source_files?: boolean;
 }
 
+export interface BatchKiStats {
+  total_input_tokens: number;
+  total_output_tokens: number;
+  total_duration_seconds: number;
+}
+
 export const importsApi = {
   /** Alle Batches laden (optional gefiltert) */
   list: (params?: { company_name?: string; year?: number }) =>
@@ -193,6 +199,10 @@ export const importsApi = {
    */
   getStatus: (id: number) =>
     apiClient.get<ImportBatch>(`/api/imports/${id}/status`).then((r) => r.data),
+
+  /** Aggregierte KI-Statistiken (Token-Summen + Gesamtdauer) für einen Import-Batch */
+  kiStats: (id: number) =>
+    apiClient.get<BatchKiStats>(`/api/imports/${id}/ki-stats`).then((r) => r.data),
 
   /** Import-Batch löschen */
   delete: (id: number) => apiClient.delete(`/api/imports/${id}`),
@@ -218,6 +228,12 @@ export interface DocumentItem {
   total_amount?: number | null;
   invoice_number?: string | null;
   supplier_name?: string | null;
+  /** True wenn eine KI-Extraktion für dieses Dokument existiert */
+  has_extraction?: boolean;
+  /** KI-Laufzeitstatistiken (direkt aus der Extraktion) */
+  ki_input_tokens?: number | null;
+  ki_output_tokens?: number | null;
+  ki_total_duration?: number | null;
 }
 
 export interface OrderPosition {
@@ -253,6 +269,10 @@ export interface InvoiceExtraction {
   cash_discount_amount: number | null;
   payment_terms: string | null;
   raw_response: string | null;
+  // KI-Statistiken
+  ki_input_tokens?: number | null;
+  ki_output_tokens?: number | null;
+  ki_total_duration?: number | null;
   created_at: string;
   updated_at: string;
 }
@@ -272,6 +292,9 @@ export interface DocumentFilter {
   page_max?: number;
   batch_ids?: number[];
   include_deleted?: boolean;
+  has_extraction?: boolean;
+  supplier_name?: string;
+  doc_id?: number;
 }
 
 export interface AnalyzeRequest {

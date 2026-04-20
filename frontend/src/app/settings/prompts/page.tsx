@@ -91,6 +91,19 @@ export default function SystemPromptsPage() {
     }
   }
 
+  async function copyPrompt(p: SystemPrompt) {
+    try {
+      await systemPromptsApi.create({
+        name: `Kopie von ${p.name}`,
+        content: p.content,
+        is_default: false,
+      });
+      await load();
+    } catch {
+      alert("Fehler beim Kopieren");
+    }
+  }
+
   return (
     <div className="max-w-3xl space-y-6">
       <div className="flex items-center justify-between">
@@ -201,6 +214,13 @@ export default function SystemPromptsPage() {
                     className="rounded px-2 py-1 text-xs text-blue-600 hover:bg-blue-50 disabled:opacity-40"
                   >
                     Bearbeiten
+                  </button>
+                  <button
+                    onClick={() => copyPrompt(p)}
+                    disabled={editingId !== null}
+                    className="rounded px-2 py-1 text-xs text-gray-600 hover:bg-gray-100 disabled:opacity-40"
+                  >
+                    Kopieren
                   </button>
                   <button
                     onClick={() => remove(p.id)}

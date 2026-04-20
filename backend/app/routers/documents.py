@@ -85,11 +85,16 @@ def list_documents(
     page_max: Optional[int] = None,
     batch_ids: Optional[list[int]] = Query(default=None),
     include_deleted: bool = False,
+    has_extraction: Optional[bool] = None,
+    supplier_name: Optional[str] = None,
+    doc_id: Optional[int] = None,
     db: Session = Depends(get_db),
 ):
     """
     Gibt alle Dokumente zurück, optional gefiltert.
     include_deleted=true zeigt auch soft-gelöschte Dokumente an.
+    has_extraction=true/false filtert nach KI-analysierten Dokumenten.
+    supplier_name filtert nach Lieferantenname (case-insensitive LIKE).
     """
     return crud.document.get_all_filtered(
         db,
@@ -102,6 +107,9 @@ def list_documents(
         page_max=page_max,
         batch_ids=batch_ids,
         include_deleted=include_deleted,
+        has_extraction=has_extraction,
+        supplier_name_filter=supplier_name,
+        doc_id=doc_id,
     )
 
 

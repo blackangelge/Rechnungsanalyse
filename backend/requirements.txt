@@ -26,6 +26,6 @@ aiofiles==24.1.0
 
 # PDF-Verarbeitung
 pypdf==4.3.1       # Seitenanzahl auslesen
-pymupdf==1.27.2.2  # PDF-Seiten in Bilder umwandeln (kein Poppler nötig)
+pypdfium2==4.30.0  # PDF-Seiten in Bilder umwandeln (kein Poppler nötig)
 Pillow==10.4.0     # Bildbearbeitung / Base64-Kodierung für KI-API
 openpyxl==3.1.5    # Excel-Export

@@ -14,7 +14,7 @@
 "use client";
 
 import { useEffect } from "react";
-import { ProgressEvent } from "@/lib/api";
+import { BatchKiStats, ProgressEvent } from "@/lib/api";
 import { useSSE } from "@/lib/sse";
 
 interface Props {
@@ -22,6 +22,8 @@ interface Props {
   initialStatus: string;
   initialTotal?: number;
   initialProcessed?: number;
+  /** Aggregierte KI-Statistiken für diesen Import-Batch */
+  kiStats?: BatchKiStats | null;
   /** Wird aufgerufen, wenn der Import abgeschlossen ist (done oder error). */
   onDone?: () => void;
 }
@@ -44,6 +46,7 @@ export default function ProgressPanel({
   initialStatus,
   initialTotal = 0,
   initialProcessed = 0,
+  kiStats,
   onDone,
 }: Props) {
   // SSE nur aktiv, wenn Import läuft oder noch nicht begonnen hat
@@ -117,25 +120,31 @@ export default function ProgressPanel({
         </div>
       </div>
 
-      {/* Statistiken */}
+      {/* KI-Token-Statistiken */}
       <div className="grid grid-cols-3 gap-3 text-center">
         <div className="rounded bg-gray-50 p-3">
           <p className="text-xl font-bold tabular-nums text-gray-800">
-            {processed.toLocaleString("de-DE")}
+            {kiStats && kiStats.total_input_tokens > 0
+              ? kiStats.total_input_tokens.toLocaleString("de-DE")
+              : "–"}
           </p>
-          <p className="text-xs text-gray-500">Verarbeitet</p>
+          <p className="text-xs text-gray-500">Input Token</p>
         </div>
         <div className="rounded bg-gray-50 p-3">
           <p className="text-xl font-bold tabular-nums text-gray-800">
-            {formatDuration(elapsed)}
+            {kiStats && kiStats.total_output_tokens > 0
+              ? kiStats.total_output_tokens.toLocaleString("de-DE")
+              : "–"}
           </p>
-          <p className="text-xs text-gray-500">Verstrichene Zeit</p>
+          <p className="text-xs text-gray-500">Output Token</p>
         </div>
         <div className="rounded bg-gray-50 p-3">
           <p className="text-xl font-bold tabular-nums text-gray-800">
-            {speed > 0 ? speed.toFixed(1) : "–"}
+            {kiStats && kiStats.total_duration_seconds > 0
+              ? formatDuration(Math.round(kiStats.total_duration_seconds))
+              : "–"}
           </p>
-          <p className="text-xs text-gray-500">Dok./Minute</p>
+          <p className="text-xs text-gray-500">KI-Zeit</p>
         </div>
       </div>
 

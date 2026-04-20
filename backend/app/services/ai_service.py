@@ -17,6 +17,7 @@ Wirft nie eine Exception — gibt bei Fehlern leeres Dict zurück.
 import json
 import logging
 import re
+import time
 from typing import Any
 
 import httpx
@@ -198,8 +199,10 @@ def extract_invoice_data(
         serialized_body = json.dumps(request_body).encode("utf-8")
         request_body.clear()  # Bilddaten sofort freigeben
 
+        _t_start = time.monotonic()
         with httpx.Client(timeout=REQUEST_TIMEOUT_SECONDS) as client:
             response = client.post(endpoint, content=serialized_body, headers=headers)
+        _total_duration = time.monotonic() - _t_start
         del serialized_body
 
         status_code = response.status_code
@@ -235,6 +238,7 @@ def extract_invoice_data(
                     "reasoning_tokens":    s.get("reasoning_output_tokens"),
                     "tokens_per_second":   s.get("tokens_per_second"),
                     "time_to_first_token": s.get("time_to_first_token_seconds"),
+                    "total_duration":      _total_duration,
                 }
                 logger.info(
                     "LM Studio Stats: %s In, %s Out, %s Reasoning, %.1f tok/s",
@@ -255,6 +259,7 @@ def extract_invoice_data(
                     "reasoning_tokens":    details.get("reasoning_tokens"),
                     "tokens_per_second":   None,
                     "time_to_first_token": None,
+                    "total_duration":      _total_duration,
                 }
         except Exception as parse_exc:
             raw_text = f"Antwort-Parse-Fehler: {parse_exc}"
