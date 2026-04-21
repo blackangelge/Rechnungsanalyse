@@ -8,12 +8,14 @@ class SystemPromptCreate(BaseModel):
     name: str
     content: str
     is_default: bool = False
+    is_document_type_prompt: bool = False
 
 
 class SystemPromptUpdate(BaseModel):
     name: str
     content: str
     is_default: bool = False
+    is_document_type_prompt: bool = False
 
 
 class SystemPromptRead(BaseModel):
@@ -21,6 +23,7 @@ class SystemPromptRead(BaseModel):
     name: str
     content: str
     is_default: bool
+    is_document_type_prompt: bool
     created_at: datetime
     updated_at: datetime
 

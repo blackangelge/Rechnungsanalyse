@@ -8,9 +8,11 @@ import {
   DocumentDetail,
   DocumentFilter,
   DocumentItem,
+  DocumentType,
   ImportBatch,
   SystemPrompt,
   aiConfigsApi,
+  documentTypesApi,
   documentsApi,
   extractApiError,
   importsApi,
@@ -124,6 +126,72 @@ function BatchMultiSelect({
   );
 }
 
+// ─── DocType-Multiselect ─────────────────────────────────────────────────────
+
+function DocTypeMultiSelect({
+  docTypes,
+  selectedIds,
+  onChange,
+}: {
+  docTypes: DocumentType[];
+  selectedIds: Set<number>;
+  onChange: (ids: Set<number>) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    function handle(e: MouseEvent) {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    }
+    document.addEventListener("mousedown", handle);
+    return () => document.removeEventListener("mousedown", handle);
+  }, []);
+
+  function toggle(id: number) {
+    const next = new Set(selectedIds);
+    next.has(id) ? next.delete(id) : next.add(id);
+    onChange(next);
+  }
+
+  const label =
+    selectedIds.size === 0
+      ? "Alle Typen"
+      : selectedIds.size === 1
+      ? (() => { const t = docTypes.find((t) => selectedIds.has(t.id)); return t ? t.name : "1 Typ"; })()
+      : `${selectedIds.size} Typen`;
+
+  return (
+    <div ref={ref} className="relative">
+      <button
+        type="button"
+        onClick={() => setOpen((o) => !o)}
+        className="flex min-w-48 items-center justify-between gap-2 rounded border border-gray-300 bg-white px-3 py-1.5 text-sm text-gray-700 focus:border-blue-500 focus:outline-none"
+      >
+        <span className="truncate">{label}</span>
+        <span className="text-gray-400">{open ? "▲" : "▼"}</span>
+      </button>
+      {open && (
+        <div className="absolute z-20 mt-1 max-h-72 min-w-56 overflow-y-auto rounded-lg border border-gray-200 bg-white shadow-lg">
+          <button type="button" onClick={() => onChange(new Set())}
+            className="w-full px-3 py-2 text-left text-xs font-medium text-blue-600 hover:bg-blue-50 border-b">
+            Alle Typen anzeigen
+          </button>
+          {docTypes.length === 0 && <p className="px-3 py-2 text-xs text-gray-400">Keine Typen vorhanden</p>}
+          {docTypes.map((t) => (
+            <label key={t.id} className="flex cursor-pointer items-center gap-2 px-3 py-2 text-sm hover:bg-gray-50">
+              <input type="checkbox" checked={selectedIds.has(t.id)} onChange={() => toggle(t.id)}
+                className="rounded border-gray-300 text-violet-600" />
+              <span className="flex-1 truncate">{t.name}</span>
+              <span className="text-xs text-gray-400">#{t.id}</span>
+            </label>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ─── Hauptkomponente ─────────────────────────────────────────────────────────
 
 export default function BelegePage() {
@@ -136,6 +204,7 @@ export default function BelegePage() {
   const [filterPageMin, setFilterPageMin] = useState("");
   const [filterPageMax, setFilterPageMax] = useState("");
   const [selectedBatchIds, setSelectedBatchIds] = useState<Set<number>>(new Set());
+  const [selectedDocTypeIds, setSelectedDocTypeIds] = useState<Set<number>>(new Set());
   const [includeDeleted, setIncludeDeleted] = useState(false);
   const [filterKi, setFilterKi] = useState<"" | "ja" | "nein">("");
   const [filterSupplierName, setFilterSupplierName] = useState("");
@@ -145,6 +214,7 @@ export default function BelegePage() {
   // Daten
   const [documents, setDocuments] = useState<DocumentItem[]>([]);
   const [batches, setBatches] = useState<ImportBatch[]>([]);
+  const [docTypes, setDocTypes] = useState<DocumentType[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [successMsg, setSuccessMsg] = useState<string | null>(null);
@@ -198,14 +268,16 @@ export default function BelegePage() {
 
   const loadOptions = useCallback(async () => {
     try {
-      const [configs, prompts, allBatches] = await Promise.all([
+      const [configs, prompts, allBatches, allDocTypes] = await Promise.all([
         aiConfigsApi.list(),
         systemPromptsApi.list(),
         importsApi.list(),
+        documentTypesApi.list(),
       ]);
       setAiConfigs(configs);
       setSystemPrompts(prompts);
       setBatches(allBatches);
+      setDocTypes(allDocTypes);
       const defaultConfig = configs.find((c) => c.is_default);
       if (defaultConfig) setSelectedAiConfigId(String(defaultConfig.id));
       const defaultPrompt = prompts.find((p) => p.is_default);
@@ -264,6 +336,7 @@ export default function BelegePage() {
     if (filterPageMin) f.page_min = parseInt(filterPageMin, 10);
     if (filterPageMax) f.page_max = parseInt(filterPageMax, 10);
     if (selectedBatchIds.size > 0) f.batch_ids = Array.from(selectedBatchIds);
+    if (selectedDocTypeIds.size > 0) f.document_type_ids = Array.from(selectedDocTypeIds);
     if (includeDeleted) f.include_deleted = true;
     if (filterKi === "ja") f.has_extraction = true;
     if (filterKi === "nein") f.has_extraction = false;
@@ -283,7 +356,7 @@ export default function BelegePage() {
   function resetFilters() {
     setFilterCompany(""); setFilterYear(""); setFilterStatus("");
     setFilterTotalMin(""); setFilterTotalMax(""); setFilterPageMin(""); setFilterPageMax("");
-    setSelectedBatchIds(new Set()); setIncludeDeleted(false);
+    setSelectedBatchIds(new Set()); setSelectedDocTypeIds(new Set()); setIncludeDeleted(false);
     setFilterKi(""); setFilterSupplierName(""); setFilterDocId("");
     const f: DocumentFilter = {};
     setActiveFilters(f);
@@ -429,6 +502,10 @@ export default function BelegePage() {
             <div className="flex flex-col gap-1">
               <label className="text-xs font-medium text-gray-600">Import</label>
               <BatchMultiSelect batches={batches} selectedIds={selectedBatchIds} onChange={setSelectedBatchIds} />
+            </div>
+            <div className="flex flex-col gap-1">
+              <label className="text-xs font-medium text-gray-600">Dokumententyp</label>
+              <DocTypeMultiSelect docTypes={docTypes} selectedIds={selectedDocTypeIds} onChange={setSelectedDocTypeIds} />
             </div>
             <div className="flex flex-col gap-1">
               <label className="text-xs font-medium text-gray-600">Firma</label>
@@ -663,6 +740,7 @@ export default function BelegePage() {
                   <th className="px-3 py-3 text-right font-medium text-gray-600">KI-Zeit</th>
                   {!showPreview && (
                     <>
+                      <th className="px-3 py-3 text-left font-medium text-gray-600">Dokumententyp</th>
                       <th className="px-3 py-3 text-left font-medium text-gray-600">Rechnungsnr.</th>
                       <th className="px-3 py-3 text-left font-medium text-gray-600">Lieferant</th>
                     </>
@@ -672,10 +750,10 @@ export default function BelegePage() {
               </thead>
               <tbody className="divide-y divide-gray-100">
                 {loading && documents.length === 0 && (
-                  <tr><td colSpan={12} className="px-4 py-8 text-center text-gray-400">Wird geladen...</td></tr>
+                  <tr><td colSpan={13} className="px-4 py-8 text-center text-gray-400">Wird geladen...</td></tr>
                 )}
                 {!loading && documents.length === 0 && (
-                  <tr><td colSpan={12} className="px-4 py-8 text-center text-gray-400">Keine Belege gefunden</td></tr>
+                  <tr><td colSpan={13} className="px-4 py-8 text-center text-gray-400">Keine Belege gefunden</td></tr>
                 )}
                 {documents.map((doc) => {
                   const isDeleted = !!doc.deleted_at;
@@ -728,9 +806,18 @@ export default function BelegePage() {
                         {formatKiDuration(doc.ki_total_duration)}
                       </td>
 
-                      {/* Rechnungsnr. + Lieferant nur ohne Preview */}
+                      {/* Dokumententyp + Rechnungsnr. + Lieferant nur ohne Preview */}
                       {!showPreview && (
                         <>
+                          <td className="px-3 py-2.5 text-gray-700 max-w-[140px]">
+                            {doc.document_type_name ? (
+                              <span className="inline-flex items-center rounded-full bg-violet-50 px-2 py-0.5 text-xs font-medium text-violet-700 whitespace-nowrap">
+                                {doc.document_type_name}
+                              </span>
+                            ) : (
+                              <span className="text-gray-400">–</span>
+                            )}
+                          </td>
                           <td className="px-3 py-2.5 text-gray-700">{doc.invoice_number ?? "–"}</td>
                           <td className="px-3 py-2.5 text-gray-700 max-w-[140px] truncate" title={doc.supplier_name ?? ""}>
                             {doc.supplier_name ?? "–"}
@@ -871,9 +958,9 @@ export default function BelegePage() {
               {!viewLoading && viewedDoc && (
                 <KiRawView
                   rawResponse={viewedDoc.extraction?.raw_response ?? null}
-                  kiInputTokens={viewedDoc.extraction?.ki_input_tokens}
-                  kiOutputTokens={viewedDoc.extraction?.ki_output_tokens}
-                  kiTotalDuration={viewedDoc.extraction?.ki_total_duration}
+                  kiInputTokens={viewedDoc.ki_input_tokens}
+                  kiOutputTokens={viewedDoc.ki_output_tokens}
+                  kiTotalDuration={viewedDoc.ki_total_duration}
                 />
               )}
               {!viewLoading && !viewedDoc && (

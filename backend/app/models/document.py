@@ -10,6 +10,8 @@ from datetime import datetime
 from sqlalchemy import BigInteger, DateTime, ForeignKey, Integer, String, Text, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
+from app.models.document_type import DocumentType  # noqa: F401
+
 from app.database import Base
 
 
@@ -67,9 +69,25 @@ class Document(Base):
         DateTime(timezone=True), nullable=True, default=None
     )
 
+    # Erkannter Dokumententyp (durch KI-Klassifikation, optional)
+    document_type_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("document_types.id", ondelete="SET NULL"), nullable=True
+    )
+
+    # KI-Stats direkt auf dem Dokument — befüllt für Nicht-Eingangsrechnungen,
+    # bei denen keine InvoiceExtraction angelegt wird.
+    doc_ki_input_tokens:  Mapped[int | None]   = mapped_column(Integer, nullable=True)
+    doc_ki_output_tokens: Mapped[int | None]   = mapped_column(Integer, nullable=True)
+    doc_ki_total_duration: Mapped[float | None] = mapped_column(nullable=True)
+
     # Beziehung zum übergeordneten Batch
     batch: Mapped["ImportBatch"] = relationship(  # noqa: F821
         "ImportBatch", back_populates="documents"
+    )
+
+    # Beziehung zum Dokumententyp (n:1, optional)
+    document_type: Mapped["DocumentType | None"] = relationship(
+        "DocumentType", foreign_keys=[document_type_id]
     )
 
     # Beziehung zur extrahierten Rechnungsdaten (1:1, optional)
@@ -106,12 +124,24 @@ class Document(Base):
 
     @property
     def ki_input_tokens(self) -> int | None:
-        return self.extraction.ki_input_tokens if self.extraction else None
+        # Extraktion hat Vorrang; Fallback auf die direkt gespeicherten Stats
+        # (befüllt für Nicht-Eingangsrechnungen ohne InvoiceExtraction)
+        if self.extraction and self.extraction.ki_input_tokens is not None:
+            return self.extraction.ki_input_tokens
+        return self.doc_ki_input_tokens
 
     @property
     def ki_output_tokens(self) -> int | None:
-        return self.extraction.ki_output_tokens if self.extraction else None
+        if self.extraction and self.extraction.ki_output_tokens is not None:
+            return self.extraction.ki_output_tokens
+        return self.doc_ki_output_tokens
 
     @property
     def ki_total_duration(self) -> float | None:
-        return self.extraction.ki_total_duration if self.extraction else None
+        if self.extraction and self.extraction.ki_total_duration is not None:
+            return self.extraction.ki_total_duration
+        return self.doc_ki_total_duration
+
+    @property
+    def document_type_name(self) -> str | None:
+        return self.document_type.name if self.document_type else None

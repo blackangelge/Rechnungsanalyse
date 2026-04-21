@@ -40,6 +40,8 @@ class DocumentListRead(DocumentRead):
     ki_input_tokens: int | None = None
     ki_output_tokens: int | None = None
     ki_total_duration: float | None = None
+    document_type_id: int | None = None
+    document_type_name: str | None = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -61,6 +63,15 @@ class DocumentDetail(DocumentRead):
 
     # Liste aller Bestellpositionen
     order_positions: list["OrderPositionRead"] = []
+
+    # Erkannter Dokumententyp
+    document_type_id: int | None = None
+    document_type_name: str | None = None
+
+    # KI-Statistiken (aus Extraktion oder direkt vom Dokument via Property)
+    ki_input_tokens: int | None = None
+    ki_output_tokens: int | None = None
+    ki_total_duration: float | None = None
 
     model_config = ConfigDict(from_attributes=True)
 

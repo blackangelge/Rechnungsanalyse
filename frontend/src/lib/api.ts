@@ -234,6 +234,9 @@ export interface DocumentItem {
   ki_input_tokens?: number | null;
   ki_output_tokens?: number | null;
   ki_total_duration?: number | null;
+  /** Erkannter Dokumententyp (durch KI-Klassifikation) */
+  document_type_id?: number | null;
+  document_type_name?: string | null;
 }
 
 export interface OrderPosition {
@@ -295,6 +298,7 @@ export interface DocumentFilter {
   has_extraction?: boolean;
   supplier_name?: string;
   doc_id?: number;
+  document_type_ids?: number[];
 }
 
 export interface AnalyzeRequest {
@@ -367,6 +371,7 @@ export interface SystemPrompt {
   name: string;
   content: string;
   is_default: boolean;
+  is_document_type_prompt: boolean;
   created_at: string;
   updated_at: string;
 }
@@ -375,6 +380,7 @@ export interface SystemPromptCreate {
   name: string;
   content: string;
   is_default?: boolean;
+  is_document_type_prompt?: boolean;
 }
 
 export const systemPromptsApi = {
@@ -387,6 +393,18 @@ export const systemPromptsApi = {
   setDefault: (id: number) =>
     apiClient.post<SystemPrompt>(`/api/settings/system-prompts/${id}/set-default`).then((r) => r.data),
   delete: (id: number) => apiClient.delete(`/api/settings/system-prompts/${id}`),
+};
+
+// ─── Typen: Dokumententypen ───────────────────────────────────────────────────
+
+export interface DocumentType {
+  id: number;
+  name: string;
+}
+
+export const documentTypesApi = {
+  list: () =>
+    apiClient.get<DocumentType[]>("/api/document-types").then((r) => r.data),
 };
 
 export const imageSettingsApi = {

@@ -20,6 +20,7 @@ export default function SystemPromptsPage() {
   const [formName, setFormName] = useState("");
   const [formContent, setFormContent] = useState("");
   const [formDefault, setFormDefault] = useState(false);
+  const [formDocTypePrompt, setFormDocTypePrompt] = useState(false);
   const [saving, setSaving] = useState(false);
 
   async function load() {
@@ -41,6 +42,7 @@ export default function SystemPromptsPage() {
     setFormName("");
     setFormContent("");
     setFormDefault(prompts.length === 0);
+    setFormDocTypePrompt(false);
   }
 
   function openEdit(p: SystemPrompt) {
@@ -48,6 +50,7 @@ export default function SystemPromptsPage() {
     setFormName(p.name);
     setFormContent(p.content);
     setFormDefault(p.is_default);
+    setFormDocTypePrompt(p.is_document_type_prompt ?? false);
   }
 
   function cancelEdit() {
@@ -59,9 +62,9 @@ export default function SystemPromptsPage() {
     setSaving(true);
     try {
       if (editingId === "new") {
-        await systemPromptsApi.create({ name: formName, content: formContent, is_default: formDefault });
+        await systemPromptsApi.create({ name: formName, content: formContent, is_default: formDefault, is_document_type_prompt: formDocTypePrompt });
       } else if (editingId !== null) {
-        await systemPromptsApi.update(editingId, { name: formName, content: formContent, is_default: formDefault });
+        await systemPromptsApi.update(editingId, { name: formName, content: formContent, is_default: formDefault, is_document_type_prompt: formDocTypePrompt });
       }
       setEditingId(null);
       await load();
@@ -97,6 +100,7 @@ export default function SystemPromptsPage() {
         name: `Kopie von ${p.name}`,
         content: p.content,
         is_default: false,
+        is_document_type_prompt: false,
       });
       await load();
     } catch {
@@ -158,6 +162,65 @@ export default function SystemPromptsPage() {
             />
             Als Standard verwenden
           </label>
+          <div className="space-y-2">
+            <label className="flex items-center gap-2 text-sm text-gray-700">
+              <input
+                type="checkbox"
+                checked={formDocTypePrompt}
+                onChange={(e) => setFormDocTypePrompt(e.target.checked)}
+              />
+              Als Dokumententyp-Prompt verwenden
+            </label>
+            {formDocTypePrompt && (
+              <div className="ml-6 rounded-lg border border-violet-200 bg-violet-50 p-4 space-y-3 text-xs">
+                <p className="font-semibold text-violet-800">
+                  ℹ️ Erwartetes KI-Antwortformat
+                </p>
+                <p className="text-violet-700">
+                  Dieser Prompt wird in Stufe 1 der Analyse verwendet. Die KI muss
+                  ausschließlich folgendes JSON zurückgeben:
+                </p>
+                <pre className="rounded bg-violet-100 px-3 py-2 font-mono text-violet-900 whitespace-pre-wrap">
+{`{"dokumententyp_id": 1, "dokumententyp_name": "Eingangsrechnung"}`}
+                </pre>
+                <div>
+                  <p className="font-semibold text-violet-800 mb-1">Gültige Dokumententypen:</p>
+                  <table className="w-full border-collapse text-violet-800">
+                    <tbody>
+                      {[
+                        [1,  "Eingangsrechnung",      "→ löst vollständige Extraktion aus"],
+                        [2,  "Ausgangsrechnung",      ""],
+                        [3,  "Gutschrift / Kreditnote",""],
+                        [4,  "Lieferschein",           ""],
+                        [5,  "Auftragsbestätigung",    ""],
+                        [6,  "Angebot",                ""],
+                        [7,  "Mahnung",                ""],
+                        [8,  "Kontoauszug",            ""],
+                        [9,  "Kassenbon / Quittung",   ""],
+                        [10, "Vertrag",                ""],
+                        [11, "Lohnabrechnung",         ""],
+                        [12, "Reisekostenabrechnung",  ""],
+                        [13, "Zollpapier",             ""],
+                        [14, "Versicherungspolice",    ""],
+                        [15, "Sonstiges",              ""],
+                      ].map(([id, name, hint]) => (
+                        <tr key={id as number} className={id === 1 ? "font-semibold" : ""}>
+                          <td className="py-0.5 pr-3 tabular-nums text-right w-6">{id}:</td>
+                          <td className="pr-3">{name as string}</td>
+                          <td className="text-violet-500 italic">{hint as string}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+                <p className="text-violet-600">
+                  <span className="font-semibold">Tipp:</span> Der Prompt-Inhalt oben dient
+                  als System-Anweisung. Die Liste der Dokumententypen und der Hinweis auf das
+                  JSON-Format werden automatisch als Benutzer-Nachricht angehängt.
+                </p>
+              </div>
+            )}
+          </div>
           <div className="flex gap-2">
             <button
               onClick={save}
@@ -187,11 +250,16 @@ export default function SystemPromptsPage() {
             <div key={p.id} className="rounded-lg border bg-white p-4 shadow-sm">
               <div className="flex items-start justify-between gap-4">
                 <div className="flex-1 min-w-0">
-                  <div className="flex items-center gap-2">
+                  <div className="flex items-center gap-2 flex-wrap">
                     <span className="font-medium text-gray-800">{p.name}</span>
                     {p.is_default && (
                       <span className="rounded-full bg-green-100 px-2 py-0.5 text-xs font-medium text-green-700">
                         Standard
+                      </span>
+                    )}
+                    {p.is_document_type_prompt && (
+                      <span className="rounded-full bg-violet-100 px-2 py-0.5 text-xs font-medium text-violet-700">
+                        Dokumententyp-Prompt
                       </span>
                     )}
                   </div>

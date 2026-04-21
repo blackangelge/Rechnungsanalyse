@@ -101,6 +101,13 @@ JSON-Struktur:
 # Lokale Modelle können bei langen PDFs länger brauchen.
 REQUEST_TIMEOUT_SECONDS = 900
 
+# Standard-System-Prompt für Dokumententyp-Erkennung.
+DEFAULT_DOC_TYPE_SYSTEM_PROMPT = """Du bist ein Dokumentenklassifikations-Assistent.
+Analysiere das bereitgestellte Dokument und bestimme seinen Typ.
+Antworte AUSSCHLIESSLICH mit einem gültigen JSON-Objekt — ohne Markdown, ohne Erklärungen.
+
+Beispiel: {"dokumententyp_id": 1, "dokumententyp_name": "Eingangsrechnung"}"""
+
 
 def extract_invoice_data(
     images_b64: list[str],
@@ -307,6 +314,185 @@ def extract_invoice_data(
         len(order_positions),
     )
     return extracted_fields, order_positions, raw_text, ki_stats
+
+
+def detect_document_type(
+    images_b64: list[str],
+    config,
+    document_types: list[dict],
+    system_prompt_text: str | None = None,
+) -> tuple[int | None, str | None, str, dict]:
+    """
+    Erkennt den Dokumententyp eines Dokuments anhand der Seitenbilder.
+
+    WICHTIG: Synchron — immer via asyncio.to_thread() aufrufen.
+
+    Args:
+        images_b64: Base64-kodierte PNG-Bilder (eine pro Seite).
+        config: KI-Konfiguration.
+        document_types: Liste von Dicts [{"id": 1, "name": "Eingangsrechnung"}, ...].
+        system_prompt_text: Optionaler System-Prompt-Text (sonst Default).
+
+    Returns:
+        (type_id, type_name, raw_response, ki_stats)
+        type_id/type_name sind None wenn die Klassifikation fehlschlägt.
+    """
+    logger.info(
+        "Starte Dokumententyp-Erkennung: Modell='%s', Seiten=%d",
+        config.model_name, len(images_b64),
+    )
+
+    active_system_prompt = system_prompt_text if system_prompt_text else DEFAULT_DOC_TYPE_SYSTEM_PROMPT
+    endpoint_type = getattr(config, "endpoint_type", "openai") or "openai"
+    base = config.api_url.rstrip("/")
+    reasoning = getattr(config, "reasoning", "off") or "off"
+    reasoning_value = "high" if reasoning == "on" else reasoning
+
+    headers = {"Content-Type": "application/json"}
+    if config.api_key:
+        headers["Authorization"] = f"Bearer {config.api_key}"
+
+    # Typliste als Text aufbauen
+    type_list_text = "\n".join(f"{dt['id']}: {dt['name']}" for dt in document_types)
+    user_text = (
+        f"Identifiziere den Typ des folgenden Dokuments ({len(images_b64)} Seite(n)).\n\n"
+        f"Mögliche Dokumententypen:\n{type_list_text}\n\n"
+        f"Antworte NUR mit dem JSON-Objekt: "
+        f'{{\"dokumententyp_id\": <Zahl>, \"dokumententyp_name\": \"<Name>\"}}'
+    )
+
+    # Request je nach Endpunkt-Typ aufbauen
+    if endpoint_type == "lmstudio":
+        endpoint = base + "/api/v1/chat"
+        input_parts: list[dict] = []
+        for data_url in images_b64:
+            input_parts.append({"type": "image", "data_url": data_url})
+        input_parts.append({"type": "text", "content": user_text})
+        request_body: dict = {
+            "model": config.model_name,
+            "input": input_parts,
+            "system_prompt": active_system_prompt,
+            "temperature": config.temperature,
+            "max_output_tokens": config.max_tokens,
+            "reasoning": reasoning_value,
+            "stream": False,
+        }
+        del input_parts
+    else:
+        endpoint = base + "/v1/chat/completions"
+        content_parts: list[dict] = [{"type": "text", "text": user_text}]
+        for data_url in images_b64:
+            content_parts.append({"type": "image_url", "image_url": {"url": data_url}})
+        request_body = {
+            "model": config.model_name,
+            "max_tokens": config.max_tokens,
+            "temperature": config.temperature,
+            "reasoning": reasoning_value,
+            "stream": False,
+            "messages": [
+                {"role": "system", "content": active_system_prompt},
+                {"role": "user", "content": content_parts},
+            ],
+        }
+        del content_parts
+
+    logger.info("Sende Dokumententyp-Anfrage an: %s (Typ: %s)", endpoint, endpoint_type)
+
+    raw_text = ""
+    ki_stats: dict = {}
+
+    try:
+        serialized_body = json.dumps(request_body).encode("utf-8")
+        request_body.clear()
+
+        _t_start = time.monotonic()
+        with httpx.Client(timeout=REQUEST_TIMEOUT_SECONDS) as client:
+            response = client.post(endpoint, content=serialized_body, headers=headers)
+        _total_duration = time.monotonic() - _t_start
+        del serialized_body
+
+        if response.status_code != 200:
+            raw_text = f"KI-Fehler: HTTP {response.status_code}"
+            logger.error("Dokumententyp-API Fehler (HTTP %d)", response.status_code)
+            return None, None, raw_text, {}
+
+        try:
+            response_data = json.loads(response.content)
+            if endpoint_type == "lmstudio":
+                output_items = response_data.get("output") or []
+                raw_text = next(
+                    (item.get("content", "")
+                     for item in output_items if item.get("type") in ("text", "message")),
+                    "",
+                )
+                s = response_data.get("stats") or {}
+                ki_stats = {
+                    "input_tokens":        s.get("input_tokens"),
+                    "output_tokens":       s.get("total_output_tokens"),
+                    "reasoning_tokens":    s.get("reasoning_output_tokens"),
+                    "tokens_per_second":   s.get("tokens_per_second"),
+                    "time_to_first_token": s.get("time_to_first_token_seconds"),
+                    "total_duration":      _total_duration,
+                }
+            else:
+                raw_text = (
+                    response_data.get("choices", [{}])[0]
+                    .get("message", {})
+                    .get("content", "")
+                )
+                usage = response_data.get("usage") or {}
+                details = usage.get("completion_tokens_details") or {}
+                ki_stats = {
+                    "input_tokens":        usage.get("prompt_tokens"),
+                    "output_tokens":       usage.get("completion_tokens"),
+                    "reasoning_tokens":    details.get("reasoning_tokens"),
+                    "tokens_per_second":   None,
+                    "time_to_first_token": None,
+                    "total_duration":      _total_duration,
+                }
+        except Exception as parse_exc:
+            raw_text = f"Antwort-Parse-Fehler: {parse_exc}"
+            logger.error("Fehler beim Parsen der Dokumententyp-Antwort: %s", parse_exc)
+            return None, None, raw_text, {}
+
+    except httpx.TimeoutException as exc:
+        raw_text = f"KI-Timeout: {exc}"
+        logger.error("Dokumententyp-API Timeout: %s", exc)
+        return None, None, raw_text, {}
+    except httpx.ConnectError as exc:
+        raw_text = f"KI-Verbindungsfehler: {exc}"
+        logger.error("Dokumententyp-API Verbindungsfehler: %s", exc)
+        return None, None, raw_text, {}
+    except Exception as exc:
+        raw_text = f"Unerwarteter KI-Fehler: {exc}"
+        logger.exception("Unerwarteter Fehler bei Dokumententyp-Erkennung: %s", exc)
+        return None, None, raw_text, {}
+
+    # JSON parsen
+    try:
+        parsed = _parse_json_response(raw_text)
+    except Exception:
+        logger.warning("Dokumententyp-Antwort nicht als JSON parsbar: %s", raw_text[:200])
+        return None, None, raw_text, ki_stats
+
+    type_id = parsed.get("dokumententyp_id")
+    type_name = parsed.get("dokumententyp_name")
+
+    # Validierung: type_id muss eine gültige ID sein
+    valid_ids = {dt["id"] for dt in document_types}
+    if type_id is not None:
+        try:
+            type_id = int(type_id)
+            if type_id not in valid_ids:
+                logger.warning("Unbekannte Dokumententyp-ID %d — ignoriert", type_id)
+                type_id = None
+                type_name = None
+        except (ValueError, TypeError):
+            type_id = None
+            type_name = None
+
+    logger.info("Dokumententyp erkannt: ID=%s, Name=%s", type_id, type_name)
+    return type_id, type_name, raw_text, ki_stats
 
 
 def _normalize_decimal_commas(obj):
