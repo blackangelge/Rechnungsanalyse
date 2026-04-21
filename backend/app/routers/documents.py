@@ -88,6 +88,7 @@ def list_documents(
     has_extraction: Optional[bool] = None,
     supplier_name: Optional[str] = None,
     doc_id: Optional[int] = None,
+    document_type_ids: Optional[list[int]] = Query(default=None),
     db: Session = Depends(get_db),
 ):
     """
@@ -95,6 +96,7 @@ def list_documents(
     include_deleted=true zeigt auch soft-gelöschte Dokumente an.
     has_extraction=true/false filtert nach KI-analysierten Dokumenten.
     supplier_name filtert nach Lieferantenname (case-insensitive LIKE).
+    document_type_ids filtert nach Dokumententypen (mehrere möglich).
     """
     return crud.document.get_all_filtered(
         db,
@@ -110,6 +112,7 @@ def list_documents(
         has_extraction=has_extraction,
         supplier_name_filter=supplier_name,
         doc_id=doc_id,
+        document_type_ids=document_type_ids,
     )
 
 
@@ -229,6 +232,10 @@ def _db_analyze_read(doc_id: int, ai_config_id: int) -> dict | None:
 
         img_settings = crud.image_settings.get_or_create(db)
 
+        # Dokumententyp-Prompt und Typliste laden
+        doc_type_prompt = crud.system_prompt.get_doc_type_prompt(db)
+        doc_types = crud.document_type.get_all(db)
+
         return {
             "pdf_path": pdf_path,
             "original_filename": doc.original_filename,
@@ -243,6 +250,9 @@ def _db_analyze_read(doc_id: int, ai_config_id: int) -> dict | None:
             "ai_temperature": ai_config.temperature,
             "ai_reasoning": getattr(ai_config, "reasoning", "off") or "off",
             "ai_endpoint_type": getattr(ai_config, "endpoint_type", "openai") or "openai",
+            # Zweistufige Analyse
+            "doc_type_prompt_text": doc_type_prompt.content if doc_type_prompt else None,
+            "document_types": [{"id": dt.id, "name": dt.name} for dt in doc_types],
         }
     except Exception as exc:
         logger.exception("Phase 1 DB-Fehler bei Dokument #%d: %s", doc_id, exc)
@@ -257,6 +267,86 @@ def _db_analyze_read(doc_id: int, ai_config_id: int) -> dict | None:
         db.close()
 
 
+def _db_save_document_type(doc_id: int, type_id: int | None) -> None:
+    """Speichert den erkannten Dokumententyp in der DB (eigene Session)."""
+    db = SessionLocal()
+    try:
+        crud.document.update_document_type(db, doc_id, type_id)
+    except Exception as exc:
+        logger.error("Fehler beim Speichern des Dokumententyps für #%d: %s", doc_id, exc)
+    finally:
+        db.close()
+
+
+def _db_type_only_finish(
+    doc_id: int,
+    type_id: int | None,
+    type_name: str | None,
+    page_count: int,
+    batch_id: int | None,
+    original_filename: str,
+    ki_stats: dict | None = None,
+) -> None:
+    """
+    Schließt die Analyse ab ohne Rechnungsdaten-Extraktion.
+    Wird verwendet wenn der Dokumententyp KEINE Eingangsrechnung ist.
+    Ki-Stats (Token-Verbrauch der Typ-Erkennung) werden direkt am Dokument gespeichert.
+    """
+    db = SessionLocal()
+    try:
+        from app.models.document import Document as _DocModel
+        doc = db.get(_DocModel, doc_id)
+        if doc is not None:
+            doc.document_type_id = type_id
+            if page_count > 0:
+                doc.page_count = page_count
+            doc.status = "done"
+            # KI-Stats der Typ-Erkennung direkt auf dem Dokument speichern
+            if ki_stats:
+                doc.doc_ki_input_tokens  = ki_stats.get("input_tokens")
+                doc.doc_ki_output_tokens = ki_stats.get("output_tokens")
+                doc.doc_ki_total_duration = ki_stats.get("total_duration")
+            db.commit()
+
+        crud.system_log.add(
+            db, category="ki", level="info",
+            message=(f"Dokumententyp erkannt (keine Extraktion): "
+                     f"{original_filename} → {type_name or 'Unbekannt'}"),
+            batch_id=batch_id, document_id=doc_id,
+        )
+        logger.info(
+            "Dokument #%d: Typ erkannt als '%s' — keine Rechnungsextraktion", doc_id, type_name
+        )
+    except Exception as exc:
+        logger.error("Fehler beim Abschluss ohne Extraktion für #%d: %s", doc_id, exc)
+        try:
+            db.rollback()
+            _set_error(doc_id, f"Abschlussfehler: {exc}")
+        except Exception:
+            pass
+    finally:
+        db.close()
+
+
+def _merge_ki_stats(stats1: dict, stats2: dict) -> dict:
+    """Summiert die KI-Statistiken zweier API-Aufrufe."""
+    def _add(a, b):
+        if a is None and b is None:
+            return None
+        return (a or 0) + (b or 0)
+
+    return {
+        "input_tokens":        _add(stats1.get("input_tokens"),  stats2.get("input_tokens")),
+        "output_tokens":       _add(stats1.get("output_tokens"), stats2.get("output_tokens")),
+        "reasoning_tokens":    _add(stats1.get("reasoning_tokens"), stats2.get("reasoning_tokens")),
+        # tokens_per_second aus Stufe 2 (Extraktion) bevorzugen, Fallback Stufe 1
+        "tokens_per_second":   stats2.get("tokens_per_second") or stats1.get("tokens_per_second"),
+        # time_to_first_token aus Stufe 1 (erster Aufruf)
+        "time_to_first_token": stats1.get("time_to_first_token"),
+        "total_duration":      _add(stats1.get("total_duration"), stats2.get("total_duration")),
+    }
+
+
 def _db_analyze_write(
     doc_id: int,
     original_filename: str,
@@ -267,6 +357,7 @@ def _db_analyze_write(
     order_positions: list,
     raw_response: str,
     ki_stats: dict | None = None,
+    document_type_id: int | None = None,
 ) -> None:
     """
     Phase 4 (sync, für asyncio.to_thread): Schreibt KI-Ergebnisse in die DB.
@@ -318,12 +409,15 @@ def _db_analyze_write(
             ki_stats=ki_stats,
         )
 
-        # Seitenanzahl aus der KI-Analyse (= Anzahl gerenderter Bilder) setzen
-        if page_count > 0:
+        # Seitenanzahl und optional Dokumententyp setzen
+        if page_count > 0 or document_type_id is not None:
             from app.models.document import Document as _DocModel
             _doc = db.get(_DocModel, doc_id)
             if _doc is not None:
-                _doc.page_count = page_count
+                if page_count > 0:
+                    _doc.page_count = page_count
+                if document_type_id is not None:
+                    _doc.document_type_id = document_type_id
                 db.commit()
 
         is_ki_error = any(raw_response.startswith(p) for p in (
@@ -393,17 +487,20 @@ async def _analyze_single(
     system_prompt_text: str | None,
 ) -> None:
     """
-    Analysiert ein einzelnes Dokument mit KI-Extraktion.
+    Analysiert ein einzelnes Dokument — optional zweistufig.
 
     ARCHITEKTUR — Event-Loop-Schutz:
       Alle DB-Operationen laufen via asyncio.to_thread() in Threads.
       Alle IO-Operationen (PDF-Rendering) laufen via _run_ki_io() im KI-Pool.
       Der Event-Loop-Thread macht KEINE blockierenden Aufrufe.
 
-    Phase 1: DB-Daten lesen         → asyncio.to_thread(_db_analyze_read)
-    Phase 2: PDF → Bilder           → _run_ki_io() (dedizierter Pool)
-    Phase 3: KI-API-Aufruf          → asyncio.to_thread (sync httpx.Client, im Thread)
-    Phase 4: Ergebnisse in DB       → asyncio.to_thread(_db_analyze_write)
+    Wenn ein Dokumententyp-Systemprompt konfiguriert ist:
+      Phase 3a: Dokumententyp erkennen
+        → Nicht Eingangsrechnung (ID 1): Typ speichern + fertig
+        → Eingangsrechnung: weiter mit Phase 3b
+      Phase 3b: Vollständige Rechnungsextraktion (nur für Eingangsrechnung)
+
+    Ohne Dokumententyp-Systemprompt: direkt zur Rechnungsextraktion (alter Modus).
     """
     # ── Phase 1: Alle Daten aus DB lesen (im Thread, nicht-blockierend) ──
     data = await asyncio.to_thread(_db_analyze_read, doc_id, ai_config_id)
@@ -423,6 +520,8 @@ async def _analyze_single(
     ai_temperature: float = data["ai_temperature"]
     ai_reasoning: str = data["ai_reasoning"]
     ai_endpoint_type: str = data["ai_endpoint_type"]
+    doc_type_prompt_text: str | None = data["doc_type_prompt_text"]
+    document_types: list[dict] = data["document_types"]
 
     # ── Phase 2: PDF → Bilder (blockierende IO, kein DB-Handle offen) ────
     logger.info("Rendere PDF für Dokument #%d: %s", doc_id, pdf_path.name)
@@ -443,10 +542,10 @@ async def _analyze_single(
         _set_error(doc_id, "PDF konnte nicht gerendert werden")
         return
 
-    # ── Phase 3: KI-API-Aufruf (sync httpx.Client im Thread, kein DB-Handle offen) ─
-    logger.info("Starte KI-Extraktion für Dokument #%d (%d Seite(n))", doc_id, len(images_b64))
+    # Seitenanzahl merken (images_b64 wird später freigegeben)
+    page_count = len(images_b64)
 
-    # Minimales Config-Proxy-Objekt für ai_service (nur benötigte Felder)
+    # Minimales Config-Proxy-Objekt für ai_service
     class _ConfigProxy:
         def __init__(self):
             self.api_url = ai_api_url
@@ -457,20 +556,67 @@ async def _analyze_single(
             self.reasoning = ai_reasoning
             self.endpoint_type = ai_endpoint_type
 
-    # extract_invoice_data ist synchron — komplett im Thread ausführen.
-    # Der Event-Loop berührt NICHTS davon (JSON-Dump, HTTP, Parsing).
     config_proxy = _ConfigProxy()
-    extracted_fields, order_positions, raw_response, ki_stats = (
-        await asyncio.to_thread(
+
+    # ── Phase 3: KI-API-Aufruf(e) ─────────────────────────────────────────────
+    document_type_id: int | None = None
+
+    if doc_type_prompt_text and document_types:
+        # ── Phase 3a: Dokumententyp erkennen ─────────────────────────────────
+        logger.info(
+            "Starte Dokumententyp-Erkennung für #%d (%d Seite(n))", doc_id, page_count
+        )
+        type_id, type_name, _type_raw, type_stats = await asyncio.to_thread(
+            ai_service.detect_document_type,
+            images_b64,
+            config_proxy,
+            document_types,
+            doc_type_prompt_text,
+        )
+        document_type_id = type_id
+
+        # Dokumententyp sofort in DB speichern (für Fortschrittsanzeige)
+        await asyncio.to_thread(_db_save_document_type, doc_id, type_id)
+
+        # Eingangsrechnung (ID 1) → vollständige Extraktion
+        # Alle anderen Typen (oder None) → fertig ohne Extraktion
+        if type_id != 1:
+            del images_b64
+            await asyncio.to_thread(
+                _db_type_only_finish,
+                doc_id, type_id, type_name, page_count, batch_id, original_filename,
+                type_stats,
+            )
+            return
+
+        logger.info(
+            "Dokumententyp='%s' → starte Rechnungsextraktion für #%d", type_name, doc_id
+        )
+
+        # ── Phase 3b: Rechnungsextraktion (nur Eingangsrechnung) ─────────────
+        extracted_fields, order_positions, raw_response, inv_stats = await asyncio.to_thread(
             ai_service.extract_invoice_data,
             images_b64,
             config_proxy,
             system_prompt_text,
         )
-    )
-    # Seitenanzahl merken und Bilddaten sofort freigeben
-    page_count = len(images_b64)
-    del images_b64
+        del images_b64
+
+        # KI-Statistiken beider Aufrufe summieren
+        ki_stats = _merge_ki_stats(type_stats, inv_stats)
+
+    else:
+        # Kein Dokumententyp-Prompt → alter Modus: direkte Rechnungsextraktion
+        logger.info(
+            "Starte KI-Extraktion für Dokument #%d (%d Seite(n))", doc_id, page_count
+        )
+        extracted_fields, order_positions, raw_response, ki_stats = await asyncio.to_thread(
+            ai_service.extract_invoice_data,
+            images_b64,
+            config_proxy,
+            system_prompt_text,
+        )
+        del images_b64
 
     # ── Phase 4: Ergebnisse in DB schreiben (im Thread, nicht-blockierend) ─
     await asyncio.to_thread(
@@ -484,6 +630,7 @@ async def _analyze_single(
         order_positions,
         raw_response,
         ki_stats,
+        document_type_id,
     )
 
 

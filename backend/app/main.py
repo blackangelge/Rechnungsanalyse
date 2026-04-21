@@ -141,14 +141,15 @@ app.add_middleware(
 from app.routers import ai_configs, documents, items, logs, settings, sse, suppliers
 from app.routers import imports as imports_router  # 'imports' ist ein Python-Keyword
 
-app.include_router(items.router)           # /api/items/*
-app.include_router(ai_configs.router)      # /api/ai-configs/*
-app.include_router(imports_router.router)  # /api/imports/*
-app.include_router(sse.router)             # /api/imports/{id}/progress (SSE)
-app.include_router(documents.router)       # /api/documents/*
-app.include_router(settings.router)        # /api/settings/*
-app.include_router(logs.router)            # /api/logs/*
-app.include_router(suppliers.router)       # /api/suppliers/*
+app.include_router(items.router)                       # /api/items/*
+app.include_router(ai_configs.router)                  # /api/ai-configs/*
+app.include_router(imports_router.router)              # /api/imports/*
+app.include_router(sse.router)                         # /api/imports/{id}/progress (SSE)
+app.include_router(documents.router)                   # /api/documents/*
+app.include_router(settings.router)                    # /api/settings/*
+app.include_router(settings.doc_types_router)          # /api/document-types/*
+app.include_router(logs.router)                        # /api/logs/*
+app.include_router(suppliers.router)                   # /api/suppliers/*
 
 
 # ── Health-Check ────────────────────────────────────────────────────────────

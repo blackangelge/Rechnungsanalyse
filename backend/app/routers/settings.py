@@ -12,11 +12,21 @@ from sqlalchemy.orm import Session
 from app import crud
 from app.config import settings
 from app.database import get_db
+from app.schemas.document_type import DocumentTypeRead
 from app.schemas.image_settings import ImageSettingsRead, ImageSettingsUpdate
 from app.schemas.processing_settings import ProcessingSettingsRead, ProcessingSettingsUpdate
 from app.schemas.system_prompt import SystemPromptCreate, SystemPromptRead, SystemPromptUpdate
 
 router = APIRouter(prefix="/api/settings", tags=["Einstellungen"])
+
+# Separater Router für Dokumententypen (eigenes Präfix)
+doc_types_router = APIRouter(prefix="/api/document-types", tags=["Dokumententypen"])
+
+
+@doc_types_router.get("", response_model=list[DocumentTypeRead])
+def list_document_types(db: Session = Depends(get_db)):
+    """Gibt alle verfügbaren Dokumententypen zurück."""
+    return crud.document_type.get_all(db)
 
 
 @router.get("/paths")

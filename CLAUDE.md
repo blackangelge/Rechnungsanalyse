@@ -39,7 +39,10 @@ app/
 ├── config.py               # Settings via pydantic-settings (aus .env)
 ├── database.py             # SQLAlchemy Session-Factory
 ├── models/                 # SQLAlchemy-ORM-Modelle
-│   ├── document.py         # + Properties: total_amount, invoice_number, supplier_name
+│   ├── document.py         # + Properties: total_amount, invoice_number, supplier_name,
+│   │                       #   document_type_name, ki_input_tokens, ki_output_tokens,
+│   │                       #   ki_total_duration (Fallback auf doc_ki_* für Non-Eingangsrechnungen)
+│   ├── document_type.py    # DocumentType (id, name) — 15 vordefinierte Typen
 │   ├── import_batch.py
 │   ├── ai_config.py
 │   ├── image_settings.py
@@ -49,30 +52,40 @@ app/
 │   ├── order_position.py
 │   ├── supplier.py         # Lieferanten-Stammdaten (Deduplication)
 │   └── system_prompt.py    # Systemprompts für KI-Extraktion
+│                           # + is_document_type_prompt: bool (Dokumententyp-Erkennung)
 ├── schemas/                # Pydantic-Schemas (Request/Response)
-│   ├── document.py         # DocumentRead, DocumentListRead (+Extraktion-Summary),
-│   │                       #   DocumentDetail, DocumentCommentUpdate
+│   ├── document.py         # DocumentRead, DocumentListRead (+Extraktion-Summary,
+│   │                       #   document_type_id/name), DocumentDetail (+ki_*-Felder
+│   │                       #   explizit — nicht von DocumentRead geerbt!),
+│   │                       #   DocumentCommentUpdate
+│   ├── document_type.py    # DocumentTypeRead (id, name)
 │   └── import_batch.py     # ImportBatchCreate (inkl. analyze_after_import,
 │                           #   system_prompt_id, delete_source_files)
 ├── crud/                   # Datenbankoperationen (je Modell eine Datei)
-│   ├── document.py         # get_all_filtered mit joinedload(extraction)
+│   ├── document.py         # get_all_filtered mit joinedload(extraction, document_type)
 │   │                       # save_extraction: speichert ki_stats; Fallback ohne Stats
 │   │                       #   falls Migration noch nicht angewendet
+│   │                       # update_document_type(db, doc_id, type_id)
+│   ├── document_type.py    # get_all(), get_by_id()
 │   ├── import_batch.py
 │   ├── supplier.py         # find_or_create (IBAN → VAT-ID → Name)
-│   └── system_prompt.py
+│   └── system_prompt.py    # + get_doc_type_prompt(db) → Prompt mit is_document_type_prompt=True
+│                           # + _clear_doc_type_prompt(db) — stellt Eindeutigkeit sicher
 ├── routers/                # API-Endpunkte
 │   ├── imports.py          # GET/POST /api/imports, DELETE löscht auch Dateien
 │   │                       # GET /api/imports/{id}/export → Excel-Download
 │   │                       # _import_then_analyze, _delete_source_files
 │   │                       # _build_export_excel (openpyxl, 2 Sheets)
 │   ├── documents.py        # GET /api/documents, POST /analyze, GET/{id}, preview, comment
-│   │                       # _KI_IO_EXECUTOR, _analyze_single (phasenbasiert, sequenziell)
+│   │                       # _KI_IO_EXECUTOR, _analyze_single (zweistufig, sequenziell)
+│   │                       # _db_type_only_finish: Abschluss ohne InvoiceExtraction
+│   │                       # _merge_ki_stats: summiert Token-Stats aus Stufe 1+2
 │   ├── ai_configs.py       # CRUD /api/ai-configs, POST set-default
 │   ├── logs.py             # GET /api/logs (System-Log), GET /api/logs/ki-stats
 │   ├── settings.py         # GET/PUT /api/settings/image-conversion
 │   │                       # GET /api/settings/paths
 │   │                       # CRUD /api/settings/system-prompts
+│   │                       # GET /api/document-types (doc_types_router)
 │   ├── sse.py              # GET /api/imports/{id}/progress (Server-Sent Events)
 │   └── items.py            # CRUD /api/items (Platzhalter)
 └── services/
@@ -81,14 +94,23 @@ app/
     ├── ai_service.py       # KI-Extraktion via OpenAI-kompatibler Vision-API
     │                       # Verschachteltes JSON-Format + Normalisierung
     │                       # extract_invoice_data ist SYNCHRON (httpx.Client)
+    │                       # detect_document_type ist SYNCHRON (httpx.Client)
+    │                       # DEFAULT_DOC_TYPE_SYSTEM_PROMPT — Fallback-Systemprompt
     └── pdf_service.py      # PDF → Bilder (pypdfium2), Seitenanzahl (pypdf)
 alembic/
 └── versions/
     ├── 0001_initial.py     # Alle Basistabellen
     ├── 0002_system_prompts.py
     ├── 0003_supplier.py    # suppliers-Tabelle + supplier_id FK auf invoice_extractions
-    └── 0009_ki_stats_on_invoice_extractions.py
-                            # 5 ki_*-Spalten auf invoice_extractions (nullable)
+    ├── 0009_ki_stats_on_invoice_extractions.py
+    │                       # 5 ki_*-Spalten auf invoice_extractions (nullable)
+    ├── 0011_document_types.py
+    │                       # document_types-Tabelle (15 Typen), document_type_id FK
+    │                       # auf documents, is_document_type_prompt auf system_prompts
+    │                       # ACHTUNG: down_revision = "0010" (nicht "0010_ki_total_duration")
+    └── 0012_doc_ki_stats.py
+                            # doc_ki_input_tokens, doc_ki_output_tokens, doc_ki_total_duration
+                            # auf documents (Fallback-Stats für Nicht-Eingangsrechnungen)
 ```
 
 ### Import-Ablauf
@@ -125,6 +147,30 @@ alembic/
 - Leere Unterordner werden ebenfalls entfernt
 - DB-Einträge (Batch → Dokumente → Extraktionen → Positionen via CASCADE)
 
+### Dokumententypen (`models/document_type.py`, `crud/document_type.py`)
+
+15 vordefinierte Dokumententypen werden beim ersten Start (Migration 0011) in die DB eingetragen:
+
+| ID | Name |
+|---|---|
+| 1 | **Eingangsrechnung** ← löst vollständige KI-Extraktion aus |
+| 2 | Ausgangsrechnung |
+| 3 | Lieferschein |
+| 4 | Bestellbestätigung |
+| 5 | Angebot |
+| 6 | Gutschrift / Storno |
+| 7 | Mahnung |
+| 8 | Kontoauszug |
+| 9 | Vertrag |
+| 10 | Lohnabrechnung |
+| 11 | Steuer- / Behördendokument |
+| 12 | Reisekostenabrechnung |
+| 13 | Kassenbon / Quittung |
+| 14 | Sonstiges kaufmännisches Dokument |
+| 15 | Unbekannt |
+
+`GET /api/document-types` — gibt alle Typen zurück (registriert als `doc_types_router` in `settings.py`, eingebunden in `main.py`).
+
 ### KI-Extraktion (`services/ai_service.py`)
 
 - Unterstützt jede OpenAI-kompatible Vision-API (LM Studio, Ollama, OpenAI, etc.)
@@ -141,6 +187,7 @@ alembic/
   `httpx.Client` (sync). Muss immer via `asyncio.to_thread()` aufgerufen werden.
   Grund: verhindert, dass JSON-Serialisierung großer Base64-Payloads und HTTP-I/O
   den asyncio Event-Loop blockieren.
+- **`detect_document_type` ist SYNCHRON** — gleiche Konvention, muss via `asyncio.to_thread()` aufgerufen werden.
 
 #### Rückgabe von `extract_invoice_data`
 
@@ -155,6 +202,27 @@ def extract_invoice_data(
 
 `ki_stats` enthält: `input_tokens`, `output_tokens`, `reasoning_tokens`,
 `tokens_per_second`, `time_to_first_token` (alle können `None` sein).
+
+#### Rückgabe von `detect_document_type`
+
+```python
+def detect_document_type(
+    images_b64: list[str],
+    config: AIConfig,
+    document_types: list[dict],          # [{"id": 1, "name": "Eingangsrechnung"}, ...]
+    system_prompt_text: str | None = None,
+) -> tuple[int | None, str | None, str, dict]:
+    # Returns: (type_id, type_name, raw_response, ki_stats)
+```
+
+Die KI antwortet mit:
+```json
+{"dokumententyp_id": 1, "dokumententyp_name": "Eingangsrechnung"}
+```
+
+`type_id` wird gegen die bekannten IDs validiert. Bei ungültiger oder fehlender Antwort → `(None, None, raw, {})`.
+
+`DEFAULT_DOC_TYPE_SYSTEM_PROMPT` — interner Fallback-Prompt für die Typenerkennung (wird verwendet, falls kein Dokumententyp-Prompt in der DB gesetzt ist, aber `detect_document_type` direkt aufgerufen wird).
 
 #### Verschachteltes KI-JSON-Format
 
@@ -216,20 +284,34 @@ Diese werden in `_db_analyze_write` vor `save_extraction` herausgefiltert (`_SUP
 | `_num(val)` | String oder Zahl → `float\|None` |
 | `_str(val)` | Beliebig → `str\|None` |
 
-### KI-Analyse: Phasenbasierter Ansatz (`routers/documents.py`)
+### KI-Analyse: Zweistufiger Ansatz (`routers/documents.py`)
 
 **Kernprinzip:** Alle blockierenden Operationen laufen in Threads — der Event-Loop wird nie blockiert.
 
 **Sequenzielle Verarbeitung:** Dokumente werden **nacheinander** analysiert (kein `asyncio.gather`, kein Semaphore). Grund: Lokale Modelle (LM Studio, Ollama) verarbeiten ohnehin nur eine Anfrage gleichzeitig. Parallele Verarbeitung erschöpft auf einem NAS den Thread-Pool und den Arbeitsspeicher.
 
+#### Zweistufige Analyse (wenn Dokumententyp-Prompt konfiguriert)
+
 | Phase | Inhalt | Ausführung |
 |---|---|---|
-| 1 | Alle Daten aus DB lesen, in lokale Variablen kopieren | `asyncio.to_thread(_db_analyze_read)` |
+| 1 | Alle Daten aus DB lesen (inkl. `doc_type_prompt_text`, `document_types`) | `asyncio.to_thread(_db_analyze_read)` |
 | 2 | PDF → Bilder | `_run_ki_io()` (dedizierter `_KI_IO_EXECUTOR`) |
-| 3 | KI-API-Aufruf (sync httpx.Client) | `asyncio.to_thread(ai_service.extract_invoice_data)` |
+| 3a | Dokumententyp erkennen (`detect_document_type`) | `asyncio.to_thread(ai_service.detect_document_type)` |
+| 3b | Typ in DB speichern (`_db_save_document_type`) | `asyncio.to_thread(...)` |
+| 3c | **Falls NICHT Eingangsrechnung (ID 1):** Abschluss ohne Extraktion | `asyncio.to_thread(_db_type_only_finish)` → return |
+| 3d | **Falls Eingangsrechnung:** Rechnungsextraktion | `asyncio.to_thread(ai_service.extract_invoice_data)` |
 | 4 | Ergebnisse + Seitenanzahl in DB schreiben | `asyncio.to_thread(_db_analyze_write)` |
 
-**Seitenanzahl:** `page_count = len(images_b64)` nach Phase 2 → wird in Phase 4 in `Document.page_count` geschrieben.
+**Einstufige Analyse (kein Dokumententyp-Prompt):** Direkt Phase 2 → 3d → 4 (altes Verhalten, rückwärtskompatibel).
+
+**`_merge_ki_stats(stats1, stats2)`** summiert `input_tokens`, `output_tokens`, `reasoning_tokens` und `total_duration` über beide KI-Aufrufe (Typenerkennung + Extraktion). Die kombinierten Stats werden in `InvoiceExtraction` gespeichert.
+
+**`_db_type_only_finish(doc_id, type_id, type_name, page_count, batch_id, original_filename, ki_stats=None)`**
+Schließt Nicht-Eingangsrechnungen ab:
+- Setzt `document.status = "done"`, `document.page_count`
+- Speichert KI-Stats direkt in `doc_ki_input_tokens`, `doc_ki_output_tokens`, `doc_ki_total_duration` auf `Document`
+
+**Seitenanzahl:** `page_count = len(images_b64)` nach Phase 2 → wird in Phase 4 (oder `_db_type_only_finish`) in `Document.page_count` geschrieben.
 
 `_set_error(doc_id, message)` — Hilfsfunktion, öffnet eigene Session nur zum Setzen des Fehlerstatus.
 
@@ -237,15 +319,27 @@ Diese werden in `_db_analyze_write` vor `save_extraction` herausgefiltert (`_SUP
 
 ### KI-Token-Statistiken
 
-Pro KI-Analyse werden in `invoice_extractions` gespeichert:
+#### Für Eingangsrechnungen (in `invoice_extractions`)
 
 | Spalte | Typ | Beschreibung |
 |---|---|---|
-| `ki_input_tokens` | `int\|None` | Eingabe-Token |
-| `ki_output_tokens` | `int\|None` | Ausgabe-Token |
+| `ki_input_tokens` | `int\|None` | Eingabe-Token (Summe aus Typ-Erkennung + Extraktion) |
+| `ki_output_tokens` | `int\|None` | Ausgabe-Token (Summe) |
 | `ki_reasoning_tokens` | `int\|None` | Reasoning-Token (nur manche Modelle) |
 | `ki_tokens_per_second` | `float\|None` | Generierungsgeschwindigkeit |
 | `ki_time_to_first_token` | `float\|None` | Zeit bis erstes Token (Sekunden) |
+
+#### Für Nicht-Eingangsrechnungen (direkt in `documents`)
+
+| Spalte | Typ | Beschreibung |
+|---|---|---|
+| `doc_ki_input_tokens` | `int\|None` | Eingabe-Token der Typenerkennung |
+| `doc_ki_output_tokens` | `int\|None` | Ausgabe-Token der Typenerkennung |
+| `doc_ki_total_duration` | `float\|None` | Gesamtdauer der Typenerkennung |
+
+Die Properties `ki_input_tokens`, `ki_output_tokens`, `ki_total_duration` auf `Document` liefern zuerst den Wert aus `InvoiceExtraction` (falls vorhanden), andernfalls den Fallback aus `doc_ki_*`.
+
+**Wichtig für Schemas:** `DocumentDetail` erbt von `DocumentRead` (nicht `DocumentListRead`). Die `ki_*`-Felder müssen daher **explizit** in `DocumentDetail` deklariert werden — sie werden nicht automatisch geerbt.
 
 Aggregierte Statistiken: `GET /api/logs/ki-stats` — gibt Summen und Durchschnitte über alle Extraktionen zurück.
 
@@ -258,6 +352,21 @@ Aggregierte Statistiken: `GET /api/logs/ki-stats` — gibt Summen und Durchschni
 
 Vorhandene Felder werden nur überschrieben, wenn der neue Wert besser (nicht leer) ist.
 `supplier_id` wird in `invoice_extractions` gespeichert.
+
+### Systemprompts (`models/system_prompt.py`, `crud/system_prompt.py`)
+
+Zusätzlich zum normalen Extraktions-Prompt gibt es einen **Dokumententyp-Prompt**:
+
+- `is_document_type_prompt: bool` — markiert einen Prompt als Dokumententyp-Erkennung
+- Nur **ein** Prompt kann gleichzeitig `is_document_type_prompt=True` haben
+- `_clear_doc_type_prompt(db)` setzt alle anderen auf `False`, bevor ein neuer gesetzt wird
+- `get_doc_type_prompt(db)` — gibt den aktiven Dokumententyp-Prompt zurück (oder `None`)
+- Bei `_analyze_single`: `doc_type_prompt_text` aus DB gelesen → zweistufige Analyse aktiv
+
+**Erwartetes KI-Antwortformat für Dokumententyp-Prompt:**
+```json
+{"dokumententyp_id": 1, "dokumententyp_name": "Eingangsrechnung"}
+```
 
 ### Umgebungsvariablen (`.env`)
 
@@ -335,6 +444,8 @@ src/
 │   ├── dashboard/page.tsx              # Übersicht aller Import-Batches
 │   ├── belege/page.tsx                 # Alle Dokumente, Filter, KI-Analyse starten
 │   │                                   # KI-Rohdaten-Ansicht + Infos-Ansicht (50/50)
+│   │                                   # Dokumententyp-Filter (DocTypeMultiSelect)
+│   │                                   # Dokumententyp-Spalte in Tabelle
 │   ├── imports/
 │   │   ├── new/page.tsx                # Neuen Import starten
 │   │   └── [id]/page.tsx               # Import-Detail: ProgressPanel + Dokumentenliste
@@ -343,6 +454,8 @@ src/
 │   └── settings/
 │       ├── ai/page.tsx                 # KI-Konfigurationen verwalten
 │       ├── prompts/page.tsx            # Systemprompts verwalten
+│       │                               # Checkbox: Als Dokumententyp-Prompt verwenden
+│       │                               # Hilfetext: erwartetes KI-JSON + Typenliste
 │       └── image/page.tsx             # Bildkonvertierungseinstellungen
 ├── components/
 │   ├── Nav.tsx                         # Links: Dashboard, Belege, Neuer Import,
@@ -387,21 +500,40 @@ Exports:
 - `systemPromptsApi` — Systemprompts CRUD
 - `importSettingsApi` — Pfade abrufen (`/api/settings/paths`)
 - `logsApi` — System-Logs + `kiStats()` → `GET /api/logs/ki-stats`
+- `documentTypesApi` — Dokumententypen abrufen (`GET /api/document-types`)
+
+Typen:
+- `DocumentType` — `{ id: number; name: string }`
+- `DocumentItem` — enthält `document_type_id?`, `document_type_name?`, `ki_input_tokens?`, `ki_output_tokens?`, `ki_total_duration?`
+- `DocumentFilter` — enthält `document_type_ids?: number[]`
+- `SystemPrompt` — enthält `is_document_type_prompt: boolean`
+- `SystemPromptCreate` — enthält `is_document_type_prompt?: boolean`
 
 ### Belege-Seite (`belege/page.tsx`)
 
-- Filter: Firma, Jahr, Status, Betrag von/bis, Seiten von/bis
-- Tabelle: Checkbox, ID, Firma, Jahr, Dateiname, Seiten, Betrag, Status, Rechnungsnr., Lieferant, PDF-Link
-- Betrag/Rechnungsnr./Lieferant kommen direkt aus `DocumentItem` (Backend liefert Extraktion-Summary mit)
+- Filter: Firma, Jahr, Status, Dokumententyp, Import, Betrag von/bis, Seiten von/bis
+- Tabelle: Checkbox, ID, Firma, Jahr, Dateiname, Seiten, Betrag, Status, Dokumententyp, Rechnungsnr., Lieferant, PDF-Link
+- Betrag/Rechnungsnr./Lieferant/Dokumententyp kommen direkt aus `DocumentItem` (Backend liefert sie mit)
 - Aktionsleiste bei Auswahl: KI-Konfiguration + Systemprompt wählen → „KI-Analyse starten"
 - Auto-Refresh alle 5 s solange Dokumente mit Status `processing` vorhanden
+
+#### Filter: `DocTypeMultiSelect`
+
+Gleiche Dropdown-Checkbox-Komponente wie `BatchMultiSelect` (Import-Filter):
+- State: `selectedDocTypeIds: Set<number>`
+- `loadOptions()` lädt `documentTypesApi.list()` parallel zu Batches
+- `buildFilters()` fügt `document_type_ids` als Array hinzu, wenn mindestens ein Typ gewählt
+- `resetFilters()` setzt `selectedDocTypeIds` zurück
+- Backend: `GET /api/documents?document_type_ids=1&document_type_ids=3` — filtert mit `.in_()`
 
 #### Aktions-Buttons pro Dokument
 
 | Button | Bedingung | Funktion |
 |---|---|---|
-| **KI** (violett) | Status `done` oder `error` | Zeigt KI-Rohantwort als JSON im Modal-Overlay |
+| **KI** (violett) | Status `done` oder `error` | Zeigt KI-Rohantwort als JSON im Modal-Overlay inkl. Token-Statistik |
 | **Infos** (smaragd) | Status `done` | Wechselt in Infos-Ansicht (50/50 Split) |
+
+**KI-Modal Token-Statistik:** Liest `viewedDoc.ki_input_tokens`, `viewedDoc.ki_output_tokens`, `viewedDoc.ki_total_duration` — also direkt aus `DocumentDetail`, nicht aus `viewedDoc.extraction`. Dies stellt sicher, dass auch Nicht-Eingangsrechnungen (ohne `InvoiceExtraction`) ihre Token-Stats anzeigen.
 
 #### Infos-Ansicht
 
@@ -446,6 +578,14 @@ Behandelt sowohl `number` als auch Strings wie `"719,99 €"`:
 | ↳ KI-Konfiguration | Dropdown | Nur sichtbar wenn KI aktiv; Standard vorgewählt |
 | ↳ Systemprompt | Dropdown | Nur sichtbar wenn KI aktiv; Standard-Prompt vorgewählt |
 
+### Systemprompts-Seite (`settings/prompts/page.tsx`)
+
+- CRUD für Systemprompts
+- **Checkbox „Als Dokumententyp-Prompt verwenden"** (`is_document_type_prompt`)
+  - Violet Info-Box klappt auf: zeigt erwartetes KI-Antwortformat + vollständige Typenliste (15 Typen, ID 1 fett als Eingangsrechnung mit Hinweis auf vollständige Extraktion)
+  - Hinweis: Nur ein Prompt kann gleichzeitig als Dokumententyp-Prompt markiert sein
+- Liste: violet Badge „Dokumententyp-Prompt" bei `is_document_type_prompt=true`
+
 ### Bekannte Fallstricke
 
 - **Infinite render loop in `useCallback`**: Nie State-Variablen in Dependency-Array aufnehmen, die innerhalb des Callbacks gesetzt werden. Stattdessen `useRef` verwenden (z.B. `batchLoadedRef` in `/imports/[id]/page.tsx`).
@@ -455,6 +595,9 @@ Behandelt sowohl `number` als auch Strings wie `"719,99 €"`:
 - **`NameError: cannot access local variable 'images_b64'`**: Entsteht wenn `del images_b64` vor `len(images_b64)` steht. Seitenanzahl immer zuerst in `page_count` sichern, dann `del`.
 - **`TypeError: Unrecognized arguments` bei `InvoiceExtraction`**: `_map_new_format()` gibt `supplier_street/zip/city` zurück, die keine DB-Spalten sind. Vor `save_extraction` mit `_SUPPLIER_ONLY_KEYS` herausfiltern.
 - **`ki_*`-Spalten fehlen (Migration 0009 nicht angewendet)**: `save_extraction` fängt den Commit-Fehler ab und wiederholt den Schreibvorgang ohne KI-Stats. Migration nachholen: `alembic upgrade head`.
+- **`KeyError` beim Container-Neustart nach Migration**: `down_revision` in einer neuen Migration muss die `revision`-ID der Vorgänger-Migration verwenden (nicht den Dateinamen). Beispiel: `0011_document_types.py` hat `down_revision = "0010"` (nicht `"0010_ki_total_duration"`).
+- **KI-Stats nicht angezeigt für Nicht-Eingangsrechnungen**: `DocumentDetail` erbt von `DocumentRead`, nicht von `DocumentListRead`. Deshalb müssen `ki_input_tokens`, `ki_output_tokens`, `ki_total_duration` **explizit** in `DocumentDetail` deklariert werden. Das KI-Modal liest `viewedDoc.ki_input_tokens` (nicht `viewedDoc.extraction?.ki_input_tokens`), damit auch Dokumente ohne `InvoiceExtraction` Stats haben.
+- **Dokumententyp-Prompt: Nur einer gleichzeitig aktiv**: `_clear_doc_type_prompt(db)` muss vor dem Setzen von `is_document_type_prompt=True` aufgerufen werden. Wird in `crud/system_prompt.py` in `create()` und `update()` gehandhabt.
 
 ### Wichtige Abhängigkeiten
 
@@ -499,10 +642,11 @@ Container Manager → jeweiliger Container → Protokoll
 
 ```
 ImportBatch  1──n  Document  1──1  InvoiceExtraction  n──1  Supplier
-                              1──n  OrderPosition
+                   │          1──n  OrderPosition
+                   n──1  DocumentType
 AIConfig        (referenziert von ImportBatch.ai_config_id)
 ImageSettings   (Singleton, globale Bildkonvertierungseinstellungen)
-SystemPrompt    (Standard-Prompt für KI-Extraktion)
+SystemPrompt    (Standard-Prompt + optionaler Dokumententyp-Prompt)
 ProcessingSettings (Singleton, import_concurrency + ai_concurrency)
 ```
 
@@ -514,6 +658,8 @@ ProcessingSettings (Singleton, import_concurrency + ai_concurrency)
 | `0002_system_prompts.py` | `system_prompts`-Tabelle |
 | `0003_supplier.py` | `suppliers`-Tabelle + `supplier_id` FK auf `invoice_extractions` |
 | `0009_ki_stats_on_invoice_extractions.py` | 5 `ki_*`-Spalten auf `invoice_extractions` (nullable) |
+| `0011_document_types.py` | `document_types`-Tabelle (15 vordefinierte Typen), `document_type_id` FK auf `documents`, `is_document_type_prompt` auf `system_prompts` |
+| `0012_doc_ki_stats.py` | `doc_ki_input_tokens`, `doc_ki_output_tokens`, `doc_ki_total_duration` auf `documents` (Fallback-Stats für Nicht-Eingangsrechnungen ohne InvoiceExtraction) |
 
 ### Import-Status-Flow
 

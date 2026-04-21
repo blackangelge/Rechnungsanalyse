@@ -114,6 +114,17 @@ def update_comment(db: Session, doc_id: int, comment: str | None) -> Document | 
     return obj
 
 
+def update_document_type(db: Session, doc_id: int, type_id: int | None) -> Document | None:
+    """Setzt den erkannten Dokumententyp eines Dokuments."""
+    obj = db.get(Document, doc_id)
+    if obj is None:
+        return None
+    obj.document_type_id = type_id
+    db.commit()
+    db.refresh(obj)
+    return obj
+
+
 def get_by_id_with_details(db: Session, doc_id: int) -> Document | None:
     """
     Gibt ein Dokument inkl. Extraktion und Bestellpositionen zurück.
@@ -124,6 +135,7 @@ def get_by_id_with_details(db: Session, doc_id: int) -> Document | None:
         .options(
             joinedload(Document.extraction),
             joinedload(Document.order_positions),
+            joinedload(Document.document_type),
         )
         .filter(Document.id == doc_id)
         .first()
@@ -144,6 +156,7 @@ def get_all_filtered(
     has_extraction: bool | None = None,
     supplier_name_filter: str | None = None,
     doc_id: int | None = None,
+    document_type_ids: list[int] | None = None,
 ) -> list[Document]:
     """
     Gibt alle Dokumente zurück, optional gefiltert.
@@ -151,7 +164,10 @@ def get_all_filtered(
     Für Betragsfilter, KI-Filter und Lieferantenfilter wird ein Outer Join
     auf invoice_extractions gemacht. Der Join wird nur einmal ausgeführt.
     """
-    query = db.query(Document).options(joinedload(Document.extraction))
+    query = db.query(Document).options(
+        joinedload(Document.extraction),
+        joinedload(Document.document_type),
+    )
 
     # Soft-Delete-Filter: standardmäßig nur nicht-gelöschte Dokumente anzeigen
     if not include_deleted:
@@ -204,6 +220,9 @@ def get_all_filtered(
         query = query.filter(Document.page_count <= page_max)
     if doc_id is not None:
         query = query.filter(Document.id == doc_id)
+
+    if document_type_ids:
+        query = query.filter(Document.document_type_id.in_(document_type_ids))
 
     return query.order_by(Document.id.desc()).all()
 
