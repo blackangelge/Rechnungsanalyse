@@ -23,7 +23,7 @@ interface Filters {
 
 export default function DashboardPage() {
   const [batches, setBatches] = useState<ImportBatch[]>([]);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [filters, setFilters] = useState<Filters>({ company: "", years: [] });
 

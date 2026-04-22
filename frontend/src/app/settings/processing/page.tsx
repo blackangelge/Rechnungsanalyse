@@ -6,7 +6,7 @@ import { ProcessingSettings, processingSettingsApi, backupApi, extractApiError }
 export default function ProcessingSettingsPage() {
   const [settings, setSettings] = useState<ProcessingSettings | null>(null);
   const [importConcurrency, setImportConcurrency] = useState(10);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [successMsg, setSuccessMsg] = useState<string | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
@@ -28,7 +28,9 @@ export default function ProcessingSettingsPage() {
       const a = document.createElement("a");
       a.href = url;
       a.download = `rechnungsanalyse-backup-${new Date().toISOString().slice(0, 10)}.json`;
+      document.body.appendChild(a);
       a.click();
+      document.body.removeChild(a);
       URL.revokeObjectURL(url);
     } catch (err) {
       setBackupError(extractApiError(err, "Fehler beim Erstellen des Backups"));

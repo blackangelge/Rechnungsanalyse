@@ -20,6 +20,7 @@ const BASE =
 export const apiClient = axios.create({
   baseURL: BASE,
   headers: { "Content-Type": "application/json" },
+  timeout: 30000, // 30 Sekunden Timeout — verhindert ewiges Hängen bei Netzwerkproblemen
 });
 
 // Array-Parameter ohne Klammern serialisieren: batch_ids=1&batch_ids=2

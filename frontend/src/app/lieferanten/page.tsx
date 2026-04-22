@@ -101,7 +101,7 @@ function SupplierEditModal({
 
 export default function LieferantenPage() {
   const [suppliers, setSuppliers] = useState<Supplier[]>([]);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [editSupplier, setEditSupplier] = useState<Supplier | null>(null);
   const [duplicates, setDuplicates] = useState<Supplier[][] | null>(null);

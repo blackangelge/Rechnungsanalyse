@@ -29,7 +29,7 @@ export default function ImportDetailPage() {
   // Aggregierte KI-Statistiken für diesen Batch
   const [kiStats, setKiStats] = useState<BatchKiStats | null>(null);
 
-  const [metaLoading, setMetaLoading] = useState(true);
+  const [metaLoading, setMetaLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   // Ref to track whether batch was ever successfully loaded (avoids `batch` in deps)

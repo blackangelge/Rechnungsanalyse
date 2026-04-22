@@ -14,6 +14,7 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
+import { useEffect, useState } from "react";
 
 /** Navigationspunkte der Anwendung */
 const NAV_LINKS = [
@@ -30,6 +31,8 @@ const NAV_LINKS = [
 
 export default function Nav() {
   const pathname = usePathname();
+  const [jsOk, setJsOk] = useState(false);
+  useEffect(() => { setJsOk(true); }, []);
 
   return (
     <nav className="border-b bg-white shadow-sm">
@@ -37,6 +40,9 @@ export default function Nav() {
         {/* Logo / App-Titel */}
         <Link href="/dashboard" className="text-lg font-bold tracking-tight text-blue-700">
           Rechnungsanalyse
+          <span className={`ml-2 text-xs font-normal px-1.5 py-0.5 rounded ${jsOk ? "bg-green-100 text-green-700" : "bg-red-100 text-red-700"}`}>
+            {jsOk ? "JS ✓" : "JS ✗"}
+          </span>
         </Link>
 
         {/* Navigationslinks */}

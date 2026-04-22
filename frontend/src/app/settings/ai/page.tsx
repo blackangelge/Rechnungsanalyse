@@ -16,7 +16,7 @@ import AIConfigForm from "@/components/settings/AIConfigForm";
 
 export default function AISettingsPage() {
   const [configs, setConfigs] = useState<AIConfig[]>([]);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   // Zeigt das Formular: undefined = neues Erstellen, AIConfig = Bearbeiten
