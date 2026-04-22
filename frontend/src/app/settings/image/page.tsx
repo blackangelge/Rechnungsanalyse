@@ -24,7 +24,7 @@ const DPI_PRESETS = [
 
 export default function ImageSettingsPage() {
   const [settings, setSettings] = useState<ImageSettings | null>(null);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState(false);
@@ -80,8 +80,6 @@ export default function ImageSettingsPage() {
       setSaving(false);
     }
   }
-
-  if (loading) return <p className="text-sm text-gray-500">Lade Einstellungen...</p>;
 
   return (
     <div className="max-w-xl space-y-6">

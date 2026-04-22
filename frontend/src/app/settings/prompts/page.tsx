@@ -12,7 +12,7 @@ import { SystemPrompt, systemPromptsApi } from "@/lib/api";
 
 export default function SystemPromptsPage() {
   const [prompts, setPrompts] = useState<SystemPrompt[]>([]);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   // Formular-Zustand

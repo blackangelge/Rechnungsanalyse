@@ -6,7 +6,7 @@ Läuft auf einem Synology NAS via Docker Compose (Container Manager GUI — kein
 ## Architektur
 
 ```
-Frontend  (Next.js 15, React 19, TypeScript, Tailwind 4)  → Port 3100
+Frontend  (Next.js 16, React 19, TypeScript, Tailwind 4)  → Port 3100
 Backend   (FastAPI, Python 3.12, SQLAlchemy 2, Alembic)   → Port 8100
 Datenbank (PostgreSQL 16)                                  → intern
 ```
@@ -598,11 +598,15 @@ Behandelt sowohl `number` als auch Strings wie `"719,99 €"`:
 - **`KeyError` beim Container-Neustart nach Migration**: `down_revision` in einer neuen Migration muss die `revision`-ID der Vorgänger-Migration verwenden (nicht den Dateinamen). Beispiel: `0011_document_types.py` hat `down_revision = "0010"` (nicht `"0010_ki_total_duration"`).
 - **KI-Stats nicht angezeigt für Nicht-Eingangsrechnungen**: `DocumentDetail` erbt von `DocumentRead`, nicht von `DocumentListRead`. Deshalb müssen `ki_input_tokens`, `ki_output_tokens`, `ki_total_duration` **explizit** in `DocumentDetail` deklariert werden. Das KI-Modal liest `viewedDoc.ki_input_tokens` (nicht `viewedDoc.extraction?.ki_input_tokens`), damit auch Dokumente ohne `InvoiceExtraction` Stats haben.
 - **Dokumententyp-Prompt: Nur einer gleichzeitig aktiv**: `_clear_doc_type_prompt(db)` muss vor dem Setzen von `is_document_type_prompt=True` aufgerufen werden. Wird in `crud/system_prompt.py` in `create()` und `update()` gehandhabt.
+- **React 19 Hydration-Mismatch / Buttons reagieren nicht**: Entsteht wenn SSR-Output und initialer Client-Render abweichen. Häufigste Ursache: `useState(true)` als initialer Ladezustand. Die Seite rendert auf dem Server ohne Ladeindikator (nach dem Fix), aber der alte Client-JS-Bundle (aus `.next/`-Cache) erwartet noch `true`. React 19 bricht die Hydration komplett ab → keine Event-Handler → Buttons tot. **Regel:** Ladestate immer mit `useState(false)` initialisieren; `setLoading(true)` nur innerhalb von `load()` setzen, nicht auf Top-Level.
+- **`.next/`-Cache überlebt Container-Neustart (NAS-spezifisch)**: Da `frontend:/app` als Docker-Volume gemountet ist, liegt der Turbopack-Cache unter `frontend/.next/` auf dem NAS-Host und überlebt Neustarts. Inotify funktioniert auf SMB/NFS-Mounts nicht → Turbopack erkennt keine Dateiänderungen → alte Client-Bundles werden weiterhin ausgeliefert. Lösung: `rm -rf /app/.next` am Anfang des Start-Kommandos in `docker-compose.yml` (bereits eingebaut).
+- **HMR WebSocket blockiert (NAS-Hostname)**: Next.js 16 blockiert cross-origin Anfragen zu `/_next/webpack-hmr` wenn der Zugriff über einen Hostnamen erfolgt (z.B. `http://nas:3100`). Symptom im Container-Log: `⚠ Blocked cross-origin request to Next.js dev resource /_next/webpack-hmr from "nas"`. Lösung: `allowedDevOrigins: ["nas", "NAS-IP"]` in `next.config.ts` eintragen (bereits konfiguriert).
+- **Frontend startet nicht nach `&&`-Kette in docker-compose**: Wenn ein Schritt in `cmd1 && cmd2 && cmd3` fehlschlägt, werden alle nachfolgenden Schritte übersprungen. Startup-Kommando verwendet daher `;` als Trenner — jeder Schritt läuft unabhängig. `npm install` Fehler blockieren nicht mehr `npm run dev`.
 
 ### Wichtige Abhängigkeiten
 
 ```
-next 15, react 19, typescript 5, tailwindcss 4, axios
+next 16.2.4, react 19, typescript 6, tailwindcss 4, axios
 ```
 
 ---
@@ -618,7 +622,19 @@ Frontend (Next.js): next dev aktiv → Dateiänderung genügt
 Container-Neustart nur nötig bei:
   - neuen Python-Paketen (requirements.txt)
   - neuen npm-Paketen (package.json)
+  - Änderungen an next.config.ts (wird nicht hot-reloaded)
 ```
+
+> **Hinweis NAS/Turbopack:** Inotify funktioniert nicht auf SMB/Docker-Mounts. HMR (Hot Module Replacement) ist daher nicht verfügbar — Dateiänderungen wirken erst nach einem Browser-Reload (F5), nicht automatisch. Der `.next/`-Cache wird bei jedem Container-Start automatisch gelöscht (`rm -rf /app/.next` im Startup-Kommando), damit keine veralteten Client-Bundles ausgeliefert werden.
+
+### Frontend-Cache manuell löschen
+
+Falls das Frontend nach einem Update seltsam reagiert (Buttons tot, „JS ✗" im Nav-Badge, Seiten frieren ein):
+
+1. Container Manager → Frontend-Container → **Stoppen**
+2. Den Ordner `\\nas\docker\_rechnungsanalyse\frontend\.next\` auf dem NAS löschen
+3. Container wieder **Starten**
+4. Browser-Cache leeren (`Strg+Shift+R`) und neu laden
 
 ### DB-Migration erstellen
 
