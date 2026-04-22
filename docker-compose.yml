@@ -53,4 +53,11 @@ services:
       - "3100:3000"
     depends_on:
       - backend
-    command: sh -c "rm -rf /app/.next; mkdir -p /app/@eaDir; echo 'export default function Default() { return null; }' > /app/@eaDir/default.js; npm install --prefer-offline 2>/dev/null || npm install; npm run dev"
+    command: >
+      sh -c "
+        rm -rf /app/.next;
+        find /app/src /app -maxdepth 4 -type d -name '@eaDir' 2>/dev/null |
+          xargs -I{} sh -c 'echo \"export default function Default() { return null; }\" > {}/default.js';
+        npm install --prefer-offline 2>/dev/null || npm install;
+        npm run dev
+      "
