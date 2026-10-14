@@ -282,7 +282,7 @@ def _db_save_used_prompts(
     try:
         crud.document.save_used_prompts(db, doc_id, system_prompt, doc_type_prompt)
     except Exception as exc:
-        # z.B. Migration 0013 noch nicht angewendet — Analyse darf deshalb nicht scheitern
+        # Prompt-Snapshot ist Zusatzinformation — ein Fehler hier darf die Analyse nicht abbrechen
         db.rollback()
         logger.warning("Systemprompts für #%d nicht gespeichert: %s", doc_id, exc)
     finally:

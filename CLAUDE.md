@@ -353,8 +353,9 @@ Endpunkte: `POST /api/documents/{id}/validate` (Regeln erneut, frühere Korrektu
 
 **Gespeicherte Prompts:** Zu Beginn jeder Analyse wird der Wortlaut des verwendeten Extraktions- und
 Dokumententyp-Prompts in `documents.used_system_prompt` / `used_doc_type_prompt` gespeichert (bei Fallback der
-Default-Prompt aus `ai_service`), der Nachprüfungs-Prompt in `used_recheck_prompt`. Die Speicherung fängt
-Fehler ab (Migration 0013 fehlt → Analyse läuft trotzdem). Sichtbar im KI-Modal der Belege-Seite.
+Default-Prompt aus `ai_service`), der Nachprüfungs-Prompt in `used_recheck_prompt`. Sichtbar im KI-Modal der Belege-Seite.
+**Migration 0013 ist Pflicht:** `docker-compose.yml` führt `alembic upgrade head` bei jedem Backend-Start aus; ohne die
+neuen Spalten schlägt jede Dokument-Abfrage fehl.
 
 **Tests:** `cd backend && pip install -r requirements-dev.txt && pytest`
 
