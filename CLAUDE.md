@@ -126,9 +126,13 @@ alembic/
     ├── 0014_pdf_versions.py
     │                       # revision = "0014_pdf_versions"; document_versions, pdf_settings,
     │                       # documents.pdf_version / analyzed_pdf_version
-    └── 0015_workflows.py
-                            # revision = "0015_workflows"; workflows, suppliers.workflow_id,
-                            # documents.used_workflow_* / workflow_trace
+    ├── 0015_workflows.py
+    │                       # revision = "0015_workflows"; workflows, suppliers.workflow_id,
+    │                       # documents.used_workflow_* / workflow_trace
+    └── 0016_search_indexes.py
+                            # revision = "0016_search_indexes"; B-Tree-Indizes (Filter-Spalten, Fremdschlüssel — u.a.
+                            # order_positions.document_id) + pg_trgm-GIN-Indizes für ILIKE '%…%' (übersprungen, falls
+                            # die Erweiterung nicht anlegbar ist)
 ```
 
 ### Import-Ablauf
@@ -334,6 +338,26 @@ Schließt Nicht-Eingangsrechnungen ab:
 `_set_error(doc_id, message)` — Hilfsfunktion, öffnet eigene Session nur zum Setzen des Fehlerstatus.
 
 **Fehlerbehandlung in `save_extraction`:** Bei fehlgeschlagenem DB-Commit (z.B. Migration noch nicht angewendet) → `db.rollback()` + Retry ohne KI-Stats-Felder.
+
+### Große Bestände: paginierte Belegliste (`crud/document.py`, `routers/documents.py`)
+
+Die Belege-Seite lädt **nur die aktuelle Seite** (Standard 50, wählbar 25–200); getestet mit 15.000 Belegen.
+
+- `GET /api/documents?limit=&offset=` + alle Filter → die Gesamtzahl steht im Header **`X-Total-Count`** (wird mit
+  `Access-Control-Expose-Headers` freigegeben). Ohne `limit` werden weiterhin alle Treffer geliefert (alte Schnittstelle,
+  nur für kleine Bestände).
+- `GET /api/documents/ids` (+ dieselben Filter) → alle Treffer-IDs für „Alle N Treffer auswählen";
+  `GET /api/documents/filter-options` → Jahre/Firmen für die Dropdowns (früher aus den geladenen Belegen abgeleitet —
+  mit Paginierung nicht mehr möglich).
+- **Schwere Spalten werden in der Liste nicht geladen** (`defer`): `invoice_extractions.raw_response`/`validation_details` und die
+  `documents.used_*`/Workflow-Snapshot-Spalten. Bei 15.000 Belegen sind das hunderte MB (Messung: alte Abfrage 4,1 s, paginiert
+  16–44 ms). Wer in der Liste neue Felder braucht, darf sie **nicht** aus `raw_response` lesen — dafür gibt es `GET /{id}` (Detail).
+  `tests/test_document_list.py` prüft per SQL-Mitschnitt, dass die Listenabfrage diese Spalten nicht anfasst.
+- Filter laufen über `_filtered_query` (gemeinsam für Liste, Zähler und ID-Liste): neue Filter nur dort ergänzen und in `_FILTER_KEYS`
+  eintragen.
+- Migration 0016: Indizes auf Filter-Spalten und Fremdschlüssel (PostgreSQL legt für FKs keine an) + `pg_trgm`-GIN-Indizes für die
+  Teilstring-Suche (`ILIKE '%…%'`: Lieferant, Firma, Dateiname, Artikelbezeichnung/-nummer).
+- Neue Listen mit potenziell tausenden Zeilen immer serverseitig paginieren und schwere Spalten deferieren.
 
 ### Plausibilitätsprüfung (`services/plausibility_service.py`)
 
@@ -658,6 +682,10 @@ Typen:
 
 ### Belege-Seite (`belege/page.tsx`)
 
+- **Paginiert:** `Pager` oben und unten (Seitengröße, « ‹ › », „x–y von N"), „Alle N Treffer auswählen" (über alle Seiten),
+  Auswahl bleibt beim Blättern erhalten. Der Auto-Refresh (alle 5 s, solange Belege verarbeitet werden) lädt die **aktuelle**
+  Seite neu (`pageRef`) und setzt sie nicht zurück; er läuft auch weiter, wenn auf der aktuellen Seite nichts verarbeitet wird, aber
+  irgendwo Belege `processing` sind. Infos-Ansicht: „Beleg N / M" zählt über alle Treffer, Vor/Zurück lädt bei Bedarf die Nachbarseite.
 - Filter: Firma, Jahr, Status, Dokumententyp, Import, Betrag von/bis, Seiten von/bis, Plausibilität (Manuell prüfen / Korrigiert / In Ordnung)
 - Tabelle: Checkbox, ID, Firma, Jahr, Dateiname, Seiten, Betrag, Status, Dokumententyp, Rechnungsnr., Lieferant, PDF-Link
 - Betrag/Rechnungsnr./Lieferant/Dokumententyp kommen direkt aus `DocumentItem` (Backend liefert sie mit)
@@ -856,6 +884,7 @@ Workflow     1──n  Supplier          (Supplier.workflow_id, optional)
 | `0013_plausibility_and_prompt_snapshot.py` | `validation_status`/`validation_details` auf `invoice_extractions`; `used_system_prompt`, `used_doc_type_prompt`, `used_recheck_prompt` auf `documents` |
 | `0014_pdf_versions.py` | `document_versions`-Tabelle, `pdf_settings` (Singleton), `pdf_version`/`analyzed_pdf_version` auf `documents` |
 | `0015_workflows.py` | `workflows`-Tabelle, `suppliers.workflow_id` (FK, SET NULL), `used_workflow_id/_name/_graph` + `workflow_trace` auf `documents` |
+| `0016_search_indexes.py` | Indizes für Beleg-/Artikelsuche (B-Tree + `pg_trgm`), siehe „Große Bestände" |
 
 ### Import-Status-Flow
 

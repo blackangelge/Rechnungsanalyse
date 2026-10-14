@@ -26,7 +26,7 @@ class Document(Base):
 
     # Fremdschlüssel zum Import-Batch (CASCADE: Dokument wird mit Batch gelöscht)
     batch_id: Mapped[int] = mapped_column(
-        Integer, ForeignKey("import_batches.id", ondelete="CASCADE"), nullable=False
+        Integer, ForeignKey("import_batches.id", ondelete="CASCADE"), nullable=False, index=True
     )
 
     # Ursprünglicher Dateiname (vor dem Umbenennen)
@@ -43,8 +43,8 @@ class Document(Base):
     page_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
 
     # Denormalisiert aus dem Batch für einfachere Abfragen / Filterung
-    company: Mapped[str] = mapped_column(String(255), nullable=False)
-    year: Mapped[int] = mapped_column(Integer, nullable=False)
+    company: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    year: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
 
     # Optionaler, dokument-spezifischer Kommentar des Nutzers
     comment: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -54,7 +54,7 @@ class Document(Base):
     # processing  = KI-Extraktion läuft
     # done        = erfolgreich extrahiert
     # error       = Fehler bei Kopieren oder Extraktion
-    status: Mapped[str] = mapped_column(String(50), default="pending", nullable=False)
+    status: Mapped[str] = mapped_column(String(50), default="pending", nullable=False, index=True)
 
     # Fehlerbeschreibung, falls status == "error"
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -72,7 +72,7 @@ class Document(Base):
 
     # Erkannter Dokumententyp (durch KI-Klassifikation, optional)
     document_type_id: Mapped[int | None] = mapped_column(
-        Integer, ForeignKey("document_types.id", ondelete="SET NULL"), nullable=True
+        Integer, ForeignKey("document_types.id", ondelete="SET NULL"), nullable=True, index=True
     )
 
     # KI-Stats direkt auf dem Dokument — befüllt für Nicht-Eingangsrechnungen,

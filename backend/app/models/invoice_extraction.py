@@ -39,12 +39,13 @@ class InvoiceExtraction(Base):
         Integer,
         ForeignKey("suppliers.id", ondelete="SET NULL"),
         nullable=True,
+        index=True,
     )
     supplier: Mapped["Supplier | None"] = relationship("Supplier")
 
     # ─── Lieferantendaten ────────────────────────────────────────────────────
     # Vollständige Bezeichnung des Lieferanten
-    supplier_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    supplier_name: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
 
     # Vollständige Anschrift des Lieferanten (mehrzeilig möglich)
     supplier_address: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -73,7 +74,7 @@ class InvoiceExtraction(Base):
     customer_number: Mapped[str | None] = mapped_column(String(100), nullable=True)
 
     # Rechnungsnummer des Lieferanten
-    invoice_number: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    invoice_number: Mapped[str | None] = mapped_column(String(100), nullable=True, index=True)
 
     # Rechnungsdatum (Ausstellungsdatum)
     invoice_date: Mapped[date | None] = mapped_column(Date, nullable=True)
@@ -116,7 +117,7 @@ class InvoiceExtraction(Base):
 
     # ─── Plausibilitätsprüfung ───────────────────────────────────────────────
     # ok | corrected | ai_corrected | needs_review | manual_ok | unchecked
-    validation_status: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    validation_status: Mapped[str | None] = mapped_column(String(30), nullable=True, index=True)
     # JSON: {"issues": [...], "corrections": [...], "checks_run": n, ...}
     validation_details: Mapped[str | None] = mapped_column(Text, nullable=True)
 
