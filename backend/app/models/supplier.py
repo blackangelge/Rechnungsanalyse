@@ -7,7 +7,7 @@ dedupliziert — zuerst nach IBAN, dann nach VAT-ID, dann nach Name.
 
 from datetime import datetime
 
-from sqlalchemy import DateTime, Integer, String, Text, func
+from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database import Base
@@ -44,6 +44,11 @@ class Supplier(Base):
     bank_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     iban: Mapped[str | None] = mapped_column(String(50), nullable=True)
     bic: Mapped[str | None] = mapped_column(String(20), nullable=True)
+
+    # Eigener Analyse-Workflow für diesen Lieferanten (None = Standard-Workflow)
+    workflow_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("workflows.id", ondelete="SET NULL"), nullable=True
+    )
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False

@@ -20,3 +20,4 @@ from app.models.pdf_settings import PdfSettings  # noqa: F401
 from app.models.processing_settings import ProcessingSettings  # noqa: F401
 from app.models.system_log import SystemLog  # noqa: F401
 from app.models.system_prompt import SystemPrompt  # noqa: F401
+from app.models.workflow import Workflow  # noqa: F401

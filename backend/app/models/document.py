@@ -91,6 +91,13 @@ class Document(Base):
     used_doc_type_prompt: Mapped[str | None] = mapped_column(Text, nullable=True)
     used_recheck_prompt:  Mapped[str | None] = mapped_column(Text, nullable=True)
 
+    # Verwendeter Workflow: Snapshot des Graphen (bleibt auch nach Änderung/Löschen des
+    # Workflows erhalten) und Ablaufprotokoll der einzelnen Knoten.
+    used_workflow_id:    Mapped[int | None] = mapped_column(Integer, nullable=True)
+    used_workflow_name:  Mapped[str | None] = mapped_column(String(255), nullable=True)
+    used_workflow_graph: Mapped[str | None] = mapped_column(Text, nullable=True)
+    workflow_trace:      Mapped[str | None] = mapped_column(Text, nullable=True)
+
     # Beziehung zum übergeordneten Batch
     batch: Mapped["ImportBatch"] = relationship(  # noqa: F821
         "ImportBatch", back_populates="documents"
@@ -152,6 +159,25 @@ class Document(Base):
         if self.extraction and self.extraction.ki_total_duration is not None:
             return self.extraction.ki_total_duration
         return self.doc_ki_total_duration
+
+    @staticmethod
+    def _json_or_none(raw: str | None):
+        if not raw:
+            return None
+        try:
+            return json.loads(raw)
+        except ValueError:
+            return None
+
+    @property
+    def used_workflow(self) -> dict | None:
+        """Graph des bei der letzten Analyse verwendeten Workflows (Snapshot)."""
+        return self._json_or_none(self.used_workflow_graph)
+
+    @property
+    def workflow_run(self) -> list | None:
+        """Ablaufprotokoll der Knoten der letzten Analyse."""
+        return self._json_or_none(self.workflow_trace)
 
     @property
     def validation_status(self) -> str | None:

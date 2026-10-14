@@ -27,6 +27,7 @@ class SupplierUpdate(SupplierBase):
 class SupplierRead(SupplierBase):
     id: int
     document_count: int = 0
+    workflow_id: int | None = None
     created_at: datetime
     updated_at: datetime
 

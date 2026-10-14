@@ -6,6 +6,7 @@ Endpunkte:
   GET    /api/suppliers/duplicates   — potenzielle Duplikate
   GET    /api/suppliers/{id}         — einzelner Lieferant
   PUT    /api/suppliers/{id}         — Lieferant aktualisieren
+  PUT    /api/suppliers/{id}/workflow — Analyse-Workflow des Lieferanten festlegen
   DELETE /api/suppliers/{id}         — Lieferant löschen
 """
 
@@ -15,6 +16,7 @@ from sqlalchemy.orm import Session
 from app import crud
 from app.database import get_db
 from app.schemas.supplier import SupplierRead, SupplierUpdate
+from app.schemas.workflow import SupplierWorkflowUpdate
 
 router = APIRouter(prefix="/api/suppliers", tags=["Lieferanten"])
 
@@ -56,6 +58,17 @@ def get_supplier(supplier_id: int, db: Session = Depends(get_db)):
 def update_supplier(supplier_id: int, payload: SupplierUpdate, db: Session = Depends(get_db)):
     """Aktualisiert einen Lieferanten."""
     obj = crud.supplier.update(db, supplier_id, payload.model_dump())
+    if obj is None:
+        raise HTTPException(status_code=404, detail="Lieferant nicht gefunden")
+    return _with_count(db, obj)
+
+
+@router.put("/{supplier_id}/workflow", response_model=SupplierRead)
+def set_supplier_workflow(supplier_id: int, payload: SupplierWorkflowUpdate, db: Session = Depends(get_db)):
+    """Legt den Analyse-Workflow für diesen Lieferanten fest (None = Standard-Workflow)."""
+    if payload.workflow_id is not None and crud.workflow.get_by_id(db, payload.workflow_id) is None:
+        raise HTTPException(status_code=404, detail="Workflow nicht gefunden")
+    obj = crud.workflow.set_supplier_workflow(db, supplier_id, payload.workflow_id)
     if obj is None:
         raise HTTPException(status_code=404, detail="Lieferant nicht gefunden")
     return _with_count(db, obj)

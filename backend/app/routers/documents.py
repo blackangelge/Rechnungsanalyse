@@ -68,6 +68,9 @@ class AnalyzeRequest(BaseModel):
     document_ids: list[int]
     ai_config_id: Optional[int] = None
     system_prompt_id: Optional[int] = None
+    # Workflow (Analyse-Ablauf). None = automatisch: Workflow des Lieferanten, sonst Standard-Workflow,
+    # sonst der klassische Ablauf.
+    workflow_id: Optional[int] = None
 
 
 class AnalyzeResponse(BaseModel):
@@ -169,6 +172,9 @@ async def analyze_documents(
         if default_sp:
             system_prompt_text = default_sp.content
 
+    if payload.workflow_id is not None and crud.workflow.get_by_id(db, payload.workflow_id) is None:
+        raise HTTPException(status_code=404, detail=f"Workflow #{payload.workflow_id} nicht gefunden")
+
     # Validierte Dokumente laden und sofort auf "processing" setzen
     from app.models.document import Document as DocModel
     valid_ids: list[int] = []
@@ -199,6 +205,7 @@ async def analyze_documents(
             document_ids=valid_ids,
             ai_config_id=ai_config_id,
             system_prompt_text=system_prompt_text,
+            workflow_id=payload.workflow_id,
         )
     )
 
@@ -275,7 +282,9 @@ def _db_analyze_read(doc_id: int, ai_config_id: int) -> dict | None:
         db.close()
 
 
-def _db_prepare_pdf(doc_id: int, original_filename: str, batch_id: int | None) -> None:
+def _db_prepare_pdf(
+    doc_id: int, original_filename: str, batch_id: int | None, allow_auto_trim: bool = True
+) -> None:
     """
     Vor dem Rendern (sync, für asyncio.to_thread): optional automatisch kürzen
     (neue PDF-Version) und die analysierte PDF-Version am Dokument festhalten.
@@ -287,7 +296,7 @@ def _db_prepare_pdf(doc_id: int, original_filename: str, batch_id: int | None) -
         if doc is None:
             return
         pdf_settings = crud.pdf_settings.get_or_create(db)
-        if pdf_settings.auto_trim_enabled:
+        if allow_auto_trim and pdf_settings.auto_trim_enabled:
             try:
                 version = pdf_edit_service.auto_trim(db, doc, pdf_settings.auto_trim_max_pages)
                 if version is not None:
@@ -366,9 +375,11 @@ async def _plausibility_pass(
     order_positions: list,
     raw_response: str,
     ki_stats: dict,
+    auto_correct: bool = True,
+    ai_recheck: bool = True,
 ) -> tuple[dict, list, str, dict, dict | None]:
     """
-    Plausibilitätsprüfung in drei Stufen:
+    Plausibilitätsprüfung in drei Stufen (Stufe 1 und 2 lassen sich im Workflow abschalten):
       1. rechnerische Prüfung inkl. automatischer Einheiten-Korrektur
       2. bei Auffälligkeiten: zweite KI-Abfrage mit Prüfhinweisen
       3. besteht auch diese nicht: Status "needs_review" (manuelle Bearbeitung)
@@ -381,11 +392,11 @@ async def _plausibility_pass(
 
     ps = plausibility_service
     result = await asyncio.to_thread(
-        ps.validate_invoice, extracted_fields, order_positions, _parse_raw(raw_response)
+        ps.validate_invoice, extracted_fields, order_positions, _parse_raw(raw_response), auto_correct
     )
     validation = result.to_dict()
     validation["method"] = "rules"
-    if result.status != ps.STATUS_NEEDS_REVIEW:
+    if result.status != ps.STATUS_NEEDS_REVIEW or not ai_recheck:
         return extracted_fields, order_positions, raw_response, ki_stats, validation
 
     # ── Stufe 2: zweite KI-Abfrage ───────────────────────────────────────────
@@ -626,6 +637,7 @@ async def _run_analysis(
     document_ids: list[int],
     ai_config_id: int,
     system_prompt_text: str | None,
+    workflow_id: int | None = None,
 ) -> None:
     """
     Hintergrund-Coroutine: Analysiert alle Dokumente nacheinander (sequenziell).
@@ -640,7 +652,7 @@ async def _run_analysis(
 
     for doc_id in document_ids:
         try:
-            await _analyze_single(doc_id, ai_config_id, system_prompt_text)
+            await _analyze_single(doc_id, ai_config_id, system_prompt_text, workflow_id)
         except Exception as exc:
             logger.exception("Unbehandelter Fehler bei Dokument #%d: %s", doc_id, exc)
             await asyncio.to_thread(_set_error, doc_id, f"Unerwarteter Fehler: {exc}")
@@ -648,10 +660,40 @@ async def _run_analysis(
     logger.info("KI-Analyse abgeschlossen (%d Dokumente)", len(document_ids))
 
 
+def _db_resolve_workflow(doc_id: int, explicit_id: int | None) -> dict | None:
+    """
+    Wählt den Workflow für ein Dokument (sync, für asyncio.to_thread):
+      1. explizit gewählter Workflow
+      2. Workflow des (bereits bekannten) Lieferanten — greift bei erneuter Analyse
+      3. Standard-Workflow
+    Gibt None zurück, wenn keiner existiert → klassischer Ablauf.
+    """
+    import json as _json
+    db = SessionLocal()
+    try:
+        wf = crud.workflow.get_by_id(db, explicit_id) if explicit_id else None
+        source = "gewählt"
+        if wf is None:
+            doc = db.get(DocModel, doc_id)
+            supplier = doc.extraction.supplier if doc and doc.extraction else None
+            if supplier is not None and supplier.workflow_id:
+                wf = crud.workflow.get_by_id(db, supplier.workflow_id)
+                source = f"Lieferant {supplier.name}"
+        if wf is None:
+            wf = crud.workflow.get_default(db)
+            source = "Standard"
+        if wf is None:
+            return None
+        return {"id": wf.id, "name": wf.name, "graph": _json.loads(wf.graph), "source": source}
+    finally:
+        db.close()
+
+
 async def _analyze_single(
     doc_id: int,
     ai_config_id: int,
     system_prompt_text: str | None,
+    workflow_id: int | None = None,
 ) -> None:
     """
     Analysiert ein einzelnes Dokument — optional zweistufig.
@@ -669,6 +711,13 @@ async def _analyze_single(
 
     Ohne Dokumententyp-Systemprompt: direkt zur Rechnungsextraktion (alter Modus).
     """
+    # ── Workflow-Modus: Ablauf und Prompts kommen aus einem Workflow-Graphen ──
+    workflow = await asyncio.to_thread(_db_resolve_workflow, doc_id, workflow_id)
+    if workflow is not None:
+        from app.services import workflow_runner
+        await workflow_runner.analyze_with_workflow(doc_id, ai_config_id, system_prompt_text, workflow)
+        return
+
     # ── Phase 1: Alle Daten aus DB lesen (im Thread, nicht-blockierend) ──
     data = await asyncio.to_thread(_db_analyze_read, doc_id, ai_config_id)
     if data is None:

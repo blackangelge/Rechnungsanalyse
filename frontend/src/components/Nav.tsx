@@ -24,6 +24,7 @@ const NAV_LINKS = [
   { href: "/lieferanten", label: "Lieferanten" },
   { href: "/settings/ai", label: "KI-Einstellungen" },
   { href: "/settings/prompts", label: "Systemprompts" },
+  { href: "/settings/workflows", label: "Workflows" },
   { href: "/settings/image", label: "Bildeinstellungen" },
   { href: "/settings/processing", label: "Einstellungen" },
   { href: "/logs", label: "Logs" },
@@ -36,9 +37,9 @@ export default function Nav() {
 
   return (
     <nav className="border-b bg-white shadow-sm">
-      <div className="mx-auto flex max-w-7xl items-center justify-between px-6 py-3">
+      <div className="mx-auto flex max-w-7xl flex-wrap items-center justify-between gap-x-4 gap-y-2 px-6 py-3">
         {/* Logo / App-Titel */}
-        <Link href="/dashboard" className="text-lg font-bold tracking-tight text-blue-700">
+        <Link href="/dashboard" className="whitespace-nowrap text-lg font-bold tracking-tight text-blue-700">
           Rechnungsanalyse
           <span className={`ml-2 text-xs font-normal px-1.5 py-0.5 rounded ${jsOk ? "bg-green-100 text-green-700" : "bg-red-100 text-red-700"}`}>
             {jsOk ? "JS ✓" : "JS ✗"}
@@ -46,7 +47,7 @@ export default function Nav() {
         </Link>
 
         {/* Navigationslinks */}
-        <ul className="flex gap-1">
+        <ul className="flex flex-wrap gap-1">
           {NAV_LINKS.map(({ href, label }) => {
             const isActive = pathname === href || pathname.startsWith(href + "/");
             return (
@@ -54,7 +55,7 @@ export default function Nav() {
                 <Link
                   href={href}
                   className={[
-                    "rounded px-3 py-2 text-sm font-medium transition-colors",
+                    "whitespace-nowrap rounded px-2.5 py-2 text-sm font-medium transition-colors",
                     isActive
                       ? "bg-blue-600 text-white"
                       : "text-gray-600 hover:bg-gray-100 hover:text-gray-900",
