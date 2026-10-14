@@ -19,7 +19,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
@@ -81,8 +81,7 @@ class AnalyzeResponse(BaseModel):
 
 # ─── GET /api/documents/ ────────────────────────────────────────────────────
 
-@router.get("", response_model=list[DocumentListRead])
-def list_documents(
+def _document_filters(
     company: Optional[str] = None,
     year: Optional[int] = None,
     status: Optional[str] = None,
@@ -97,34 +96,51 @@ def list_documents(
     doc_id: Optional[int] = None,
     document_type_ids: Optional[list[int]] = Query(default=None),
     validation_status: Optional[list[str]] = Query(default=None),
+) -> dict:
+    """Gemeinsame Filter-Parameter für Liste, Anzahl und ID-Liste."""
+    return dict(
+        company=company, year=year, status=status, total_min=total_min, total_max=total_max,
+        page_min=page_min, page_max=page_max, batch_ids=batch_ids, include_deleted=include_deleted,
+        has_extraction=has_extraction, supplier_name_filter=supplier_name, doc_id=doc_id,
+        document_type_ids=document_type_ids, validation_statuses=validation_status,
+    )
+
+
+@router.get("", response_model=list[DocumentListRead])
+def list_documents(
+    response: Response,
+    filters: dict = Depends(_document_filters),
+    limit: Optional[int] = Query(default=None, ge=1, le=1000, description="Seitengröße (leer = alle)"),
+    offset: int = Query(default=0, ge=0),
     db: Session = Depends(get_db),
 ):
     """
-    Gibt alle Dokumente zurück, optional gefiltert.
-    validation_status filtert nach Ergebnis der Plausibilitätsprüfung
-    (ok, corrected, ai_corrected, needs_review, manual_ok, unchecked).
-    include_deleted=true zeigt auch soft-gelöschte Dokumente an.
-    has_extraction=true/false filtert nach KI-analysierten Dokumenten.
-    supplier_name filtert nach Lieferantenname (case-insensitive LIKE).
-    document_type_ids filtert nach Dokumententypen (mehrere möglich).
+    Gibt Dokumente zurück (neueste zuerst), optional gefiltert und paginiert.
+
+    Mit `limit`/`offset` wird nur eine Seite geladen; die Gesamtzahl der Treffer steht dann im
+    Header `X-Total-Count`. Ohne `limit` werden alle Treffer geliefert (alte Schnittstelle) —
+    bei vielen tausend Belegen bitte immer paginieren.
+
+    Filter: validation_status (ok, corrected, ai_corrected, needs_review, manual_ok, unchecked),
+    include_deleted (auch soft-gelöschte), has_extraction, supplier_name (LIKE, ohne Groß/Klein),
+    document_type_ids (mehrere), batch_ids (mehrere), company (LIKE), year, status, Beträge, Seiten.
     """
-    return crud.document.get_all_filtered(
-        db,
-        company=company,
-        year=year,
-        status=status,
-        total_min=total_min,
-        total_max=total_max,
-        page_min=page_min,
-        page_max=page_max,
-        batch_ids=batch_ids,
-        include_deleted=include_deleted,
-        has_extraction=has_extraction,
-        supplier_name_filter=supplier_name,
-        doc_id=doc_id,
-        document_type_ids=document_type_ids,
-        validation_statuses=validation_status,
-    )
+    if limit is not None:
+        response.headers["X-Total-Count"] = str(crud.document.count_filtered(db, **filters))
+        response.headers["Access-Control-Expose-Headers"] = "X-Total-Count"
+    return crud.document.get_all_filtered(db, limit=limit, offset=offset, **filters)
+
+
+@router.get("/ids", response_model=list[int])
+def list_document_ids(filters: dict = Depends(_document_filters), db: Session = Depends(get_db)):
+    """Alle Treffer-IDs zu den Filtern (neueste zuerst) — für „alle Treffer auswählen"."""
+    return crud.document.get_ids_filtered(db, **filters)
+
+
+@router.get("/filter-options")
+def get_filter_options(db: Session = Depends(get_db)):
+    """Werte für die Filter-Dropdowns (Jahre, Firmen) — unabhängig von der geladenen Seite."""
+    return crud.document.get_filter_options(db)
 
 
 # ─── POST /api/documents/analyze ────────────────────────────────────────────

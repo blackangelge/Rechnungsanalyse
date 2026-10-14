@@ -11,6 +11,8 @@ import {
   DocumentItem,
   DocumentType,
   ImportBatch,
+  Supplier,
+  suppliersApi,
   SystemPrompt,
   ValidationStatus,
   WorkflowListItem,
@@ -244,8 +246,17 @@ export default function BelegePage() {
   const [filterValidation, setFilterValidation] = useState("");
   const [activeFilters, setActiveFilters] = useState<DocumentFilter>({});
 
-  // Daten
+  // Daten (serverseitig paginiert: nur die aktuelle Seite liegt im Browser)
   const [documents, setDocuments] = useState<DocumentItem[]>([]);
+  const [total, setTotal] = useState(0);
+  const [page, setPage] = useState(0);
+  const [pageSize, setPageSize] = useState(50);
+  const [yearOptions, setYearOptions] = useState<number[]>([]);
+  const [supplierOptions, setSupplierOptions] = useState<string[]>([]);
+  // Aktuelle Seite/Größe für Timer und Callbacks (Refs, damit Auto-Refresh die Seite NICHT zurücksetzt)
+  const pageRef = useRef(0);
+  const pageSizeRef = useRef(50);
+  const activeFiltersRef = useRef<DocumentFilter>({});
   const [batches, setBatches] = useState<ImportBatch[]>([]);
   const [docTypes, setDocTypes] = useState<DocumentType[]>([]);
   const [loading, setLoading] = useState(false);
@@ -288,19 +299,32 @@ export default function BelegePage() {
   const [selectedWorkflowId, setSelectedWorkflowId] = useState<string>("");
   const [analyzing, setAnalyzing] = useState(false);
 
-  const refreshTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
-
   // ─── Laden ──────────────────────────────────────────────────────────────
 
-  const loadDocuments = useCallback(async (filters: DocumentFilter) => {
+  /**
+   * Lädt eine Seite. Ohne Angabe wird die AKTUELLE Seite neu geladen (Auto-Refresh, nach Aktionen).
+   * Liegt die Seite nach Änderungen außerhalb der Treffer (z.B. nach Löschen), wird die letzte Seite geladen.
+   */
+  const loadDocuments = useCallback(async (filters: DocumentFilter, pageIdx?: number): Promise<DocumentItem[]> => {
     setLoading(true);
     setError(null);
     try {
-      const docs = await documentsApi.list(filters);
-      setDocuments(docs);
+      let target = pageIdx ?? pageRef.current;
+      let res = await documentsApi.listPage(filters, target, pageSizeRef.current);
+      const lastPage = Math.max(0, Math.ceil(res.total / pageSizeRef.current) - 1);
+      if (target > lastPage) {
+        target = lastPage;
+        res = await documentsApi.listPage(filters, target, pageSizeRef.current);
+      }
+      pageRef.current = target;
+      setPage(target);
+      setDocuments(res.items);
+      setTotal(res.total);
+      return res.items;
     } catch (err) {
       setError(extractApiError(err, "Fehler beim Laden der Belege"));
       console.error(err);
+      return [];
     } finally {
       setLoading(false);
     }
@@ -308,14 +332,18 @@ export default function BelegePage() {
 
   const loadOptions = useCallback(async () => {
     try {
-      const [configs, prompts, allBatches, allDocTypes, allWorkflows] = await Promise.all([
+      const [configs, prompts, allBatches, allDocTypes, allWorkflows, options, allSuppliers] = await Promise.all([
         aiConfigsApi.list(),
         systemPromptsApi.list(),
         importsApi.list(),
         documentTypesApi.list(),
         workflowsApi.list().catch(() => [] as WorkflowListItem[]),   // Workflows sind optional
+        documentsApi.filterOptions().catch(() => ({ years: [] as number[], companies: [] as string[] })),
+        suppliersApi.list().catch(() => [] as Supplier[]),
       ]);
       setWorkflows(allWorkflows);
+      setYearOptions(options.years);
+      setSupplierOptions(Array.from(new Set(allSuppliers.map((s) => s.name))).sort((a, b) => a.localeCompare(b, "de")));
       setAiConfigs(configs);
       setSystemPrompts(prompts);
       setBatches(allBatches);
@@ -346,21 +374,27 @@ export default function BelegePage() {
       }
       setActiveFilters(initial);
     }
-    loadDocuments(initial);
+    activeFiltersRef.current = initial;
+    loadDocuments(initial, 0);
     loadOptions();
   }, [loadDocuments, loadOptions]);
 
-  // Auto-Refresh bei processing-Dokumenten
+  // Auto-Refresh, solange Dokumente verarbeitet werden. Lädt die AKTUELLE Seite neu
+  // (pageRef) — ein Seitenwechsel wird dadurch nicht zurückgesetzt. Geprüft wird auch, ob
+  // irgendwo (nicht nur auf dieser Seite) noch Dokumente verarbeitet werden.
+  const [watchProcessing, setWatchProcessing] = useState(false);
+  const hasProcessingOnPage = documents.some((d) => d.status === "processing");
   useEffect(() => {
-    const hasProcessing = documents.some((d) => d.status === "processing");
-    if (hasProcessing && !refreshTimerRef.current) {
-      refreshTimerRef.current = setInterval(() => loadDocuments(activeFilters), 5000);
-    } else if (!hasProcessing && refreshTimerRef.current) {
-      clearInterval(refreshTimerRef.current);
-      refreshTimerRef.current = null;
-    }
-    return () => { if (refreshTimerRef.current) { clearInterval(refreshTimerRef.current); refreshTimerRef.current = null; } };
-  }, [documents, activeFilters, loadDocuments]);
+    if (!hasProcessingOnPage && !watchProcessing) return;
+    const timer = setInterval(async () => {
+      await loadDocuments(activeFiltersRef.current);
+      try {
+        const busy = await documentsApi.listPage({ status: "processing" }, 0, 1);
+        if (busy.total === 0) setWatchProcessing(false);
+      } catch { /* nächster Tick */ }
+    }, 5000);
+    return () => clearInterval(timer);
+  }, [hasProcessingOnPage, watchProcessing, loadDocuments]);
 
   // Scroll- und Resize-Listener: verfolgt die Y-Position der Tabellen-Oberkante
   // PDF-Panel top = max(NAV_HEIGHT, tableTop) → startet an der Tabelle, rastet oben ein
@@ -420,9 +454,10 @@ export default function BelegePage() {
     const f = buildFilters();
     syncUrl(f);
     setActiveFilters(f);
+    activeFiltersRef.current = f;
     setSelectedIds(new Set());
     setPreviewDocId(null);
-    loadDocuments(f);
+    loadDocuments(f, 0);
   }
 
   function resetFilters() {
@@ -433,9 +468,36 @@ export default function BelegePage() {
     const f: DocumentFilter = {};
     syncUrl(f);
     setActiveFilters(f);
+    activeFiltersRef.current = f;
     setSelectedIds(new Set());
     setPreviewDocId(null);
-    loadDocuments(f);
+    loadDocuments(f, 0);
+  }
+
+  function goToPage(p: number) {
+    const last = Math.max(0, Math.ceil(total / pageSize) - 1);
+    const target = Math.min(Math.max(0, p), last);
+    setPreviewDocId(null);
+    loadDocuments(activeFilters, target);
+  }
+
+  async function changePageSize(size: number) {
+    pageSizeRef.current = size;                      // für das Laden sofort wirksam
+    await loadDocuments(activeFilters, 0);
+    setPageSize(size);                               // Anzeige erst umstellen, wenn die Daten dazu da sind
+  }
+
+  /** Alle Treffer (über alle Seiten) auswählen */
+  const [selectingAll, setSelectingAll] = useState(false);
+  async function selectAllHits() {
+    setSelectingAll(true);
+    try {
+      setSelectedIds(new Set(await documentsApi.ids(activeFilters)));
+    } catch (err) {
+      setError(extractApiError(err, "Treffer konnten nicht ausgewählt werden"));
+    } finally {
+      setSelectingAll(false);
+    }
   }
 
   // ─── Auswahl ──────────────────────────────────────────────────────────────
@@ -472,6 +534,7 @@ export default function BelegePage() {
       const result = await documentsApi.analyze(payload);
       setSuccessMsg(result.message);
       setSelectedIds(new Set());
+      setWatchProcessing(true);
       await loadDocuments(activeFilters);
     } catch (err: unknown) {
       setError(extractApiError(err, "Fehler beim Starten der KI-Analyse"));
@@ -567,9 +630,17 @@ export default function BelegePage() {
 
   async function navigateInfos(delta: number) {
     const idx = documents.findIndex((d) => d.id === infosDocId);
-    const nextIdx = idx + delta;
-    if (nextIdx < 0 || nextIdx >= documents.length) return;
-    await openView(documents[nextIdx].id, "infos");
+    if (idx < 0) return;
+    let target: DocumentItem | undefined = documents[idx + delta];
+    if (!target) {
+      // Seitengrenze: angrenzende Seite laden und am Rand weitermachen
+      const newPage = page + (delta > 0 ? 1 : -1);
+      if (newPage < 0 || newPage * pageSize >= total) return;
+      const docs = await loadDocuments(activeFilters, newPage);
+      target = delta > 0 ? docs[0] : docs[docs.length - 1];
+    }
+    if (!target) return;
+    await openView(target.id, "infos");
     infosContainerRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
   }
 
@@ -578,10 +649,11 @@ export default function BelegePage() {
   const activeDocs = documents.filter((d) => !d.deleted_at);
   const allSelected = activeDocs.length > 0 && selectedIds.size === activeDocs.length;
   const someSelected = selectedIds.size > 0 && selectedIds.size < activeDocs.length;
-  const availableYears = Array.from(new Set(documents.map((d) => d.year))).sort((a, b) => b - a);
-  const availableSuppliers = Array.from(
-    new Set(documents.map((d) => d.supplier_name).filter((s): s is string => !!s))
-  ).sort((a, b) => a.localeCompare(b, "de"));
+  const availableYears = yearOptions;
+  const availableSuppliers = supplierOptions;
+  const totalPages = Math.max(1, Math.ceil(total / pageSize));
+  const rangeFrom = total === 0 ? 0 : page * pageSize + 1;
+  const rangeTo = Math.min((page + 1) * pageSize, total);
   const infosIdx = infosDocId !== null ? documents.findIndex((d) => d.id === infosDocId) : -1;
 
   // ─── Render ───────────────────────────────────────────────────────────────
@@ -798,21 +870,21 @@ export default function BelegePage() {
               <div className="h-5 w-px bg-gray-200" />
               {infosIdx >= 0 && (
                 <span className="text-sm text-gray-500">
-                  Beleg <span className="font-semibold text-gray-800">{infosIdx + 1}</span>
-                  <span className="text-gray-400"> / {documents.length}</span>
+                  Beleg <span className="font-semibold text-gray-800">{(page * pageSize + infosIdx + 1).toLocaleString("de-DE")}</span>
+                  <span className="text-gray-400"> / {total.toLocaleString("de-DE")}</span>
                 </span>
               )}
               <div className="ml-auto flex items-center gap-2">
                 <button
                   onClick={() => navigateInfos(-1)}
-                  disabled={infosIdx <= 0 || viewLoading}
+                  disabled={page * pageSize + infosIdx <= 0 || viewLoading}
                   className="rounded border border-gray-300 px-3 py-1.5 text-sm text-gray-600 hover:bg-gray-50 disabled:opacity-40 transition-colors"
                 >
                   ← Vorherige
                 </button>
                 <button
                   onClick={() => navigateInfos(1)}
-                  disabled={infosIdx >= documents.length - 1 || viewLoading}
+                  disabled={page * pageSize + infosIdx >= total - 1 || viewLoading}
                   className="rounded border border-gray-300 px-3 py-1.5 text-sm text-gray-600 hover:bg-gray-50 disabled:opacity-40 transition-colors"
                 >
                   Nächste →
@@ -871,10 +943,14 @@ export default function BelegePage() {
         ) : (
         <>
 
-        {/* Anzahl */}
-        <div className="mb-2 text-sm text-gray-500">
-          {loading ? "Lade..." : `${documents.length} Beleg${documents.length !== 1 ? "e" : ""} gefunden`}
-        </div>
+        {/* Anzahl + Blättern */}
+        <Pager
+          testId="pager-top"
+          loading={loading} total={total} page={page} pageSize={pageSize} totalPages={totalPages}
+          rangeFrom={rangeFrom} rangeTo={rangeTo} selectedCount={selectedIds.size}
+          selectingAll={selectingAll} onSelectAll={selectAllHits} onClearSelection={() => setSelectedIds(new Set())}
+          onPage={goToPage} onPageSize={changePageSize}
+        />
 
         {/* Tabelle — bei geöffneter Vorschau auf halbe Breite beschränkt */}
         <div className={`overflow-x-auto rounded-lg border bg-white shadow-sm ${showPreview ? "w-1/2" : "w-full"}`}>
@@ -1080,6 +1156,15 @@ export default function BelegePage() {
               </tbody>
             </table>
           </div>
+        <div className={`mt-2 ${showPreview ? "w-1/2" : "w-full"}`}>
+          <Pager
+            testId="pager-bottom"
+            loading={loading} total={total} page={page} pageSize={pageSize} totalPages={totalPages}
+            rangeFrom={rangeFrom} rangeTo={rangeTo} selectedCount={selectedIds.size}
+            selectingAll={selectingAll} onSelectAll={selectAllHits} onClearSelection={() => setSelectedIds(new Set())}
+            onPage={goToPage} onPageSize={changePageSize} compact
+          />
+        </div>
 
         {/* PDF-Vorschau — fixed rechts via Portal (umgeht transform-Einschränkung des Containers).
              top startet an der Tabellen-Oberkante und rastet beim Scrollen am Nav ein. */}
@@ -1603,6 +1688,69 @@ function UsedWorkflow({ doc }: { doc: DocumentDetail }) {
           </pre>
         </details>
       )}
+    </div>
+  );
+}
+
+
+// ─── Blättern (serverseitig paginiert) ────────────────────────────────────────
+
+function Pager({
+  testId, loading, total, page, pageSize, totalPages, rangeFrom, rangeTo, selectedCount,
+  selectingAll, onSelectAll, onClearSelection, onPage, onPageSize, compact,
+}: {
+  testId: string;
+  loading: boolean;
+  total: number;
+  page: number;
+  pageSize: number;
+  totalPages: number;
+  rangeFrom: number;
+  rangeTo: number;
+  selectedCount: number;
+  selectingAll: boolean;
+  onSelectAll: () => void;
+  onClearSelection: () => void;
+  onPage: (p: number) => void;
+  onPageSize: (size: number) => void;
+  compact?: boolean;
+}) {
+  const btn = "rounded border border-gray-300 bg-white px-2.5 py-1 text-sm text-gray-600 hover:bg-gray-50 disabled:opacity-40";
+  return (
+    <div className="mb-2 flex flex-wrap items-center gap-x-4 gap-y-2 text-sm text-gray-500" data-testid={testId}>
+      <span data-testid={`${testId}-count`}>
+        {loading && total === 0
+          ? "Lade..."
+          : total === 0
+            ? "Keine Belege gefunden"
+            : `${rangeFrom.toLocaleString("de-DE")}–${rangeTo.toLocaleString("de-DE")} von ${total.toLocaleString("de-DE")} Beleg${total !== 1 ? "en" : ""}`}
+      </span>
+      {total > pageSize && selectedCount < total && (
+        <button onClick={onSelectAll} disabled={selectingAll} className="text-blue-600 hover:underline disabled:opacity-50">
+          {selectingAll ? "Wähle aus…" : `Alle ${total.toLocaleString("de-DE")} Treffer auswählen`}
+        </button>
+      )}
+      {selectedCount > 0 && (
+        <button onClick={onClearSelection} className="text-gray-500 hover:underline">
+          Auswahl aufheben ({selectedCount.toLocaleString("de-DE")})
+        </button>
+      )}
+      <div className="ml-auto flex items-center gap-2">
+        {!compact && (
+          <label className="flex items-center gap-1.5 text-xs text-gray-500">
+            pro Seite
+            <select value={pageSize} onChange={(e) => onPageSize(Number(e.target.value))}
+              className="rounded border border-gray-300 bg-white px-1.5 py-1 text-sm">
+              {[25, 50, 100, 200].map((n) => <option key={n} value={n}>{n}</option>)}
+            </select>
+          </label>
+        )}
+        <button className={btn} onClick={() => onPage(0)} disabled={page === 0 || loading}>«</button>
+        <button className={btn} onClick={() => onPage(page - 1)} disabled={page === 0 || loading}>‹ Zurück</button>
+        <span className="px-1 tabular-nums" data-testid={`${testId}-page`}>Seite {page + 1} / {totalPages}</span>
+        <button className={btn} onClick={() => onPage(page + 1)} disabled={page >= totalPages - 1 || loading}>Weiter ›</button>
+        <button className={btn} onClick={() => onPage(totalPages - 1)} disabled={page >= totalPages - 1 || loading}>»</button>
+      </div>
     </div>
   );
 }

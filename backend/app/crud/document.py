@@ -9,8 +9,8 @@ from decimal import Decimal
 
 logger = logging.getLogger(__name__)
 
-from sqlalchemy import outerjoin
-from sqlalchemy.orm import Session, joinedload
+from sqlalchemy import func, outerjoin
+from sqlalchemy.orm import Session, defer, joinedload
 
 from app.models.document import Document
 from app.models.invoice_extraction import InvoiceExtraction
@@ -143,95 +143,123 @@ def get_by_id_with_details(db: Session, doc_id: int) -> Document | None:
     )
 
 
-def get_all_filtered(
-    db: Session,
-    company: str | None = None,
-    year: int | None = None,
-    status: str | None = None,
-    total_min: float | None = None,
-    total_max: float | None = None,
-    page_min: int | None = None,
-    page_max: int | None = None,
-    batch_ids: list[int] | None = None,
-    include_deleted: bool = False,
-    has_extraction: bool | None = None,
-    supplier_name_filter: str | None = None,
-    doc_id: int | None = None,
-    document_type_ids: list[int] | None = None,
-    validation_statuses: list[str] | None = None,
-) -> list[Document]:
-    """
-    Gibt alle Dokumente zurück, optional gefiltert.
+# Filter, die von get_all_filtered / count_filtered / get_ids_filtered gleichermaßen verstanden werden
+_FILTER_KEYS = (
+    "company", "year", "status", "total_min", "total_max", "page_min", "page_max", "batch_ids",
+    "include_deleted", "has_extraction", "supplier_name_filter", "doc_id", "document_type_ids",
+    "validation_statuses",
+)
 
-    Für Betragsfilter, KI-Filter und Lieferantenfilter wird ein Outer Join
-    auf invoice_extractions gemacht. Der Join wird nur einmal ausgeführt.
+
+def _filtered_query(db: Session, **f):
     """
-    query = db.query(Document).options(
-        joinedload(Document.extraction),
-        joinedload(Document.document_type),
-    )
+    Basisabfrage mit allen Filtern (ohne Eager-Loading, Sortierung und Paginierung).
+
+    Für Betrags-, KI-, Lieferanten- und Prüfstatus-Filter wird ein Outer Join auf
+    invoice_extractions gemacht (1:1 → keine Zeilenvervielfachung).
+    """
+    unknown = set(f) - set(_FILTER_KEYS)
+    if unknown:
+        raise TypeError(f"Unbekannte Filter: {sorted(unknown)}")
+    g = f.get
+    query = db.query(Document)
 
     # Soft-Delete-Filter: standardmäßig nur nicht-gelöschte Dokumente anzeigen
-    if not include_deleted:
+    if not g("include_deleted"):
         query = query.filter(Document.deleted_at.is_(None))
 
-    # Import-Batch-Filter
-    if batch_ids:
-        query = query.filter(Document.batch_id.in_(batch_ids))
+    if g("batch_ids"):
+        query = query.filter(Document.batch_id.in_(g("batch_ids")))
 
-    # Prüfen ob ein Join auf InvoiceExtraction benötigt wird
     needs_join = (
-        total_min is not None
-        or total_max is not None
-        or has_extraction is not None
-        or supplier_name_filter is not None
-        or bool(validation_statuses)
+        g("total_min") is not None
+        or g("total_max") is not None
+        or g("has_extraction") is not None
+        or g("supplier_name_filter") is not None
+        or bool(g("validation_statuses"))
     )
     if needs_join:
-        query = query.outerjoin(
-            InvoiceExtraction,
-            Document.id == InvoiceExtraction.document_id,
-        )
+        query = query.outerjoin(InvoiceExtraction, Document.id == InvoiceExtraction.document_id)
 
-    # Betragsfilter
-    if total_min is not None:
-        query = query.filter(InvoiceExtraction.total_amount >= Decimal(str(total_min)))
-    if total_max is not None:
-        query = query.filter(InvoiceExtraction.total_amount <= Decimal(str(total_max)))
-
-    # KI-Filter: Extraktion vorhanden oder nicht
-    if has_extraction is True:
+    if g("total_min") is not None:
+        query = query.filter(InvoiceExtraction.total_amount >= Decimal(str(g("total_min"))))
+    if g("total_max") is not None:
+        query = query.filter(InvoiceExtraction.total_amount <= Decimal(str(g("total_max"))))
+    if g("has_extraction") is True:
         query = query.filter(InvoiceExtraction.id.isnot(None))
-    elif has_extraction is False:
+    elif g("has_extraction") is False:
         query = query.filter(InvoiceExtraction.id.is_(None))
+    if g("validation_statuses"):
+        query = query.filter(InvoiceExtraction.validation_status.in_(g("validation_statuses")))
+    if g("supplier_name_filter"):
+        query = query.filter(InvoiceExtraction.supplier_name.ilike(f"%{g('supplier_name_filter')}%"))
 
-    # Plausibilitätsprüfung: Dokumente mit bestimmtem Prüfstatus
-    if validation_statuses:
-        query = query.filter(InvoiceExtraction.validation_status.in_(validation_statuses))
+    if g("company"):
+        query = query.filter(Document.company.ilike(f"%{g('company')}%"))
+    if g("year") is not None:
+        query = query.filter(Document.year == g("year"))
+    if g("status"):
+        query = query.filter(Document.status == g("status"))
+    if g("page_min") is not None:
+        query = query.filter(Document.page_count >= g("page_min"))
+    if g("page_max") is not None:
+        query = query.filter(Document.page_count <= g("page_max"))
+    if g("doc_id") is not None:
+        query = query.filter(Document.id == g("doc_id"))
+    if g("document_type_ids"):
+        query = query.filter(Document.document_type_id.in_(g("document_type_ids")))
+    return query
 
-    # Lieferantenname-Filter
-    if supplier_name_filter:
-        query = query.filter(
-            InvoiceExtraction.supplier_name.ilike(f"%{supplier_name_filter}%")
-        )
 
-    if company:
-        query = query.filter(Document.company.ilike(f"%{company}%"))
-    if year is not None:
-        query = query.filter(Document.year == year)
-    if status:
-        query = query.filter(Document.status == status)
-    if page_min is not None:
-        query = query.filter(Document.page_count >= page_min)
-    if page_max is not None:
-        query = query.filter(Document.page_count <= page_max)
-    if doc_id is not None:
-        query = query.filter(Document.id == doc_id)
+def get_all_filtered(
+    db: Session,
+    limit: int | None = None,
+    offset: int = 0,
+    **filters,
+) -> list[Document]:
+    """
+    Gibt Dokumente (neueste zuerst) zurück, optional gefiltert und paginiert.
 
-    if document_type_ids:
-        query = query.filter(Document.document_type_id.in_(document_type_ids))
+    Für die Listenansicht werden die schweren Textspalten NICHT geladen (KI-Rohantwort,
+    Prüfdetails, Prompt-/Workflow-Snapshots) — bei tausenden Belegen machen sie sonst
+    hunderte MB aus, obwohl die Liste sie nie anzeigt.
+    """
+    query = _filtered_query(db, **filters).options(
+        joinedload(Document.extraction)
+        .defer(InvoiceExtraction.raw_response)
+        .defer(InvoiceExtraction.validation_details),
+        joinedload(Document.document_type),
+        defer(Document.used_system_prompt),
+        defer(Document.used_doc_type_prompt),
+        defer(Document.used_recheck_prompt),
+        defer(Document.used_workflow_graph),
+        defer(Document.workflow_trace),
+    ).order_by(Document.id.desc())
+    if offset:
+        query = query.offset(offset)
+    if limit:
+        query = query.limit(limit)
+    return query.all()
 
-    return query.order_by(Document.id.desc()).all()
+
+def count_filtered(db: Session, **filters) -> int:
+    """Anzahl der Treffer (ohne Eager-Loading → schnell)."""
+    return _filtered_query(db, **filters).with_entities(func.count(Document.id)).scalar() or 0
+
+
+def get_ids_filtered(db: Session, **filters) -> list[int]:
+    """Alle Treffer-IDs (neueste zuerst) — z.B. für „alle Treffer auswählen"."""
+    rows = _filtered_query(db, **filters).with_entities(Document.id).order_by(Document.id.desc()).all()
+    return [r[0] for r in rows]
+
+
+def get_filter_options(db: Session) -> dict:
+    """Werte für die Filter-Dropdowns: Jahre und Firmen aller (nicht gelöschten) Belege."""
+    years = [r[0] for r in db.query(Document.year).filter(Document.deleted_at.is_(None))
+             .distinct().order_by(Document.year.desc()).all()]
+    companies = [r[0] for r in db.query(Document.company).filter(Document.deleted_at.is_(None))
+                 .distinct().order_by(Document.company).all()]
+    return {"years": years, "companies": companies}
 
 
 def save_extraction(

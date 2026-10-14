@@ -401,6 +401,28 @@ export const documentsApi = {
       .get<DocumentItem[]>("/api/documents/", { params: filters })
       .then((r) => r.data),
 
+  /**
+   * Eine Seite der Dokumente laden (serverseitig paginiert) — immer verwenden statt `list`,
+   * sobald es viele Belege gibt. `total` ist die Gesamtzahl der Treffer (Header X-Total-Count).
+   */
+  listPage: async (filters: DocumentFilter | undefined, page: number, pageSize: number) => {
+    const r = await apiClient.get<DocumentItem[]>("/api/documents/", {
+      params: { ...filters, limit: pageSize, offset: page * pageSize },
+    });
+    const header = Number(r.headers["x-total-count"]);
+    return { items: r.data, total: Number.isFinite(header) ? header : r.data.length };
+  },
+
+  /** Alle Treffer-IDs zu den Filtern (für „alle Treffer auswählen") */
+  ids: (filters?: DocumentFilter) =>
+    apiClient.get<number[]>("/api/documents/ids", { params: filters }).then((r) => r.data),
+
+  /** Werte für die Filter-Dropdowns, unabhängig von der geladenen Seite */
+  filterOptions: () =>
+    apiClient
+      .get<{ years: number[]; companies: string[] }>("/api/documents/filter-options")
+      .then((r) => r.data),
+
   /** Dokument mit Extraktion und Positionen laden */
   get: (id: number) =>
     apiClient.get<DocumentDetail>(`/api/documents/${id}`).then((r) => r.data),

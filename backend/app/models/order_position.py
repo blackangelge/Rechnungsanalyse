@@ -23,7 +23,7 @@ class OrderPosition(Base):
 
     # Fremdschlüssel zum Dokument (CASCADE: Position wird mit Dokument gelöscht)
     document_id: Mapped[int] = mapped_column(
-        Integer, ForeignKey("documents.id", ondelete="CASCADE"), nullable=False
+        Integer, ForeignKey("documents.id", ondelete="CASCADE"), nullable=False, index=True
     )
 
     # Reihenfolge der Position innerhalb des Dokuments (0-basiert)

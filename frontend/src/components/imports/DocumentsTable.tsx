@@ -43,9 +43,12 @@ export default function DocumentsTable({ documents, onRefresh }: Props) {
   const [previewDocId, setPreviewDocId] = useState<number | null>(null);
   const [editingCommentId, setEditingCommentId] = useState<number | null>(null);
   const [commentValue, setCommentValue] = useState("");
-  const [page, setPage] = useState(0);
+  const [rawPage, setPage] = useState(0);
 
   const totalPages = Math.ceil(documents.length / PAGE_SIZE);
+  // Die gewählte Seite bleibt beim Neuladen der Liste erhalten; sie wird nur begrenzt,
+  // falls die Liste kürzer geworden ist (z.B. nach dem Löschen von Belegen).
+  const page = Math.min(rawPage, Math.max(0, totalPages - 1));
   const pageDocs = documents.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE);
 
   async function saveComment(docId: number) {
