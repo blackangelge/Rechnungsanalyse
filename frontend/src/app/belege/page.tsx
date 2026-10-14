@@ -330,7 +330,23 @@ export default function BelegePage() {
   }, []);
 
   useEffect(() => {
-    loadDocuments({});
+    // Direktlink, z.B. /belege?doc_id=42 (aus den Logs): ID ins Suchfeld "Beleg-ID" eintragen
+    // und sofort danach filtern. Optional include_deleted=1 für gelöschte Belege.
+    // (Aus window.location statt useSearchParams gelesen: kein Suspense nötig, und der
+    // erste Render bleibt identisch zum Server-Render → keine Hydration-Abweichung.)
+    const params = new URLSearchParams(window.location.search);
+    const idParam = params.get("doc_id")?.trim() ?? "";
+    const initial: DocumentFilter = {};
+    if (/^\d+$/.test(idParam)) {
+      initial.doc_id = parseInt(idParam, 10);
+      setFilterDocId(idParam);
+      if (params.get("include_deleted") === "1") {
+        initial.include_deleted = true;
+        setIncludeDeleted(true);
+      }
+      setActiveFilters(initial);
+    }
+    loadDocuments(initial);
     loadOptions();
   }, [loadDocuments, loadOptions]);
 
@@ -390,8 +406,19 @@ export default function BelegePage() {
     return f;
   }
 
+  /** Hält doc_id/include_deleted in der Adresszeile synchron (teilbar, Neuladen-sicher) */
+  function syncUrl(f: DocumentFilter) {
+    const url = new URL(window.location.href);
+    if (f.doc_id !== undefined && !Number.isNaN(f.doc_id)) url.searchParams.set("doc_id", String(f.doc_id));
+    else url.searchParams.delete("doc_id");
+    if (f.doc_id !== undefined && f.include_deleted) url.searchParams.set("include_deleted", "1");
+    else url.searchParams.delete("include_deleted");
+    window.history.replaceState(null, "", url.pathname + url.search);
+  }
+
   function applyFilters() {
     const f = buildFilters();
+    syncUrl(f);
     setActiveFilters(f);
     setSelectedIds(new Set());
     setPreviewDocId(null);
@@ -404,6 +431,7 @@ export default function BelegePage() {
     setSelectedBatchIds(new Set()); setSelectedDocTypeIds(new Set()); setIncludeDeleted(false);
     setFilterKi(""); setFilterSupplierName(""); setFilterDocId(""); setFilterValidation("");
     const f: DocumentFilter = {};
+    syncUrl(f);
     setActiveFilters(f);
     setSelectedIds(new Set());
     setPreviewDocId(null);

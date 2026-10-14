@@ -452,7 +452,17 @@ export default function LogsPage() {
 
                 {/* Dokument-ID */}
                 <td className="px-3 py-2.5 text-gray-500 tabular-nums">
-                  {log.document_id != null ? `#${log.document_id}` : "–"}
+                  {log.document_id != null ? (
+                    <a
+                      href={`/belege?doc_id=${log.document_id}&include_deleted=1`}
+                      className="text-blue-600 hover:underline"
+                      title="Beleg in der Belege-Übersicht öffnen"
+                    >
+                      #{log.document_id}
+                    </a>
+                  ) : (
+                    "–"
+                  )}
                 </td>
               </tr>
             ))}
