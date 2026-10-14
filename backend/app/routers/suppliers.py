@@ -3,7 +3,9 @@ Router für Lieferanten-Stammdaten.
 
 Endpunkte:
   GET    /api/suppliers              — alle Lieferanten (mit Dokumentanzahl)
-  GET    /api/suppliers/duplicates   — potenzielle Duplikate
+  GET    /api/suppliers/duplicates   — potenzielle Duplikate (nur gleicher Name, veraltet)
+  GET    /api/suppliers/duplicate-groups — Dublettensuche (IBAN, USt-IdNr., Steuernr., Name)
+  POST   /api/suppliers/merge        — Lieferanten zusammenführen
   GET    /api/suppliers/{id}         — einzelner Lieferant
   PUT    /api/suppliers/{id}         — Lieferant aktualisieren
   PUT    /api/suppliers/{id}/workflow — Analyse-Workflow des Lieferanten festlegen
@@ -15,8 +17,11 @@ from sqlalchemy.orm import Session
 
 from app import crud
 from app.database import get_db
-from app.schemas.supplier import SupplierRead, SupplierUpdate
+from app.schemas.supplier import (
+    DuplicateGroupRead, SupplierMergeRequest, SupplierMergeResult, SupplierRead, SupplierUpdate,
+)
 from app.schemas.workflow import SupplierWorkflowUpdate
+from app.services import supplier_dedup
 
 router = APIRouter(prefix="/api/suppliers", tags=["Lieferanten"])
 
@@ -43,6 +48,50 @@ def get_duplicates(db: Session = Depends(get_db)):
         [_with_count(db, s) for s in group]
         for group in groups
     ]
+
+
+@router.get("/duplicate-groups", response_model=list[DuplicateGroupRead])
+def get_duplicate_groups(db: Session = Depends(get_db)):
+    """
+    Dublettensuche: gleiche IBAN / USt-IdNr. / Steuernummer (hohe Konfidenz), gleicher Name ohne
+    Rechtsform (mittel), sehr ähnlicher Name (niedrig). Es wird nichts verändert.
+    """
+    by_id = {s.id: s for s in crud.supplier.get_all(db)}
+    groups = supplier_dedup.find_duplicate_groups(by_id.values())
+    return [
+        DuplicateGroupRead(
+            suppliers=[_with_count(db, by_id[i]) for i in g.supplier_ids],
+            reasons=g.reasons,
+            reason_labels=[supplier_dedup.REASON_LABELS[r] for r in g.reasons],
+            confidence=g.confidence,
+        )
+        for g in groups
+    ]
+
+
+@router.post("/merge", response_model=SupplierMergeResult)
+def merge_suppliers(payload: SupplierMergeRequest, db: Session = Depends(get_db)):
+    """
+    Führt Lieferanten zusammen: Belege der Quellen werden dem Ziel zugeordnet, leere Stammdaten
+    aufgefüllt, die Quellen gelöscht. Alles in einer Transaktion.
+    """
+    try:
+        result = crud.supplier.merge(
+            db, payload.target_id, payload.source_ids,
+            fields=payload.fields, update_document_names=payload.update_document_names,
+        )
+    except crud.supplier.MergeError as exc:
+        raise HTTPException(status_code=exc.status, detail=str(exc))
+    crud.system_log.add(
+        db, category="system", level="info",
+        message=(f"Lieferanten zusammengeführt: {', '.join('#' + str(i) for i in result.merged_ids)} → "
+                 f"#{result.supplier.id} '{result.supplier.name}' ({result.moved_documents} Beleg(e) umgehängt"
+                 + (f", {result.renamed_documents} Name(n) vereinheitlicht" if result.renamed_documents else "") + ")"),
+    )
+    return SupplierMergeResult(
+        supplier=_with_count(db, result.supplier), merged_ids=result.merged_ids,
+        moved_documents=result.moved_documents, renamed_documents=result.renamed_documents,
+    )
 
 
 @router.get("/{supplier_id}", response_model=SupplierRead)

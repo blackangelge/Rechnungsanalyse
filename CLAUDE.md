@@ -98,6 +98,7 @@ app/
     │                       # DEFAULT_DOC_TYPE_SYSTEM_PROMPT — Fallback-Systemprompt
     ├── pdf_service.py      # PDF → Bilder (pypdfium2), Seitenanzahl (pypdf)
     ├── pdf_edit_service.py # PDF-Bearbeitung mit Versionierung (Seiten entfernen, Wiederherstellen, Auto-Kürzen)
+    ├── supplier_dedup.py   # Dublettensuche für Lieferanten (reine Logik): IBAN, USt-IdNr., Steuernr., Name ohne Rechtsform, ähnlicher Name
     ├── workflow_service.py # Workflow-Engine (reine Logik): Graph-Validierung, Bedingungen, Ablaufschleife, Vorlagen
     ├── workflow_runner.py  # Knoten-Implementierungen + analyze_with_workflow (nutzt die Helfer aus routers/documents.py)
     └── plausibility_service.py  # Plausibilitätsprüfung (reine Rechenlogik, keine DB/Netzwerk)
@@ -471,6 +472,23 @@ Die Properties `ki_input_tokens`, `ki_output_tokens`, `ki_total_duration` auf `D
 **Wichtig für Schemas:** `DocumentDetail` erbt von `DocumentRead` (nicht `DocumentListRead`). Die `ki_*`-Felder müssen daher **explizit** in `DocumentDetail` deklariert werden — sie werden nicht automatisch geerbt.
 
 Aggregierte Statistiken: `GET /api/logs/ki-stats` — gibt Summen und Durchschnitte über alle Extraktionen zurück.
+
+### Lieferanten: Dublettensuche und Zusammenführen (`services/supplier_dedup.py`, `crud/supplier.py::merge`)
+
+- `GET /api/suppliers/duplicate-groups`: Gruppen von Dublettenkandidaten (Union-Find über alle Merkmale). Merkmale/Konfidenz:
+  gleiche IBAN, USt-IdNr. oder Steuernummer (Schreibweise egal) = **hoch**; gleicher Name nach Normalisierung (ohne Rechtsform
+  wie GmbH/KG/e.K./S.A., Umlaute/Satzzeichen egal) = **mittel**; Namensähnlichkeit ≥ 88 % (nur innerhalb gleicher Anfangsbuchstaben,
+  Namen ≥ 5 Zeichen) = **niedrig**. Es wird **nie automatisch** zusammengeführt. Der alte Endpunkt `/duplicates` (nur gleicher Name) bleibt.
+- `POST /api/suppliers/merge` `{target_id, source_ids, fields?, update_document_names?}` — eine Transaktion: Belege
+  (`invoice_extractions.supplier_id`) der Quellen → Ziel, leere Stammdatenfelder des Ziels aus den Quellen auffüllen, `fields`
+  legt Endwerte ausdrücklich fest, Workflow des Ziels bleibt (sonst erster der Quellen), Quellen werden gelöscht. Optional
+  `update_document_names` vereinheitlicht `invoice_extractions.supplier_name` (Standard **aus**: schreibt extrahierte Daten um;
+  Originalwortlaut bleibt in `raw_response`). Fehler → HTTP 400/404, nichts wird verändert. Ergebnis wird im System-Log festgehalten.
+- Frontend: „Dubletten suchen" (Gruppen mit Konfidenz und Gründen) und Mehrfachauswahl in der Tabelle → `MergeModal`
+  (`components/suppliers/MergeModal.tsx`): Ziel wählen (Vorschlag: meiste Belege), abweichende Angaben je Feld wählen (IBAN/USt-IdNr.
+  in anderer Schreibweise zählt **nicht** als Konflikt), Checkbox „Namen in Belegen vereinheitlichen".
+- `find_or_create` (Analyse) erkennt weiterhin nur exakte IBAN/USt-IdNr./Namen — Schreibvarianten legen also neue Lieferanten an,
+  die später per Dublettensuche zusammengeführt werden können.
 
 ### Lieferanten-Deduplication (`crud/supplier.py`)
 
