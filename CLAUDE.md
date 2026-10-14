@@ -98,6 +98,8 @@ app/
     │                       # DEFAULT_DOC_TYPE_SYSTEM_PROMPT — Fallback-Systemprompt
     ├── pdf_service.py      # PDF → Bilder (pypdfium2), Seitenanzahl (pypdf)
     ├── pdf_edit_service.py # PDF-Bearbeitung mit Versionierung (Seiten entfernen, Wiederherstellen, Auto-Kürzen)
+    ├── workflow_service.py # Workflow-Engine (reine Logik): Graph-Validierung, Bedingungen, Ablaufschleife, Vorlagen
+    ├── workflow_runner.py  # Knoten-Implementierungen + analyze_with_workflow (nutzt die Helfer aus routers/documents.py)
     └── plausibility_service.py  # Plausibilitätsprüfung (reine Rechenlogik, keine DB/Netzwerk)
                             # Einheiten (t/kg/g, l/ml/hl, Stück, Verpackungen), Positions-/Summen-/
                             # Steuerprüfung, automatische Einheiten-Korrektur
@@ -120,9 +122,12 @@ alembic/
     │                       # revision = "0013_plausibility"; validation_status/-details auf
     │                       # invoice_extractions; used_system_prompt/_doc_type_prompt/
     │                       # _recheck_prompt auf documents
-    └── 0014_pdf_versions.py
-                            # revision = "0014_pdf_versions"; document_versions, pdf_settings,
-                            # documents.pdf_version / analyzed_pdf_version
+    ├── 0014_pdf_versions.py
+    │                       # revision = "0014_pdf_versions"; document_versions, pdf_settings,
+    │                       # documents.pdf_version / analyzed_pdf_version
+    └── 0015_workflows.py
+                            # revision = "0015_workflows"; workflows, suppliers.workflow_id,
+                            # documents.used_workflow_* / workflow_trace
 ```
 
 ### Import-Ablauf
@@ -394,6 +399,53 @@ Endpunkte (`/api/documents`): `GET /{id}/versions`, `GET /{id}/versions/{n}/prev
 (PNG, `?version=`, 1-basiert), `POST /{id}/pages/remove` (`remove_pages` ODER `keep_pages`, optional `note`),
 `POST /{id}/versions/{n}/restore`, `POST /auto-trim`; `GET|PUT /api/settings/pdf`.
 
+### Workflows (`services/workflow_service.py`, `services/workflow_runner.py`, `routers/workflows.py`)
+
+Ein **Workflow** legt als Graph fest, welche Schritte die KI-Analyse durchläuft und welche Systemprompts dabei gelten
+(Editor wie bei n8n, siehe Frontend). Er ist optional: **ohne Standard-Workflow läuft der klassische Ablauf** (`_analyze_single`
+wie zuvor, Phasen 1–4).
+
+**Auswahl** (`_db_resolve_workflow` in `documents.py`, pro Dokument): 1. in der Analyse gewählter Workflow
+(`AnalyzeRequest.workflow_id`) → 2. Workflow des Lieferanten (`suppliers.workflow_id`, nur wenn der Lieferant schon bekannt ist,
+also z.B. bei erneuter Analyse) → 3. Standard-Workflow (`workflows.is_default`, höchstens einer) → 4. klassischer Ablauf.
+Import mit „KI-Analyse nach Import" nutzt immer die automatische Auswahl (2.–4.).
+
+**Graph** (JSON in `workflows.graph`, React-Flow-kompatibel): `{"nodes": [{id, type, position, data: {label, config}}],
+"edges": [{id, source, target, sourceHandle}]}`. Knotentypen und Konfiguration:
+
+| Typ | Konfiguration | Wirkung |
+|---|---|---|
+| `start` | – | Einstieg (genau einer) |
+| `trim_pages` | `max_pages` | neue PDF-Version mit den ersten N Seiten (`pdf_edit_service.auto_trim`) |
+| `detect_type` | `system_prompt_id?` | Dokumententyp erkennen (leer = Dokumententyp-Prompt der Einstellungen, sonst `DEFAULT_DOC_TYPE_SYSTEM_PROMPT`) |
+| `branch` | `field`, `op`, `value` | Ja/Nein-Weiche (Ausgänge `true`/`false`); Felder `document_type`, `supplier_name`, `page_count`, `validation_status` |
+| `extract` | `system_prompt_id?`, `ai_config_id?` | Rechnungsdaten extrahieren (leer = in der Analyse gewählter/Standard-Prompt bzw. -KI) |
+| `validate` | `auto_correct`, `ai_recheck` | Plausibilitätsprüfung (`_plausibility_pass`), Stufen einzeln abschaltbar |
+| `end` | – | Ende |
+
+Regeln (`validate_graph`, beim Speichern erzwungen → HTTP 422): genau ein Start ohne Eingang; jeder Ausgang höchstens **eine**
+Kante (sequenzieller Ablauf, kein paralleles Verzweigen); keine Zyklen; Verzweigung nur mit `true`/`false`; Operatoren passend zum
+Feld. Nur Warnungen (kein Fehler): nicht erreichbare Knoten, offene Verzweigungsausgänge, keine Extraktion, Prüfung vor Extraktion,
+fehlende Prompt-/KI-IDs. Fehlt eine Kante, endet der Ablauf dort.
+
+**Ausführung** (`analyze_with_workflow`): Handler pro Knotentyp, gemeinsamer `RunContext` (Bilder werden beim ersten Bedarf
+gerendert und nach `trim_pages` neu). Abschluss wie im klassischen Ablauf: Extraktion lief → `_db_analyze_write`; nur Typ erkannt →
+`_db_type_only_finish`; sonst Status `done`. Die globale „Auto-Kürzen"-Einstellung gilt im Workflow-Modus **nicht** (der
+`trim_pages`-Knoten entscheidet). Fehler in einem Knoten → Dokument-Status `error` mit Knotenname; Ablaufprotokoll wird trotzdem gespeichert.
+
+**Nachvollziehbarkeit** (am Dokument): `used_workflow_id/_name`, `used_workflow_graph` (Snapshot, bleibt nach Ändern/Löschen des
+Workflows erhalten), `workflow_trace` (pro Knoten: Status, Dauer, Detail, bei Verzweigung der gewählte Ausgang), dazu wie bisher
+`used_system_prompt`/`used_doc_type_prompt`/`used_recheck_prompt` mit dem tatsächlich verwendeten Wortlaut. Beim Start jeder
+Analyse werden diese Felder zurückgesetzt (`save_used_prompts`).
+
+Endpunkte: `GET|POST /api/workflows`, `GET /api/workflows/templates` (Standard, Nur Extraktion, Erst kürzen), `POST /api/workflows/validate`,
+`GET|PUT|DELETE /api/workflows/{id}`, `POST /{id}/set-default|clear-default|duplicate`, `PUT /api/suppliers/{id}/workflow`.
+Workflow löschen setzt Lieferanten-Zuordnungen auf `NULL`.
+
+**Neuer Knotentyp:** Konfigurationsmodell in `CONFIG_MODELS` + Eintrag in `NODE_TYPES`/`output_handles` (`workflow_service.py`),
+Handler in `HANDLERS` (`workflow_runner.py`), Darstellung in `components/workflows/nodeMeta.ts` und Formular im `Inspector`
+(`WorkflowEditor.tsx`), Typ in `WorkflowNodeType` (`api.ts`).
+
 ### KI-Token-Statistiken
 
 #### Für Eingangsrechnungen (in `invoice_extractions`)
@@ -607,6 +659,7 @@ Gleiche Dropdown-Checkbox-Komponente wie `BatchMultiSelect` (Import-Filter):
   Vorschaubild anklicken (Shift = Bereich) oder als „2-5, 8" eingeben, „Ausgewählte entfernen" / „Nur ausgewählte behalten" /
   „nur die ersten N behalten", rechts Versionsverlauf mit Ansehen und Wiederherstellen
 - Aktionsleiste: „PDFs kürzen" für die Auswahl (`POST /auto-trim`)
+- Analyse-Leiste: Dropdown **Workflow** (leer = automatisch); KI-Modal zeigt verwendeten Workflow + Ablaufprotokoll (`UsedWorkflow`)
 - Spalte **Prüfung** (`ValidationBadge`): OK · Korrigiert · KI-korrigiert · Prüfen! · Geprüft
 - Infos-Ansicht: `ValidationPanel` oben (Korrekturen, Auffälligkeiten, Ergebnis der zweiten KI-Abfrage,
   Buttons „Prüfung erneut ausführen" / „Als geprüft bestätigen")
@@ -664,6 +717,17 @@ Behandelt sowohl `number` als auch Strings wie `"719,99 €"`:
 | ↳ KI-Konfiguration | Dropdown | Nur sichtbar wenn KI aktiv; Standard vorgewählt |
 | ↳ Systemprompt | Dropdown | Nur sichtbar wenn KI aktiv; Standard-Prompt vorgewählt |
 
+### Workflows (`settings/workflows/`, `components/workflows/`)
+
+- `/settings/workflows`: Liste (Standard setzen/aufheben, duplizieren, löschen, neu aus Vorlage) mit Erklärung der Auswahlreihenfolge
+- `/settings/workflows/[id]`: Editor mit **React Flow** (`@xyflow/react`, exakt gepinnt): Palette links (Klick oder Drag & Drop),
+  Zeichenfläche, rechts Eigenschaften des gewählten Knotens (hier wird der Systemprompt je Knoten gewählt) + **Live-Prüfung**
+  (`POST /validate`, entprellt). Verbinden: vom Anschluss rechts zum Anschluss links ziehen; pro Ausgang nur eine Verbindung (neue
+  ersetzt die alte); Zyklen und Eingänge in den Start werden schon beim Ziehen verhindert. Entfernen mit Entf/Backspace.
+  Speichern nur bei Änderungen, Browser-Warnung bei ungespeicherten Änderungen.
+- `/lieferanten`: Spalte **Workflow** (Dropdown je Lieferant, „Standard" = kein eigener Workflow)
+- Neues npm-Paket → nach dem Update Frontend-Container neu starten (`npm install` läuft im Startkommando)
+
 ### Systemprompts-Seite (`settings/prompts/page.tsx`)
 
 - CRUD für Systemprompts
@@ -694,7 +758,7 @@ Behandelt sowohl `number` als auch Strings wie `"719,99 €"`:
 ### Wichtige Abhängigkeiten
 
 ```
-next 16.2.4, react 19, typescript 6, tailwindcss 4, axios
+next 16.2.4, react 19, typescript 6, tailwindcss 4, axios, @xyflow/react 12.12.0
 ```
 
 ---
@@ -752,6 +816,9 @@ AIConfig        (referenziert von ImportBatch.ai_config_id)
 ImageSettings   (Singleton, globale Bildkonvertierungseinstellungen)
 SystemPrompt    (Standard-Prompt + optionaler Dokumententyp-Prompt)
 ProcessingSettings (Singleton, import_concurrency + ai_concurrency)
+PdfSettings     (Singleton, auto_trim_enabled + auto_trim_max_pages)
+Document     1──n  DocumentVersion   (PDF-Versionen)
+Workflow     1──n  Supplier          (Supplier.workflow_id, optional)
 ```
 
 ### Migrationen
@@ -764,8 +831,9 @@ ProcessingSettings (Singleton, import_concurrency + ai_concurrency)
 | `0009_ki_stats_on_invoice_extractions.py` | 5 `ki_*`-Spalten auf `invoice_extractions` (nullable) |
 | `0011_document_types.py` | `document_types`-Tabelle (15 vordefinierte Typen), `document_type_id` FK auf `documents`, `is_document_type_prompt` auf `system_prompts` |
 | `0012_doc_ki_stats.py` | `doc_ki_input_tokens`, `doc_ki_output_tokens`, `doc_ki_total_duration` auf `documents` (Fallback-Stats für Nicht-Eingangsrechnungen ohne InvoiceExtraction) |
-| `0014_pdf_versions.py` | `document_versions`-Tabelle, `pdf_settings` (Singleton), `pdf_version`/`analyzed_pdf_version` auf `documents` |
 | `0013_plausibility_and_prompt_snapshot.py` | `validation_status`/`validation_details` auf `invoice_extractions`; `used_system_prompt`, `used_doc_type_prompt`, `used_recheck_prompt` auf `documents` |
+| `0014_pdf_versions.py` | `document_versions`-Tabelle, `pdf_settings` (Singleton), `pdf_version`/`analyzed_pdf_version` auf `documents` |
+| `0015_workflows.py` | `workflows`-Tabelle, `suppliers.workflow_id` (FK, SET NULL), `used_workflow_id/_name/_graph` + `workflow_trace` auf `documents` |
 
 ### Import-Status-Flow
 

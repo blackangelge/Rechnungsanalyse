@@ -18,3 +18,4 @@ from app.crud import item  # noqa: F401
 from app.crud import supplier  # noqa: F401
 from app.crud import system_log  # noqa: F401
 from app.crud import system_prompt  # noqa: F401
+from app.crud import workflow  # noqa: F401
