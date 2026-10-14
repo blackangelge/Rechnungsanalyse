@@ -14,12 +14,16 @@ def get_all(
     db: Session,
     company_name: str | None = None,
     year: int | None = None,
+    include_hidden: bool = False,
 ) -> list[ImportBatch]:
     """
-    Gibt alle Import-Batches zurück.
+    Gibt Import-Batches zurück (neueste zuerst).
     Optionale Filter: Firmenname (Teilstring) und/oder Jahr.
+    Ausgeblendete Imports werden nur mit include_hidden=True geliefert.
     """
     query = db.query(ImportBatch).order_by(ImportBatch.created_at.desc())
+    if not include_hidden:
+        query = query.filter(ImportBatch.hidden_at.is_(None))
 
     if company_name:
         # Groß-/Kleinschreibung ignorieren
@@ -115,3 +119,23 @@ def update_status(
     db.commit()
     db.refresh(obj)
     return obj
+
+
+def set_hidden(db: Session, ids: list[int], hidden: bool) -> int:
+    """
+    Blendet Imports aus (hidden=True) bzw. wieder ein. Gibt die Anzahl geänderter Imports zurück.
+    Bereits im gewünschten Zustand befindliche Imports werden nicht angefasst (Zeitpunkt bleibt).
+    """
+    from datetime import datetime, timezone
+
+    query = db.query(ImportBatch).filter(ImportBatch.id.in_(ids))
+    if hidden:
+        count = query.filter(ImportBatch.hidden_at.is_(None)).update(
+            {ImportBatch.hidden_at: datetime.now(timezone.utc)}, synchronize_session=False
+        )
+    else:
+        count = query.filter(ImportBatch.hidden_at.isnot(None)).update(
+            {ImportBatch.hidden_at: None}, synchronize_session=False
+        )
+    db.commit()
+    return count

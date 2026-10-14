@@ -63,6 +63,13 @@ class ImportBatch(Base):
     )
 
     # Erstellungszeitpunkt des Datensatzes
+    # Ausgeblendet (archiviert): NULL = sichtbar, sonst Zeitpunkt des Ausblendens.
+    # Ausgeblendete Imports und ihre Belege tauchen in Dashboard und Belege-Liste
+    # nur auf Wunsch auf; alles bleibt erhalten und lässt sich wieder einblenden.
+    hidden_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, default=None, index=True
+    )
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

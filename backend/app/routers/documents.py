@@ -96,6 +96,7 @@ def _document_filters(
     doc_id: Optional[int] = None,
     document_type_ids: Optional[list[int]] = Query(default=None),
     validation_status: Optional[list[str]] = Query(default=None),
+    include_hidden: bool = False,
 ) -> dict:
     """Gemeinsame Filter-Parameter für Liste, Anzahl und ID-Liste."""
     return dict(
@@ -103,6 +104,7 @@ def _document_filters(
         page_min=page_min, page_max=page_max, batch_ids=batch_ids, include_deleted=include_deleted,
         has_extraction=has_extraction, supplier_name_filter=supplier_name, doc_id=doc_id,
         document_type_ids=document_type_ids, validation_statuses=validation_status,
+        include_hidden=include_hidden,
     )
 
 
@@ -122,7 +124,8 @@ def list_documents(
     bei vielen tausend Belegen bitte immer paginieren.
 
     Filter: validation_status (ok, corrected, ai_corrected, needs_review, manual_ok, unchecked),
-    include_deleted (auch soft-gelöschte), has_extraction, supplier_name (LIKE, ohne Groß/Klein),
+    include_deleted (auch soft-gelöschte), include_hidden (auch Belege ausgeblendeter Imports; ein
+    ausdrücklich gewählter Import `batch_ids` und die Suche per `doc_id` gelten immer), has_extraction, supplier_name (LIKE, ohne Groß/Klein),
     document_type_ids (mehrere), batch_ids (mehrere), company (LIKE), year, status, Beträge, Seiten.
     """
     if limit is not None:
@@ -138,9 +141,9 @@ def list_document_ids(filters: dict = Depends(_document_filters), db: Session = 
 
 
 @router.get("/filter-options")
-def get_filter_options(db: Session = Depends(get_db)):
+def get_filter_options(include_hidden: bool = False, db: Session = Depends(get_db)):
     """Werte für die Filter-Dropdowns (Jahre, Firmen) — unabhängig von der geladenen Seite."""
-    return crud.document.get_filter_options(db)
+    return crud.document.get_filter_options(db, include_hidden=include_hidden)
 
 
 # ─── POST /api/documents/analyze ────────────────────────────────────────────

@@ -156,6 +156,8 @@ export interface ImportBatch {
   started_at: string | null;
   finished_at: string | null;
   created_at: string;
+  /** Zeitpunkt des Ausblendens (null = sichtbar) */
+  hidden_at?: string | null;
 }
 
 export interface ImportBatchWithDocuments extends ImportBatch {
@@ -181,8 +183,17 @@ export interface BatchKiStats {
 
 export const importsApi = {
   /** Alle Batches laden (optional gefiltert) */
-  list: (params?: { company_name?: string; year?: number }) =>
+  list: (params?: { company_name?: string; year?: number; include_hidden?: boolean }) =>
     apiClient.get<ImportBatch[]>("/api/imports/", { params }).then((r) => r.data),
+
+  /** Imports aus- bzw. einblenden (es wird nichts gelöscht) */
+  setHidden: (ids: number[], hidden: boolean) =>
+    apiClient
+      .post<{ updated: number; hidden: boolean; ids: number[] }>("/api/imports/visibility", { ids, hidden })
+      .then((r) => r.data),
+
+  /** Download-URL für den Excel-Export von einem oder mehreren Imports (eine gemeinsame Datei) */
+  exportUrl: (ids: number[]) => `/api/imports/export/?${ids.map((i) => `ids=${i}`).join("&")}`,
 
   /** Batch mit Dokumenten laden */
   get: (id: number) =>
@@ -356,6 +367,8 @@ export interface DocumentFilter {
   doc_id?: number;
   document_type_ids?: number[];
   validation_status?: ValidationStatus[];
+  /** Auch Belege ausgeblendeter Imports */
+  include_hidden?: boolean;
 }
 
 /** Eine gespeicherte PDF-Version (Original = 1, danach manuell/auto/restore) */
@@ -418,9 +431,11 @@ export const documentsApi = {
     apiClient.get<number[]>("/api/documents/ids", { params: filters }).then((r) => r.data),
 
   /** Werte für die Filter-Dropdowns, unabhängig von der geladenen Seite */
-  filterOptions: () =>
+  filterOptions: (includeHidden = false) =>
     apiClient
-      .get<{ years: number[]; companies: string[] }>("/api/documents/filter-options")
+      .get<{ years: number[]; companies: string[] }>("/api/documents/filter-options", {
+        params: { include_hidden: includeHidden },
+      })
       .then((r) => r.data),
 
   /** Dokument mit Extraktion und Positionen laden */
