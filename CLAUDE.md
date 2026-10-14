@@ -393,6 +393,10 @@ nur bei Eingangsrechnungen mit verwertbarer KI-Antwort. Dreistufig:
    Ist die neue Auslesung plausibel → `ai_corrected` (ersetzt die erste). Sonst Original behalten.
 3. **Markierung** `needs_review` → manuelle Prüfung; Nutzer bestätigt mit `manual_ok`.
 
+**Keine Bestätigung für automatische Korrekturen:** `corrected` und `ai_corrected` gelten als **erledigt** (grün, kein Button „Als geprüft
+bestätigen"); die Änderungen bleiben im Prüfpanel nachlesbar. Hintergrund: bei sehr vielen Belegen (zehntausende) ist eine Einzelbestätigung
+nicht leistbar. Nur `needs_review` („Prüfen!") verlangt eine Entscheidung. Neue Statuswerte, die Nutzerhandlung verlangen, bitte sparsam einführen.
+
 `validation_status`: `ok` · `corrected` · `ai_corrected` · `needs_review` · `manual_ok` · `unchecked`.
 Gespeichert in `invoice_extractions.validation_status` (+ `validation_details` als JSON-Text).
 Die KI soll pro Position optional `preiseinheit` liefern (steht nur im `raw_response`, **keine** DB-Spalte —
