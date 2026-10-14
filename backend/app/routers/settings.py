@@ -13,6 +13,7 @@ from app import crud
 from app.config import settings
 from app.database import get_db
 from app.schemas.document_type import DocumentTypeRead
+from app.schemas.document_version import PdfSettingsRead, PdfSettingsUpdate
 from app.schemas.image_settings import ImageSettingsRead, ImageSettingsUpdate
 from app.schemas.processing_settings import ProcessingSettingsRead, ProcessingSettingsUpdate
 from app.schemas.system_prompt import SystemPromptCreate, SystemPromptRead, SystemPromptUpdate
@@ -41,6 +42,17 @@ def get_paths():
 @router.get("/image-conversion", response_model=ImageSettingsRead)
 def get_image_settings(db: Session = Depends(get_db)):
     return crud.image_settings.get_or_create(db)
+
+
+@router.get("/pdf", response_model=PdfSettingsRead)
+def get_pdf_settings(db: Session = Depends(get_db)):
+    """Einstellungen für das automatische Kürzen langer PDFs."""
+    return crud.pdf_settings.get_or_create(db)
+
+
+@router.put("/pdf", response_model=PdfSettingsRead)
+def update_pdf_settings(payload: PdfSettingsUpdate, db: Session = Depends(get_db)):
+    return crud.pdf_settings.update(db, payload)
 
 
 @router.put("/image-conversion", response_model=ImageSettingsRead)
@@ -114,6 +126,7 @@ def download_backup(db: Session = Depends(get_db)):
     prompts = crud.system_prompt.get_all(db)
     img = crud.image_settings.get_or_create(db)
     processing = crud.processing_settings.get_or_create(db)
+    pdf = crud.pdf_settings.get_or_create(db)
 
     def _obj(o):
         return {c.name: getattr(o, c.name) for c in o.__table__.columns}
@@ -125,6 +138,7 @@ def download_backup(db: Session = Depends(get_db)):
         "system_prompts": [_obj(p) for p in prompts],
         "image_settings": _obj(img),
         "processing_settings": _obj(processing),
+        "pdf_settings": _obj(pdf),
     }
 
     from fastapi.responses import Response
@@ -192,6 +206,14 @@ async def upload_restore(file: UploadFile = File(...), db: Session = Depends(get
         proc_data.pop("updated_at", None)
         db.query(ProcessingSettings).delete()
         db.add(ProcessingSettings(**proc_data))
+
+    # PDF-Einstellungen (fehlen in älteren Backups → bestehende bleiben unverändert)
+    pdf_data = backup.get("pdf_settings")
+    if pdf_data:
+        from app.models.pdf_settings import PdfSettings
+        pdf_data.pop("id", None)
+        db.query(PdfSettings).delete()
+        db.add(PdfSettings(id=1, **pdf_data))
 
     db.commit()
     return {"restored": restored, "message": "Backup erfolgreich wiederhergestellt"}

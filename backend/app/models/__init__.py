@@ -9,12 +9,14 @@ Base.metadata ausliest. Dieser zentrale Import stellt das sicher.
 from app.models.ai_config import AIConfig  # noqa: F401
 from app.models.document import Document  # noqa: F401
 from app.models.document_type import DocumentType  # noqa: F401
+from app.models.document_version import DocumentVersion  # noqa: F401
 from app.models.image_settings import ImageSettings  # noqa: F401
 from app.models.import_batch import ImportBatch  # noqa: F401
 from app.models.invoice_extraction import InvoiceExtraction  # noqa: F401
 from app.models.item import Item  # noqa: F401
 from app.models.order_position import OrderPosition  # noqa: F401
 from app.models.supplier import Supplier  # noqa: F401
+from app.models.pdf_settings import PdfSettings  # noqa: F401
 from app.models.processing_settings import ProcessingSettings  # noqa: F401
 from app.models.system_log import SystemLog  # noqa: F401
 from app.models.system_prompt import SystemPrompt  # noqa: F401

@@ -39,9 +39,11 @@ function CategoryBadge({ category }: { category: string }) {
     import: "bg-purple-100 text-purple-700",
     ki: "bg-green-100 text-green-700",
     system: "bg-gray-200 text-gray-700",
+    pdf: "bg-amber-100 text-amber-800",
   };
   const labels: Record<string, string> = {
     import: "Import",
+    pdf: "PDF",
     ki: "KI-Abfrage",
     system: "System",
   };

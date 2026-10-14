@@ -81,6 +81,11 @@ class Document(Base):
     doc_ki_output_tokens: Mapped[int | None]   = mapped_column(Integer, nullable=True)
     doc_ki_total_duration: Mapped[float | None] = mapped_column(nullable=True)
 
+    # Aktuelle PDF-Version (1 = Original) und die Version, auf der die letzte
+    # KI-Analyse lief — zeigt, ob nach einer PDF-Bearbeitung neu analysiert werden sollte.
+    pdf_version: Mapped[int] = mapped_column(Integer, default=1, server_default="1", nullable=False)
+    analyzed_pdf_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
     # Beim Analysieren tatsächlich verwendete Systemprompts (Wortlaut-Snapshot)
     used_system_prompt:   Mapped[str | None] = mapped_column(Text, nullable=True)
     used_doc_type_prompt: Mapped[str | None] = mapped_column(Text, nullable=True)
