@@ -11,6 +11,7 @@ import {
   DocumentType,
   ImportBatch,
   SystemPrompt,
+  ValidationStatus,
   aiConfigsApi,
   documentTypesApi,
   documentsApi,
@@ -59,6 +60,33 @@ function KiBadge({ hasExtraction }: { hasExtraction: boolean }) {
   if (hasExtraction) return <span className="text-xs font-medium text-green-700">Ja</span>;
   return <span className="text-xs text-gray-400">Nein</span>;
 }
+
+const VALIDATION_STYLES: Record<ValidationStatus, { label: string; cls: string; hint: string }> = {
+  ok: { label: "OK", cls: "bg-green-100 text-green-700", hint: "Alle Prüfungen bestanden" },
+  corrected: { label: "Korrigiert", cls: "bg-amber-100 text-amber-800", hint: "Automatisch (rechnerisch) korrigiert" },
+  ai_corrected: { label: "KI-korrigiert", cls: "bg-amber-100 text-amber-800", hint: "Durch zweite KI-Abfrage korrigiert" },
+  needs_review: { label: "Prüfen!", cls: "bg-red-100 text-red-700", hint: "Nicht plausibel — bitte manuell prüfen" },
+  manual_ok: { label: "Geprüft", cls: "bg-blue-100 text-blue-700", hint: "Manuell als geprüft bestätigt" },
+  unchecked: { label: "–", cls: "bg-gray-100 text-gray-500", hint: "Nicht prüfbar (keine Beträge/Positionen)" },
+};
+
+function ValidationBadge({ status }: { status: ValidationStatus | null | undefined }) {
+  if (!status) return <span className="text-gray-400">–</span>;
+  const v = VALIDATION_STYLES[status];
+  if (!v) return <span className="text-gray-400">{status}</span>;
+  return (
+    <span title={v.hint} className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium whitespace-nowrap ${v.cls}`}>
+      {v.label}
+    </span>
+  );
+}
+
+/** Filter-Presets für die Plausibilitätsprüfung → Backend-Statuswerte */
+const VALIDATION_FILTERS: Record<string, { label: string; statuses: ValidationStatus[] }> = {
+  needs_review: { label: "Manuell prüfen", statuses: ["needs_review"] },
+  corrected: { label: "Korrigiert", statuses: ["corrected", "ai_corrected"] },
+  ok: { label: "In Ordnung", statuses: ["ok", "manual_ok"] },
+};
 
 // ─── Batch-Multiselect ───────────────────────────────────────────────────────
 
@@ -209,6 +237,7 @@ export default function BelegePage() {
   const [filterKi, setFilterKi] = useState<"" | "ja" | "nein">("");
   const [filterSupplierName, setFilterSupplierName] = useState("");
   const [filterDocId, setFilterDocId] = useState("");
+  const [filterValidation, setFilterValidation] = useState("");
   const [activeFilters, setActiveFilters] = useState<DocumentFilter>({});
 
   // Daten
@@ -342,6 +371,9 @@ export default function BelegePage() {
     if (filterKi === "nein") f.has_extraction = false;
     if (filterSupplierName.trim()) f.supplier_name = filterSupplierName.trim();
     if (filterDocId.trim()) f.doc_id = parseInt(filterDocId.trim(), 10);
+    if (filterValidation && VALIDATION_FILTERS[filterValidation]) {
+      f.validation_status = VALIDATION_FILTERS[filterValidation].statuses;
+    }
     return f;
   }
 
@@ -357,7 +389,7 @@ export default function BelegePage() {
     setFilterCompany(""); setFilterYear(""); setFilterStatus("");
     setFilterTotalMin(""); setFilterTotalMax(""); setFilterPageMin(""); setFilterPageMax("");
     setSelectedBatchIds(new Set()); setSelectedDocTypeIds(new Set()); setIncludeDeleted(false);
-    setFilterKi(""); setFilterSupplierName(""); setFilterDocId("");
+    setFilterKi(""); setFilterSupplierName(""); setFilterDocId(""); setFilterValidation("");
     const f: DocumentFilter = {};
     setActiveFilters(f);
     setSelectedIds(new Set());
@@ -542,6 +574,16 @@ export default function BelegePage() {
               </select>
             </div>
             <div className="flex flex-col gap-1">
+              <label className="text-xs font-medium text-gray-600">Plausibilität</label>
+              <select value={filterValidation} onChange={(e) => setFilterValidation(e.target.value)}
+                className="rounded border border-gray-300 px-3 py-1.5 text-sm focus:border-blue-500 focus:outline-none w-40">
+                <option value="">Alle</option>
+                {Object.entries(VALIDATION_FILTERS).map(([key, v]) => (
+                  <option key={key} value={key}>{v.label}</option>
+                ))}
+              </select>
+            </div>
+            <div className="flex flex-col gap-1">
               <label className="text-xs font-medium text-gray-600">Lieferant</label>
               <select value={filterSupplierName} onChange={(e) => setFilterSupplierName(e.target.value)}
                 className="rounded border border-gray-300 px-3 py-1.5 text-sm focus:border-blue-500 focus:outline-none w-48">
@@ -690,7 +732,15 @@ export default function BelegePage() {
                     <p className="text-xs text-gray-500">{viewedDoc.company} {viewedDoc.year} · #{viewedDoc.id}</p>
                   </div>
                   <div className="p-5">
-                    <InfosView doc={viewedDoc} />
+                    <InfosView
+                      doc={viewedDoc}
+                      onDocChange={(d) => {
+                        setViewedDoc(d);
+                        setDocuments((prev) => prev.map((x) =>
+                          x.id === d.id ? { ...x, validation_status: d.validation_status } : x
+                        ));
+                      }}
+                    />
                   </div>
                 </div>
 
@@ -738,6 +788,7 @@ export default function BelegePage() {
                   <th className="px-3 py-3 text-left font-medium text-gray-600">Status</th>
                   <th className="px-3 py-3 text-left font-medium text-gray-600">KI</th>
                   <th className="px-3 py-3 text-right font-medium text-gray-600">KI-Zeit</th>
+                  <th className="px-3 py-3 text-left font-medium text-gray-600">Prüfung</th>
                   {!showPreview && (
                     <>
                       <th className="px-3 py-3 text-left font-medium text-gray-600">Dokumententyp</th>
@@ -750,10 +801,10 @@ export default function BelegePage() {
               </thead>
               <tbody className="divide-y divide-gray-100">
                 {loading && documents.length === 0 && (
-                  <tr><td colSpan={13} className="px-4 py-8 text-center text-gray-400">Wird geladen...</td></tr>
+                  <tr><td colSpan={14} className="px-4 py-8 text-center text-gray-400">Wird geladen...</td></tr>
                 )}
                 {!loading && documents.length === 0 && (
-                  <tr><td colSpan={13} className="px-4 py-8 text-center text-gray-400">Keine Belege gefunden</td></tr>
+                  <tr><td colSpan={14} className="px-4 py-8 text-center text-gray-400">Keine Belege gefunden</td></tr>
                 )}
                 {documents.map((doc) => {
                   const isDeleted = !!doc.deleted_at;
@@ -805,6 +856,7 @@ export default function BelegePage() {
                       <td className="px-3 py-2.5 text-right tabular-nums text-xs text-gray-500">
                         {formatKiDuration(doc.ki_total_duration)}
                       </td>
+                      <td className="px-3 py-2.5"><ValidationBadge status={doc.validation_status} /></td>
 
                       {/* Dokumententyp + Rechnungsnr. + Lieferant nur ohne Preview */}
                       {!showPreview && (
@@ -963,6 +1015,7 @@ export default function BelegePage() {
                   kiTotalDuration={viewedDoc.ki_total_duration}
                 />
               )}
+              {!viewLoading && viewedDoc && <UsedPrompts doc={viewedDoc} />}
               {!viewLoading && !viewedDoc && (
                 <p className="text-sm text-red-500">Dokument konnte nicht geladen werden.</p>
               )}
@@ -1027,7 +1080,13 @@ function KiRawView({
 
 // ─── Formatierte Infos-Ansicht ────────────────────────────────────────────────
 
-function InfosView({ doc }: { doc: DocumentDetail }) {
+function InfosView({
+  doc,
+  onDocChange,
+}: {
+  doc: DocumentDetail;
+  onDocChange: (doc: DocumentDetail) => void;
+}) {
   const ext = doc.extraction;
 
   // Neues verschachteltes Format aus raw_response lesen (für Felder außerhalb der DB-Spalten)
@@ -1084,6 +1143,8 @@ function InfosView({ doc }: { doc: DocumentDetail }) {
 
   return (
     <div>
+      <ValidationPanel doc={doc} onChange={onDocChange} />
+
       {/* Lieferant */}
       <Section title="Lieferant">
         <Row label="Name" value={lieferant?.name ?? ext?.supplier_name} />
@@ -1224,6 +1285,138 @@ function InfosView({ doc }: { doc: DocumentDetail }) {
       {!ext && (
         <p className="text-sm text-gray-400">Keine Extraktionsdaten vorhanden.</p>
       )}
+    </div>
+  );
+}
+
+
+// ─── Plausibilitätsprüfung (Infos-Ansicht) ────────────────────────────────────
+
+function ValidationPanel({
+  doc,
+  onChange,
+}: {
+  doc: DocumentDetail;
+  onChange: (doc: DocumentDetail) => void;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const status = doc.validation_status;
+  const v = doc.validation;
+  if (!doc.extraction || !status) return null;
+
+  async function run(action: "revalidate" | "confirm") {
+    setBusy(true);
+    setErr(null);
+    try {
+      const updated = action === "revalidate"
+        ? await documentsApi.revalidate(doc.id)
+        : await documentsApi.confirmValidation(doc.id);
+      onChange(updated);
+    } catch (e) {
+      setErr(extractApiError(e, "Aktion fehlgeschlagen"));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const fmtNum = (n: number) =>
+    new Intl.NumberFormat("de-DE", { minimumFractionDigits: 2, maximumFractionDigits: 4 }).format(n);
+  const info = VALIDATION_STYLES[status];
+  const box =
+    status === "needs_review" ? "border-red-200 bg-red-50"
+    : status === "corrected" || status === "ai_corrected" ? "border-amber-200 bg-amber-50"
+    : status === "manual_ok" ? "border-blue-200 bg-blue-50"
+    : "border-green-200 bg-green-50";
+  const sevCls: Record<string, string> = {
+    error: "text-red-700", warning: "text-red-700", info: "text-gray-600",
+  };
+
+  return (
+    <div className={`mb-6 rounded-lg border p-4 ${box}`}>
+      <div className="mb-2 flex flex-wrap items-center gap-2">
+        <h3 className="text-sm font-semibold text-gray-700 uppercase tracking-wide">Plausibilitätsprüfung</h3>
+        <ValidationBadge status={status} />
+        <span className="text-xs text-gray-500">{info?.hint}</span>
+      </div>
+
+      {(v?.corrections ?? []).length > 0 && (
+        <ul className="mb-2 space-y-1 text-sm text-amber-900">
+          {v!.corrections.map((c, i) => (
+            <li key={i}>
+              ↻ Position {c.position + 1}: Positionspreis von <b>{fmtNum(c.from)} €</b> auf{" "}
+              <b>{fmtNum(c.to)} €</b> korrigiert (Faktor {String(c.factor).replace(".", ",")})
+            </li>
+          ))}
+        </ul>
+      )}
+
+      {(v?.issues ?? []).length > 0 && (
+        <ul className="mb-2 space-y-1 text-sm">
+          {v!.issues.map((i, idx) => (
+            <li key={idx} className={sevCls[i.severity] ?? "text-gray-600"}>
+              {i.severity === "info" ? "ℹ" : "⚠"} {i.message}
+            </li>
+          ))}
+        </ul>
+      )}
+
+      {v?.recheck?.performed && (
+        <p className="mb-2 text-xs text-gray-600">
+          Zweite KI-Abfrage:{" "}
+          {v.recheck.outcome === "corrected" && "Auslesung korrigiert — jetzt plausibel."}
+          {v.recheck.outcome === "still_inconsistent" && "weiterhin nicht plausibel — ursprüngliche Auslesung behalten."}
+          {v.recheck.outcome === "failed" && `fehlgeschlagen${v.recheck.error ? ` (${v.recheck.error})` : ""}.`}
+        </p>
+      )}
+
+      {err && <p className="mb-2 text-xs text-red-600">{err}</p>}
+
+      <div className="flex flex-wrap gap-2">
+        <button
+          onClick={() => run("revalidate")}
+          disabled={busy}
+          className="rounded border border-gray-300 bg-white px-2.5 py-1 text-xs font-medium text-gray-700 hover:bg-gray-100 disabled:opacity-50"
+        >
+          {busy ? "…" : "Prüfung erneut ausführen"}
+        </button>
+        {status !== "manual_ok" && status !== "ok" && (
+          <button
+            onClick={() => run("confirm")}
+            disabled={busy}
+            className="rounded bg-blue-600 px-2.5 py-1 text-xs font-medium text-white hover:bg-blue-700 disabled:opacity-50"
+          >
+            Als geprüft bestätigen
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ─── Verwendete Systemprompts (KI-Modal) ──────────────────────────────────────
+
+function UsedPrompts({ doc }: { doc: DocumentDetail }) {
+  const items: { title: string; text: string | null | undefined }[] = [
+    { title: "Systemprompt (Extraktion)", text: doc.used_system_prompt },
+    { title: "Systemprompt (Dokumententyp-Erkennung)", text: doc.used_doc_type_prompt },
+    { title: "Systemprompt (zweite KI-Abfrage / Plausibilität)", text: doc.used_recheck_prompt },
+  ];
+  const present = items.filter((i) => i.text);
+  if (present.length === 0) return null;
+  return (
+    <div className="mt-4 space-y-2">
+      <h3 className="text-xs font-semibold uppercase tracking-wide text-gray-500">
+        Bei dieser Analyse verwendete Prompts
+      </h3>
+      {present.map((i) => (
+        <details key={i.title} className="rounded-lg border border-gray-200 bg-gray-50">
+          <summary className="cursor-pointer px-3 py-2 text-sm font-medium text-gray-700">{i.title}</summary>
+          <pre className="overflow-x-auto whitespace-pre-wrap break-words border-t border-gray-200 p-3 text-xs text-gray-700">
+            {i.text}
+          </pre>
+        </details>
+      ))}
     </div>
   );
 }

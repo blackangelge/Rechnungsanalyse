@@ -34,6 +34,10 @@ Analysiere die bereitgestellten Rechnungsbilder und extrahiere alle Daten.
 Antworte AUSSCHLIESSLICH mit einem gültigen JSON-Objekt — ohne Markdown, ohne Erklärungen.
 Nicht gefundene Werte setzt du auf null.
 
+Achte besonders auf Einheiten: Menge und Einzelpreis können sich auf unterschiedliche
+Einheiten beziehen (z.B. Menge in kg, Preis je Tonne; Preis je 100 Stück). Übernimm
+gesamtpreis exakt so, wie er auf der Rechnung steht — rechne ihn nicht selbst aus.
+
 JSON-Struktur:
 {
   "lieferant": {
@@ -66,6 +70,7 @@ JSON-Struktur:
       "artikelnummer_lieferant": "Artikelnummer des Lieferanten",
       "menge": 0,
       "mengeneinheit": "Stück/kg/Liter/Palette/etc.",
+      "preiseinheit": "Bezugsgröße des Einzelpreises, z.B. kg, t, 100 kg, 1000 Stück (nur wenn sie von mengeneinheit abweicht, sonst null)",
       "einzelpreis": 0.00,
       "gesamtpreis": 0.00,
       "waehrung": "EUR",
@@ -314,6 +319,50 @@ def extract_invoice_data(
         len(order_positions),
     )
     return extracted_fields, order_positions, raw_text, ki_stats
+
+
+def build_recheck_prompt(
+    base_prompt: str | None,
+    issues: list[str],
+    previous_raw: str | None,
+) -> str:
+    """
+    Baut den Systemprompt für die zweite KI-Abfrage (Plausibilitäts-Nachprüfung):
+    der normale Extraktionsprompt plus die gefundenen Auffälligkeiten.
+    """
+    parts = [base_prompt or DEFAULT_SYSTEM_PROMPT, "", "PRÜFHINWEIS — NACHPRÜFUNG:"]
+    parts.append(
+        "Eine automatische Plausibilitätsprüfung hat bei einer ersten Auslesung dieser "
+        "Rechnung Unstimmigkeiten gefunden. Lies die Rechnung erneut sorgfältig aus "
+        "und achte besonders auf Mengeneinheiten (t/kg/g, l/ml/hl, Stück, Preis je 100 "
+        "oder je 1000) sowie auf Rechnungssummen. Übernimm Preise und Summen exakt so, "
+        "wie sie auf der Rechnung stehen. Antworte im gleichen JSON-Format wie zuvor."
+    )
+    parts.append("Gefundene Auffälligkeiten:")
+    parts.extend(f"- {msg}" for msg in issues[:20])
+    if previous_raw:
+        parts.append("")
+        parts.append("Erste Auslesung (zur Orientierung, kann fehlerhaft sein):")
+        parts.append(previous_raw[:6000])
+    return "\n".join(parts)
+
+
+def recheck_invoice_data(
+    images_b64: list[str],
+    config,
+    base_prompt: str | None,
+    issues: list[str],
+    previous_raw: str | None,
+) -> tuple[dict[str, Any], list[dict[str, Any]], str, dict, str]:
+    """
+    Zweite KI-Abfrage nach fehlgeschlagener Plausibilitätsprüfung.
+
+    SYNCHRON (via asyncio.to_thread aufrufen), wirft nie eine Exception.
+    Returns: (extracted_fields, order_positions, raw_response, ki_stats, prompt_used)
+    """
+    prompt = build_recheck_prompt(base_prompt, issues, previous_raw)
+    fields, positions, raw, stats = extract_invoice_data(images_b64, config, prompt)
+    return fields, positions, raw, stats, prompt
 
 
 def detect_document_type(

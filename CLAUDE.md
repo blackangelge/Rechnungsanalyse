@@ -96,7 +96,11 @@ app/
     │                       # extract_invoice_data ist SYNCHRON (httpx.Client)
     │                       # detect_document_type ist SYNCHRON (httpx.Client)
     │                       # DEFAULT_DOC_TYPE_SYSTEM_PROMPT — Fallback-Systemprompt
-    └── pdf_service.py      # PDF → Bilder (pypdfium2), Seitenanzahl (pypdf)
+    ├── pdf_service.py      # PDF → Bilder (pypdfium2), Seitenanzahl (pypdf)
+    └── plausibility_service.py  # Plausibilitätsprüfung (reine Rechenlogik, keine DB/Netzwerk)
+                            # Einheiten (t/kg/g, l/ml/hl, Stück, Verpackungen), Positions-/Summen-/
+                            # Steuerprüfung, automatische Einheiten-Korrektur
+tests/                      # pytest (SQLite statt PostgreSQL, siehe tests/conftest.py)
 alembic/
 └── versions/
     ├── 0001_initial.py     # Alle Basistabellen
@@ -108,9 +112,13 @@ alembic/
     │                       # document_types-Tabelle (15 Typen), document_type_id FK
     │                       # auf documents, is_document_type_prompt auf system_prompts
     │                       # ACHTUNG: down_revision = "0010" (nicht "0010_ki_total_duration")
-    └── 0012_doc_ki_stats.py
-                            # doc_ki_input_tokens, doc_ki_output_tokens, doc_ki_total_duration
-                            # auf documents (Fallback-Stats für Nicht-Eingangsrechnungen)
+    ├── 0012_doc_ki_stats.py
+    │                       # doc_ki_input_tokens, doc_ki_output_tokens, doc_ki_total_duration
+    │                       # auf documents (Fallback-Stats für Nicht-Eingangsrechnungen)
+    └── 0013_plausibility_and_prompt_snapshot.py
+                            # revision = "0013_plausibility"; validation_status/-details auf
+                            # invoice_extractions; used_system_prompt/_doc_type_prompt/
+                            # _recheck_prompt auf documents
 ```
 
 ### Import-Ablauf
@@ -317,6 +325,40 @@ Schließt Nicht-Eingangsrechnungen ab:
 
 **Fehlerbehandlung in `save_extraction`:** Bei fehlgeschlagenem DB-Commit (z.B. Migration noch nicht angewendet) → `db.rollback()` + Retry ohne KI-Stats-Felder.
 
+### Plausibilitätsprüfung (`services/plausibility_service.py`)
+
+Läuft in `_analyze_single` als **Phase 3c** nach der Extraktion (`_plausibility_pass` in `documents.py`),
+nur bei Eingangsrechnungen mit verwertbarer KI-Antwort. Dreistufig:
+
+1. **Regeln + automatische Korrektur** (`validate_invoice`, ohne KI):
+   - Position: Menge × Einzelpreis ≙ Positionspreis (Positionsrabatt und abweichende Preiseinheit wie
+     „Preis je t bei Menge in kg" werden erkannt und nur als `info` gemeldet)
+   - Summe: Σ Positionspreise ≙ Netto **oder** Brutto
+   - Netto + Steuer ≙ Brutto; Steuerbetrag ≙ Netto × Satz
+   - Passt die Summe nicht, wird nach der **kleinsten eindeutigen** Korrektur gesucht (1, dann 2 Positionen,
+     Faktoren aus Einheiten-Verhältnissen + 10/100/1000 und Kehrwerte). Mehrdeutig → es wird **nicht geraten**.
+     Korrigiert wird nur `total_price`; Originalwert steht in `validation_details.corrections`.
+2. **Zweite KI-Abfrage** (`ai_service.recheck_invoice_data`): nur wenn Stufe 1 `needs_review` ergibt.
+   Systemprompt = normaler Extraktionsprompt + Prüfhinweis + gefundene Auffälligkeiten + erste Auslesung.
+   Ist die neue Auslesung plausibel → `ai_corrected` (ersetzt die erste). Sonst Original behalten.
+3. **Markierung** `needs_review` → manuelle Prüfung; Nutzer bestätigt mit `manual_ok`.
+
+`validation_status`: `ok` · `corrected` · `ai_corrected` · `needs_review` · `manual_ok` · `unchecked`.
+Gespeichert in `invoice_extractions.validation_status` (+ `validation_details` als JSON-Text).
+Die KI soll pro Position optional `preiseinheit` liefern (steht nur im `raw_response`, **keine** DB-Spalte —
+daher nicht in `_map_new_format` mappen, sonst `TypeError` bei `OrderPosition(**pos)`).
+
+Endpunkte: `POST /api/documents/{id}/validate` (Regeln erneut, frühere Korrekturen bleiben dokumentiert),
+`POST /api/documents/{id}/validation/confirm`, Filter `GET /api/documents?validation_status=needs_review`.
+
+**Gespeicherte Prompts:** Zu Beginn jeder Analyse wird der Wortlaut des verwendeten Extraktions- und
+Dokumententyp-Prompts in `documents.used_system_prompt` / `used_doc_type_prompt` gespeichert (bei Fallback der
+Default-Prompt aus `ai_service`), der Nachprüfungs-Prompt in `used_recheck_prompt`. Sichtbar im KI-Modal der Belege-Seite.
+**Migration 0013 ist Pflicht:** `docker-compose.yml` führt `alembic upgrade head` bei jedem Backend-Start aus; ohne die
+neuen Spalten schlägt jede Dokument-Abfrage fehl.
+
+**Tests:** `cd backend && pip install -r requirements-dev.txt && pytest`
+
 ### KI-Token-Statistiken
 
 #### Für Eingangsrechnungen (in `invoice_extractions`)
@@ -511,7 +553,7 @@ Typen:
 
 ### Belege-Seite (`belege/page.tsx`)
 
-- Filter: Firma, Jahr, Status, Dokumententyp, Import, Betrag von/bis, Seiten von/bis
+- Filter: Firma, Jahr, Status, Dokumententyp, Import, Betrag von/bis, Seiten von/bis, Plausibilität (Manuell prüfen / Korrigiert / In Ordnung)
 - Tabelle: Checkbox, ID, Firma, Jahr, Dateiname, Seiten, Betrag, Status, Dokumententyp, Rechnungsnr., Lieferant, PDF-Link
 - Betrag/Rechnungsnr./Lieferant/Dokumententyp kommen direkt aus `DocumentItem` (Backend liefert sie mit)
 - Aktionsleiste bei Auswahl: KI-Konfiguration + Systemprompt wählen → „KI-Analyse starten"
@@ -525,6 +567,11 @@ Gleiche Dropdown-Checkbox-Komponente wie `BatchMultiSelect` (Import-Filter):
 - `buildFilters()` fügt `document_type_ids` als Array hinzu, wenn mindestens ein Typ gewählt
 - `resetFilters()` setzt `selectedDocTypeIds` zurück
 - Backend: `GET /api/documents?document_type_ids=1&document_type_ids=3` — filtert mit `.in_()`
+
+- Spalte **Prüfung** (`ValidationBadge`): OK · Korrigiert · KI-korrigiert · Prüfen! · Geprüft
+- Infos-Ansicht: `ValidationPanel` oben (Korrekturen, Auffälligkeiten, Ergebnis der zweiten KI-Abfrage,
+  Buttons „Prüfung erneut ausführen" / „Als geprüft bestätigen")
+- KI-Modal zeigt unter der Rohantwort die bei der Analyse verwendeten Prompts (`UsedPrompts`)
 
 #### Aktions-Buttons pro Dokument
 
@@ -588,6 +635,8 @@ Behandelt sowohl `number` als auch Strings wie `"719,99 €"`:
 
 ### Bekannte Fallstricke
 
+- **Einheitenfehler (t ↔ kg, l ↔ hl, je 100/1000)**: werden von `plausibility_service` erkannt. Neue
+  Einheiten/Schreibweisen in `_register(...)` ergänzen, nicht in den Prüfregeln.
 - **Infinite render loop in `useCallback`**: Nie State-Variablen in Dependency-Array aufnehmen, die innerhalb des Callbacks gesetzt werden. Stattdessen `useRef` verwenden (z.B. `batchLoadedRef` in `/imports/[id]/page.tsx`).
 - **LM Studio `channelId`-Warnung**: Entsteht durch `"detail": "high"` in image_url oder fehlendes `"stream": false`. Beides in `ai_service.py` korrekt gesetzt.
 - **Dokument bleibt auf „Wird verarbeitet"**: Kann durch fehlgeschlagenen DB-Commit entstehen (z.B. Datum im falschen Format von KI). `_date()` in `ai_service.py` normalisiert alle bekannten Formate → `None` bei unbekanntem Format, verhindert Commit-Fehler.
@@ -676,6 +725,7 @@ ProcessingSettings (Singleton, import_concurrency + ai_concurrency)
 | `0009_ki_stats_on_invoice_extractions.py` | 5 `ki_*`-Spalten auf `invoice_extractions` (nullable) |
 | `0011_document_types.py` | `document_types`-Tabelle (15 vordefinierte Typen), `document_type_id` FK auf `documents`, `is_document_type_prompt` auf `system_prompts` |
 | `0012_doc_ki_stats.py` | `doc_ki_input_tokens`, `doc_ki_output_tokens`, `doc_ki_total_duration` auf `documents` (Fallback-Stats für Nicht-Eingangsrechnungen ohne InvoiceExtraction) |
+| `0013_plausibility_and_prompt_snapshot.py` | `validation_status`/`validation_details` auf `invoice_extractions`; `used_system_prompt`, `used_doc_type_prompt`, `used_recheck_prompt` auf `documents` |
 
 ### Import-Status-Flow
 

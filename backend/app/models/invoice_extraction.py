@@ -114,6 +114,12 @@ class InvoiceExtraction(Base):
     # Gesamtdauer des KI-API-Aufrufs in Sekunden (Request gesendet → Response empfangen)
     ki_total_duration: Mapped[float | None] = mapped_column(Float, nullable=True)
 
+    # ─── Plausibilitätsprüfung ───────────────────────────────────────────────
+    # ok | corrected | ai_corrected | needs_review | manual_ok | unchecked
+    validation_status: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    # JSON: {"issues": [...], "corrections": [...], "checks_run": n, ...}
+    validation_details: Mapped[str | None] = mapped_column(Text, nullable=True)
+
     # Erstellungs- und Änderungszeitpunkt
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False

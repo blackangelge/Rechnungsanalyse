@@ -42,6 +42,7 @@ class DocumentListRead(DocumentRead):
     ki_total_duration: float | None = None
     document_type_id: int | None = None
     document_type_name: str | None = None
+    validation_status: str | None = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -72,6 +73,15 @@ class DocumentDetail(DocumentRead):
     ki_input_tokens: int | None = None
     ki_output_tokens: int | None = None
     ki_total_duration: float | None = None
+
+    # Plausibilitätsprüfung (Status + Details aus der Extraktion)
+    validation_status: str | None = None
+    validation: dict | None = None
+
+    # Beim Analysieren verwendete Systemprompts (Wortlaut)
+    used_system_prompt: str | None = None
+    used_doc_type_prompt: str | None = None
+    used_recheck_prompt: str | None = None
 
     model_config = ConfigDict(from_attributes=True)
 

@@ -2,6 +2,7 @@
 CRUD-Operationen für importierte Dokumente.
 """
 
+import json
 import logging
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -157,6 +158,7 @@ def get_all_filtered(
     supplier_name_filter: str | None = None,
     doc_id: int | None = None,
     document_type_ids: list[int] | None = None,
+    validation_statuses: list[str] | None = None,
 ) -> list[Document]:
     """
     Gibt alle Dokumente zurück, optional gefiltert.
@@ -183,6 +185,7 @@ def get_all_filtered(
         or total_max is not None
         or has_extraction is not None
         or supplier_name_filter is not None
+        or bool(validation_statuses)
     )
     if needs_join:
         query = query.outerjoin(
@@ -201,6 +204,10 @@ def get_all_filtered(
         query = query.filter(InvoiceExtraction.id.isnot(None))
     elif has_extraction is False:
         query = query.filter(InvoiceExtraction.id.is_(None))
+
+    # Plausibilitätsprüfung: Dokumente mit bestimmtem Prüfstatus
+    if validation_statuses:
+        query = query.filter(InvoiceExtraction.validation_status.in_(validation_statuses))
 
     # Lieferantenname-Filter
     if supplier_name_filter:
@@ -235,6 +242,7 @@ def save_extraction(
     raw_response: str,
     supplier_id: int | None = None,
     ki_stats: dict | None = None,
+    validation: dict | None = None,
 ) -> InvoiceExtraction:
     """
     Speichert extrahierte Rechnungsdaten und Bestellpositionen.
@@ -247,6 +255,8 @@ def save_extraction(
         raw_response: vollständige KI-Antwort als String (für Debugging)
         supplier_id: optionale ID des verknüpften Lieferanten-Stammdatensatzes
         ki_stats: optionale KI-Statistiken (Token-Counts, Geschwindigkeit)
+        validation: optionales Ergebnis der Plausibilitätsprüfung
+                    (ValidationResult.to_dict() + Zusatzinfos)
     """
     # Vorhandene Extraktion löschen (falls Wiederholung)
     db.query(InvoiceExtraction).filter(
@@ -258,6 +268,13 @@ def save_extraction(
 
     # KI-Statistiken auspacken
     stats = ki_stats or {}
+    validation_cols = (
+        {
+            "validation_status": validation.get("status"),
+            "validation_details": json.dumps(validation, ensure_ascii=False),
+        }
+        if validation else {}
+    )
 
     # Neue Extraktion speichern — erst mit KI-Stats, bei DB-Fehler ohne Retry
     extraction = InvoiceExtraction(
@@ -270,6 +287,7 @@ def save_extraction(
         ki_tokens_per_second=stats.get("tokens_per_second"),
         ki_time_to_first_token=stats.get("time_to_first_token"),
         ki_total_duration=stats.get("total_duration"),
+        **validation_cols,
         **extracted_data,
     )
     db.add(extraction)
@@ -315,5 +333,68 @@ def save_extraction(
             db.add(order_pos)
         db.commit()
 
+    db.refresh(extraction)
+    return extraction
+
+
+def save_used_prompts(
+    db: Session,
+    doc_id: int,
+    system_prompt: str | None = None,
+    doc_type_prompt: str | None = None,
+) -> None:
+    """
+    Speichert den Wortlaut der bei der Analyse verwendeten Systemprompts am
+    Dokument. Wird zu Beginn jeder (Neu-)Analyse aufgerufen und überschreibt
+    die vorherigen Prompts; der Nachprüfungs-Prompt wird dabei zurückgesetzt.
+    """
+    obj = db.get(Document, doc_id)
+    if obj is None:
+        return
+    obj.used_system_prompt = system_prompt
+    obj.used_doc_type_prompt = doc_type_prompt
+    obj.used_recheck_prompt = None
+    db.commit()
+
+
+def save_recheck_prompt(db: Session, doc_id: int, recheck_prompt: str | None) -> None:
+    """Speichert den Prompt der zweiten KI-Abfrage (Plausibilitäts-Nachprüfung)."""
+    obj = db.get(Document, doc_id)
+    if obj is None:
+        return
+    obj.used_recheck_prompt = recheck_prompt
+    db.commit()
+
+
+def update_validation(
+    db: Session,
+    doc_id: int,
+    validation: dict,
+    corrected_positions: list[dict] | None = None,
+) -> InvoiceExtraction | None:
+    """
+    Schreibt ein (neues) Prüfergebnis in die Extraktion. Optional werden
+    korrigierte `total_price`-Werte in die Positionen übernommen
+    (`corrected_positions` = [{"position": idx, "to": wert}, ...]).
+    """
+    extraction = (
+        db.query(InvoiceExtraction).filter(InvoiceExtraction.document_id == doc_id).first()
+    )
+    if extraction is None:
+        return None
+    for corr in corrected_positions or []:
+        pos = (
+            db.query(OrderPosition)
+            .filter(
+                OrderPosition.document_id == doc_id,
+                OrderPosition.position_index == corr["position"],
+            )
+            .first()
+        )
+        if pos is not None:
+            pos.total_price = Decimal(str(corr["to"]))
+    extraction.validation_status = validation.get("status")
+    extraction.validation_details = json.dumps(validation, ensure_ascii=False)
+    db.commit()
     db.refresh(extraction)
     return extraction
