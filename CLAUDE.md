@@ -643,6 +643,10 @@ Typen:
 - Filter: Firma, Jahr, Status, Dokumententyp, Import, Betrag von/bis, Seiten von/bis, Plausibilität (Manuell prüfen / Korrigiert / In Ordnung)
 - Tabelle: Checkbox, ID, Firma, Jahr, Dateiname, Seiten, Betrag, Status, Dokumententyp, Rechnungsnr., Lieferant, PDF-Link
 - Betrag/Rechnungsnr./Lieferant/Dokumententyp kommen direkt aus `DocumentItem` (Backend liefert sie mit)
+- **Direktlink:** `/belege?doc_id=42` (optional `&include_deleted=1`) trägt die ID ins Feld „Beleg-ID" ein und filtert sofort
+  (gelesen aus `window.location` im Mount-Effekt, nicht per `useSearchParams` → kein Suspense, keine Hydration-Abweichung).
+  „Filter anwenden"/„Zurücksetzen" halten die Adresszeile per `history.replaceState` synchron (`syncUrl`). Die Beleg-ID in der
+  Logs-Tabelle ist ein solcher Link.
 - Aktionsleiste bei Auswahl: KI-Konfiguration + Systemprompt wählen → „KI-Analyse starten"
 - Auto-Refresh alle 5 s solange Dokumente mit Status `processing` vorhanden
 
