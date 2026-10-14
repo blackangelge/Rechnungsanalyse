@@ -271,13 +271,23 @@ export interface ValidationIssue {
   details: Record<string, unknown>;
 }
 
+/** Automatische Korrektur: Positionspreis (`position` gesetzt) oder Gesamtbetrag (`field: "total_amount"`) */
 export interface ValidationCorrection {
-  position: number;
+  position?: number;
   field: string;
-  from: number;
+  from: number | null;
   to: number;
-  factor: number;
+  factor?: number;
   method: string;
+}
+
+/** Eine Zeile der „Durchrechnung": berechneter Wert (expected) ↔ Wert laut Rechnung (actual) */
+export interface ValidationCalcRow {
+  label: string;
+  expected: number | null;
+  actual: number | null;
+  status: "ok" | "warn";
+  note?: string | null;
 }
 
 export interface ValidationDetails {
@@ -286,6 +296,8 @@ export interface ValidationDetails {
   issues: ValidationIssue[];
   corrections: ValidationCorrection[];
   checks_run: number;
+  /** Durchrechnung aller Werte (Positionen, Netto, Steuer je Satz, Brutto) */
+  calc?: ValidationCalcRow[];
   confirmed_manually?: boolean;
   recheck?: {
     performed: boolean;

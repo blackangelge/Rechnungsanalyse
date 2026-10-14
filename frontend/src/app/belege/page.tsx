@@ -1589,8 +1589,18 @@ function ValidationPanel({
         <ul className="mb-2 space-y-1 text-sm text-amber-900">
           {v!.corrections.map((c, i) => (
             <li key={i}>
-              ↻ Position {c.position + 1}: Positionspreis von <b>{fmtNum(c.from)} €</b> auf{" "}
-              <b>{fmtNum(c.to)} €</b> korrigiert (Faktor {String(c.factor).replace(".", ",")})
+              {c.field === "total_amount" ? (
+                <>
+                  ↻ Gesamtbetrag (Brutto){" "}
+                  {c.from == null ? "fehlte und wurde berechnet:" : <>von <b>{fmtNum(c.from)} €</b> auf</>}{" "}
+                  <b>{fmtNum(c.to)} €</b>{c.from == null ? "" : " korrigiert"} (Netto + Steuer)
+                </>
+              ) : (
+                <>
+                  ↻ Position {(c.position ?? 0) + 1}: Positionspreis von <b>{fmtNum(c.from ?? 0)} €</b> auf{" "}
+                  <b>{fmtNum(c.to)} €</b> korrigiert (Faktor {String(c.factor ?? "").replace(".", ",")})
+                </>
+              )}
             </li>
           ))}
         </ul>
@@ -1604,6 +1614,40 @@ function ValidationPanel({
             </li>
           ))}
         </ul>
+      )}
+
+      {(v?.calc ?? []).length > 0 && (
+        <details className="mb-2 rounded border border-gray-200 bg-white/70" data-testid="calc-details">
+          <summary className="cursor-pointer px-3 py-1.5 text-xs font-medium text-gray-700">
+            Durchrechnung ({v!.calc!.length} Prüfungen
+            {v!.calc!.some((r) => r.status === "warn") ? `, ${v!.calc!.filter((r) => r.status === "warn").length} auffällig` : ", alle stimmig"})
+          </summary>
+          <table className="w-full text-xs">
+            <thead className="border-t border-gray-200 bg-gray-50 text-left text-gray-500">
+              <tr>
+                <th className="px-3 py-1 font-medium">Prüfung</th>
+                <th className="px-3 py-1 text-right font-medium">Berechnet</th>
+                <th className="px-3 py-1 text-right font-medium">Laut Rechnung</th>
+                <th className="w-8 px-2 py-1"></th>
+              </tr>
+            </thead>
+            <tbody>
+              {v!.calc!.map((r, i) => (
+                <tr key={i} className={`border-t border-gray-100 ${r.status === "warn" ? "bg-red-50" : ""}`}>
+                  <td className="px-3 py-1 text-gray-700">
+                    {r.label}
+                    {r.note && <span className="block text-[11px] text-gray-400">{r.note}</span>}
+                  </td>
+                  <td className="px-3 py-1 text-right tabular-nums">{r.expected == null ? "–" : `${fmtNum(r.expected)} €`}</td>
+                  <td className="px-3 py-1 text-right tabular-nums">{r.actual == null ? "–" : `${fmtNum(r.actual)} €`}</td>
+                  <td className={`px-2 py-1 text-center font-bold ${r.status === "ok" ? "text-green-600" : "text-red-600"}`}>
+                    {r.status === "ok" ? "✓" : "✕"}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </details>
       )}
 
       {v?.recheck?.performed && (

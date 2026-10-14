@@ -366,14 +366,28 @@ Die Belege-Seite lädt **nur die aktuelle Seite** (Standard 50, wählbar 25–20
 Läuft in `_analyze_single` als **Phase 3c** nach der Extraktion (`_plausibility_pass` in `documents.py`),
 nur bei Eingangsrechnungen mit verwertbarer KI-Antwort. Dreistufig:
 
-1. **Regeln + automatische Korrektur** (`validate_invoice`, ohne KI):
+1. **Regeln + automatische Korrektur** (`validate_invoice`, ohne KI) — **alle Werte werden gegeneinander durchgerechnet**:
    - Position: Menge × Einzelpreis ≙ Positionspreis (Positionsrabatt und abweichende Preiseinheit wie
      „Preis je t bei Menge in kg" werden erkannt und nur als `info` gemeldet)
-   - Summe: Σ Positionspreise ≙ Netto **oder** Brutto
-   - Netto + Steuer ≙ Brutto; Steuerbetrag ≙ Netto × Satz
+   - Summe: Σ Positionspreise ≙ Netto, **oder** Brutto − Steuer, **oder** Brutto (Positionen brutto, z.B. Kassenbon);
+     ein ausgewiesener Gesamtrabatt (`discount_amount`) wird berücksichtigt
+   - Netto ↔ Σ Positionen (`net_mismatch`; bestätigen Positionen und Brutto − Steuer einander, heißt es „Netto wohl falsch gelesen" —
+     dann werden **keine** Positionen „zurechtskaliert")
+   - Steuerbetrag ≙ Netto × Satz je Zeile der USt-Zusammenfassung (`tax_mismatch`)
+   - **Je Steuersatz:** Σ Positionen mit diesem Satz (`positionen[i].steuersatz` im `raw_response`) ≙ Nettobetrag der USt-Zusammenfassung,
+     in **beide Richtungen** (`rate_net_mismatch`); Steuer aus den Positionen berechnet ≙ ausgewiesene Steuer (`tax_from_positions_mismatch`).
+     Nur wenn jede bepreiste Position einen Steuersatz hat.
+   - Netto + Steuer ≙ Brutto (`gross_mismatch`)
    - Passt die Summe nicht, wird nach der **kleinsten eindeutigen** Korrektur gesucht (1, dann 2 Positionen,
      Faktoren aus Einheiten-Verhältnissen + 10/100/1000 und Kehrwerte). Mehrdeutig → es wird **nicht geraten**.
-     Korrigiert wird nur `total_price`; Originalwert steht in `validation_details.corrections`.
+     Korrigiert wird `total_price`; Originalwert steht in `validation_details.corrections`.
+   - **Brutto (`total_amount`) wird korrigiert**, wenn Positionen ≙ Netto und Steuer ≙ Netto × Satz sich gegenseitig bestätigen, das Brutto aber
+     nicht zu Netto + Steuer passt (`total_corrected`); **fehlt** das Brutto, wird es aus Netto + Steuer berechnet (`total_derived`).
+     Netto/Steuer selbst werden nie überschrieben (sie stehen nur im `raw_response`) — nur gemeldet. Korrekturen sind mit
+     `auto_correct: false` (Workflow-Knoten „Plausibilität prüfen") abschaltbar.
+   - **Durchrechnung** (`validation_details.calc`): jede Rechnung als Zeile `{label, expected (berechnet), actual (laut Rechnung), status ok|warn, note}`;
+     das Prüfpanel zeigt sie als Tabelle. Korrekturen sind `{position, field: "total_price", …}` bzw. `{field: "total_amount", from, to, method}`;
+     `crud.document.update_validation` übernimmt beide Arten in die Daten.
 2. **Zweite KI-Abfrage** (`ai_service.recheck_invoice_data`): nur wenn Stufe 1 `needs_review` ergibt.
    Systemprompt = normaler Extraktionsprompt + Prüfhinweis + gefundene Auffälligkeiten + erste Auslesung.
    Ist die neue Auslesung plausibel → `ai_corrected` (ersetzt die erste). Sonst Original behalten.
