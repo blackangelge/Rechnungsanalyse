@@ -9,6 +9,7 @@ Bei einem Match werden vorhandene Felder nur durch nicht-leere neue Werte aktual
 """
 
 import logging
+from dataclasses import dataclass, field
 
 from sqlalchemy import func
 from sqlalchemy.orm import Session
@@ -76,6 +77,106 @@ def delete(db: Session, supplier_id: int) -> bool:
     db.delete(obj)
     db.commit()
     return True
+
+
+# Stammdatenfelder, die beim Zusammenführen übernommen/gewählt werden können
+MERGE_FIELDS = (
+    "name", "street", "zip_code", "city", "address",
+    "hrb_number", "tax_number", "vat_id", "bank_name", "iban", "bic",
+)
+
+
+class MergeError(ValueError):
+    """Fachlicher Fehler beim Zusammenführen; `status` ist der passende HTTP-Status."""
+
+    def __init__(self, message: str, status: int = 400):
+        super().__init__(message)
+        self.status = status
+
+
+@dataclass
+class MergeResult:
+    supplier: Supplier
+    merged_ids: list[int] = field(default_factory=list)
+    moved_documents: int = 0
+    renamed_documents: int = 0
+
+
+def merge(
+    db: Session,
+    target_id: int,
+    source_ids: list[int],
+    fields: dict[str, str | None] | None = None,
+    update_document_names: bool = False,
+) -> MergeResult:
+    """
+    Führt die Lieferanten `source_ids` in `target_id` zusammen (alles in einer Transaktion):
+
+      • Alle Belege (invoice_extractions.supplier_id) der Quellen zeigen danach auf das Ziel.
+      • Leere Stammdatenfelder des Ziels werden aus den Quellen aufgefüllt (in ID-Reihenfolge);
+        `fields` legt einzelne Felder ausdrücklich fest (Vorrang vor dem Auffüllen).
+      • Hat das Ziel keinen Analyse-Workflow, wird der erste der Quellen übernommen.
+      • `update_document_names`: setzt `invoice_extractions.supplier_name` aller Belege des Ziels
+        auf den (endgültigen) Namen. Standard aus, weil das extrahierte Daten umschreibt;
+        der Originalwortlaut bleibt in `raw_response` erhalten.
+      • Die Quell-Lieferanten werden gelöscht.
+    """
+    ids = list(dict.fromkeys(source_ids))
+    if not ids:
+        raise MergeError("Keine Lieferanten zum Zusammenführen ausgewählt")
+    if target_id in ids:
+        raise MergeError("Der Ziel-Lieferant darf nicht gleichzeitig zusammengeführt werden")
+    target = db.get(Supplier, target_id)
+    if target is None:
+        raise MergeError(f"Ziel-Lieferant #{target_id} nicht gefunden", 404)
+    sources = [db.get(Supplier, i) for i in ids]
+    missing = [i for i, s in zip(ids, sources) if s is None]
+    if missing:
+        raise MergeError("Lieferant(en) nicht gefunden: " + ", ".join(f"#{i}" for i in missing), 404)
+    sources = sorted(sources, key=lambda s: s.id)           # type: ignore[arg-type, return-value]
+
+    overrides = {k: (v.strip() if isinstance(v, str) else v) for k, v in (fields or {}).items()}
+    unknown = [k for k in overrides if k not in MERGE_FIELDS]
+    if unknown:
+        raise MergeError("Unbekannte Felder: " + ", ".join(unknown))
+    if "name" in overrides and not _is_set(overrides["name"]):
+        raise MergeError("Der Name darf nicht leer sein")
+
+    try:
+        for fname in MERGE_FIELDS:                          # 1) Leeres auffüllen
+            if not _is_set(getattr(target, fname)):
+                for s in sources:
+                    if _is_set(getattr(s, fname)):
+                        setattr(target, fname, getattr(s, fname))
+                        break
+        for fname, value in overrides.items():              # 2) ausdrückliche Wahl
+            setattr(target, fname, value if _is_set(value) else None)
+        if target.workflow_id is None:
+            target.workflow_id = next((s.workflow_id for s in sources if s.workflow_id), None)
+
+        moved = (
+            db.query(InvoiceExtraction)
+            .filter(InvoiceExtraction.supplier_id.in_(ids))
+            .update({InvoiceExtraction.supplier_id: target_id}, synchronize_session=False)
+        )
+        renamed = 0
+        if update_document_names:
+            renamed = (
+                db.query(InvoiceExtraction)
+                .filter(InvoiceExtraction.supplier_id == target_id)
+                .filter((InvoiceExtraction.supplier_name.is_(None)) | (InvoiceExtraction.supplier_name != target.name))
+                .update({InvoiceExtraction.supplier_name: target.name}, synchronize_session=False)
+            )
+        for s in sources:
+            db.delete(s)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    db.refresh(target)
+    logger.info("Lieferanten %s in #%d '%s' zusammengeführt (%d Belege umgehängt)",
+                ids, target.id, target.name, moved)
+    return MergeResult(target, ids, moved, renamed)
 
 
 def find_duplicates(db: Session) -> list[list[Supplier]]:

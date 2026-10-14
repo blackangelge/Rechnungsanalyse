@@ -653,6 +653,30 @@ export interface SupplierUpdate {
   bic?: string | null;
 }
 
+export type DuplicateReason = "iban" | "vat_id" | "tax_number" | "name" | "name_similar";
+
+export interface DuplicateGroup {
+  suppliers: Supplier[];
+  reasons: DuplicateReason[];
+  reason_labels: string[];
+  confidence: "high" | "medium" | "low";
+}
+
+export interface SupplierMergeRequest {
+  target_id: number;
+  source_ids: number[];
+  /** Ausdrücklich gewählte Endwerte einzelner Felder */
+  fields?: Record<string, string | null>;
+  update_document_names?: boolean;
+}
+
+export interface SupplierMergeResult {
+  supplier: Supplier;
+  merged_ids: number[];
+  moved_documents: number;
+  renamed_documents: number;
+}
+
 export const suppliersApi = {
   list: () => apiClient.get<Supplier[]>("/api/suppliers/").then((r) => r.data),
   get: (id: number) => apiClient.get<Supplier>(`/api/suppliers/${id}`).then((r) => r.data),
@@ -661,6 +685,12 @@ export const suppliersApi = {
   delete: (id: number) => apiClient.delete(`/api/suppliers/${id}`),
   duplicates: () =>
     apiClient.get<Supplier[][]>("/api/suppliers/duplicates/").then((r) => r.data),
+  /** Dublettensuche: gleiche IBAN / USt-IdNr. / Steuernummer, gleicher oder ähnlicher Name */
+  duplicateGroups: () =>
+    apiClient.get<DuplicateGroup[]>("/api/suppliers/duplicate-groups").then((r) => r.data),
+  /** Lieferanten zusammenführen (Belege der Quellen → Ziel, Quellen werden gelöscht) */
+  merge: (data: SupplierMergeRequest) =>
+    apiClient.post<SupplierMergeResult>("/api/suppliers/merge", data).then((r) => r.data),
   /** Analyse-Workflow des Lieferanten festlegen (null = Standard-Workflow) */
   setWorkflow: (id: number, workflow_id: number | null) =>
     apiClient.put<Supplier>(`/api/suppliers/${id}/workflow`, { workflow_id }).then((r) => r.data),

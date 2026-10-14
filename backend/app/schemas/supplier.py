@@ -3,7 +3,7 @@ Pydantic-Schemas für Lieferanten.
 """
 
 from datetime import datetime
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class SupplierBase(BaseModel):
@@ -32,3 +32,27 @@ class SupplierRead(SupplierBase):
     updated_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class DuplicateGroupRead(BaseModel):
+    """Gruppe von Dublettenkandidaten mit den gefundenen Übereinstimmungen."""
+
+    suppliers: list[SupplierRead]
+    reasons: list[str]            # iban | vat_id | tax_number | name | name_similar
+    reason_labels: list[str]
+    confidence: str               # high | medium | low
+
+
+class SupplierMergeRequest(BaseModel):
+    target_id: int
+    source_ids: list[int] = Field(min_length=1)
+    # Ausdrücklich gewählte Endwerte einzelner Stammdatenfelder (sonst: Ziel behalten, Leeres auffüllen)
+    fields: dict[str, str | None] | None = None
+    update_document_names: bool = False
+
+
+class SupplierMergeResult(BaseModel):
+    supplier: SupplierRead
+    merged_ids: list[int]
+    moved_documents: int
+    renamed_documents: int
