@@ -43,6 +43,7 @@ app/
 │   │                       #   document_type_name, ki_input_tokens, ki_output_tokens,
 │   │                       #   ki_total_duration (Fallback auf doc_ki_* für Non-Eingangsrechnungen)
 │   ├── document_type.py    # DocumentType (id, name) — 15 vordefinierte Typen
+│   ├── analysis_history.py # Frühere Analyse-Stände je Beleg (Snapshot-JSON + Kurzfelder)
 │   ├── import_batch.py
 │   ├── ai_config.py
 │   ├── image_settings.py
@@ -67,6 +68,7 @@ app/
 │   │                       #   falls Migration noch nicht angewendet
 │   │                       # update_document_type(db, doc_id, type_id)
 │   ├── document_type.py    # get_all(), get_by_id()
+│   ├── analysis_history.py # archive_current / restore / list_for_document (Analyse-Historie)
 │   ├── import_batch.py
 │   ├── position_search.py  # Artikelsuche über alle Positionen (Filter, Sortierung, Kennzahlen)
 │   ├── supplier.py         # find_or_create (IBAN → VAT-ID → Name)
@@ -135,8 +137,11 @@ alembic/
     │                       # revision = "0016_search_indexes"; B-Tree-Indizes (Filter-Spalten, Fremdschlüssel — u.a.
     │                       # order_positions.document_id) + pg_trgm-GIN-Indizes für ILIKE '%…%' (übersprungen, falls
     │                       # die Erweiterung nicht anlegbar ist)
-    └── 0017_import_hidden.py
-                            # revision = "0017_import_hidden"; import_batches.hidden_at (+ Index)
+    ├── 0017_import_hidden.py
+    │                       # revision = "0017_import_hidden"; import_batches.hidden_at (+ Index)
+    └── 0018_analysis_history.py
+                            # revision = "0018_analysis_history"; analysis_history-Tabelle,
+                            # processing_settings.analysis_history_keep (Standard 3)
 ```
 
 ### Import-Ablauf
@@ -518,6 +523,28 @@ Die Properties `ki_input_tokens`, `ki_output_tokens`, `ki_total_duration` auf `D
 **Wichtig für Schemas:** `DocumentDetail` erbt von `DocumentRead` (nicht `DocumentListRead`). Die `ki_*`-Felder müssen daher **explizit** in `DocumentDetail` deklariert werden — sie werden nicht automatisch geerbt.
 
 Aggregierte Statistiken: `GET /api/logs/ki-stats` — gibt Summen und Durchschnitte über alle Extraktionen zurück.
+
+### Analyse-Historie (`crud/analysis_history.py`, `routers/document_history.py`)
+
+Wird ein Beleg erneut analysiert, ersetzt `save_extraction` Extraktion und Positionen — damit nichts verloren geht, hebt
+die Historie den **bisherigen Stand** vorher auf.
+
+- **Zeitpunkt:** `crud.document.save_used_prompts` (läuft zu Beginn jeder Analyse, klassisch und Workflow) ruft
+  `analysis_history.archive_current` auf — *bevor* `used_*`/Workflow-Felder zurückgesetzt werden, damit der Snapshot den Prompt/Workflow
+  der **alten** Analyse enthält. Nicht in `save_extraction` einbauen (dort sind `used_*` schon überschrieben).
+- **Inhalt** (`analysis_history.snapshot`, JSON): `extraction` (alle Spalten inkl. `raw_response`, `validation_*`, `supplier_id`),
+  `positions`, `meta` (verwendete Prompts, Workflow + Graph + Ablaufprotokoll, Dokumententyp, Seitenzahl, `analyzed_pdf_version`).
+  Kurzfelder (Datum, Workflow, Prüfstatus, Rechnungsnr., Betrag, Positionszahl) liegen als Spalten daneben; die Liste lädt das Snapshot-JSON nie.
+- **Nicht aufgehoben** wird: kein Stand vorhanden, Historie aus (`analysis_history_keep = 0`), KI-Fehlerantwort/leere `raw_response`
+  (Fehlerstände sind Müll) und ein Stand, dessen Prüfsumme (`fingerprint`, ohne KI-Laufzeitstatistik) dem zuletzt aufgehobenen gleicht
+  (z. B. Analyse gestartet, aber vor dem Speichern abgebrochen).
+- **Begrenzung:** `processing_settings.analysis_history_keep` (Standard 3, 0–20, Einstellungen → Verarbeitung); ältere Stände werden beim Aufheben gelöscht.
+  Jeder Stand ≈ 10 KB (Rohantwort) — bei hunderttausenden Belegen niedrig halten.
+- **Wiederherstellen** (`restore`): eine Transaktion — aktuellen Stand aufheben, Extraktion/Positionen/Prompts/Workflow aus dem Snapshot setzen
+  (Datum/Decimal werden aus JSON zurückgewandelt), wiederhergestellten Eintrag aus der Historie entfernen. Status wird `done`. Gesperrt bei `processing` (HTTP 409).
+- **Robust:** `archive_current` fängt jede Ausnahme ab (z. B. Migration 0018 fehlt) — eine Analyse bricht nie wegen der Historie ab.
+- Endpunkte (`/api/documents/{id}/analysis-history`): `GET` (Liste), `GET /{hid}` (Detail), `POST /{hid}/restore`, `DELETE /{hid}`.
+- Frontend: `components/belege/AnalysisHistoryPanel.tsx` in der Infos-Ansicht (Liste, Vergleich Feld für Feld mit dem aktuellen Stand, Wiederherstellen, Löschen).
 
 ### Lieferanten: Dublettensuche und Zusammenführen (`services/supplier_dedup.py`, `crud/supplier.py::merge`)
 
@@ -926,7 +953,8 @@ ImportBatch  1──n  Document  1──1  InvoiceExtraction  n──1  Supplier
 AIConfig        (referenziert von ImportBatch.ai_config_id)
 ImageSettings   (Singleton, globale Bildkonvertierungseinstellungen)
 SystemPrompt    (Standard-Prompt + optionaler Dokumententyp-Prompt)
-ProcessingSettings (Singleton, import_concurrency + ai_concurrency)
+ProcessingSettings (Singleton, import_concurrency + ai_concurrency + analysis_history_keep)
+Document     1──n  AnalysisHistory   (frühere Analyse-Stände)
 PdfSettings     (Singleton, auto_trim_enabled + auto_trim_max_pages)
 Document     1──n  DocumentVersion   (PDF-Versionen)
 Workflow     1──n  Supplier          (Supplier.workflow_id, optional)
@@ -947,6 +975,7 @@ Workflow     1──n  Supplier          (Supplier.workflow_id, optional)
 | `0015_workflows.py` | `workflows`-Tabelle, `suppliers.workflow_id` (FK, SET NULL), `used_workflow_id/_name/_graph` + `workflow_trace` auf `documents` |
 | `0016_search_indexes.py` | Indizes für Beleg-/Artikelsuche (B-Tree + `pg_trgm`), siehe „Große Bestände" |
 | `0017_import_hidden.py` | `import_batches.hidden_at` (Imports ausblenden) |
+| `0018_analysis_history.py` | `analysis_history`-Tabelle (frühere Analyse-Stände), `processing_settings.analysis_history_keep` |
 
 ### Import-Status-Flow
 

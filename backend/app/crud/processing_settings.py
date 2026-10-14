@@ -42,6 +42,7 @@ def update(db: Session, data: ProcessingSettingsUpdate) -> ProcessingSettings:
 
     obj.import_concurrency = data.import_concurrency
     obj.ai_concurrency = data.ai_concurrency
+    obj.analysis_history_keep = data.analysis_history_keep
 
     db.commit()
     db.refresh(obj)

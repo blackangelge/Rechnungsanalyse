@@ -7,6 +7,7 @@ Base.metadata ausliest. Dieser zentrale Import stellt das sicher.
 """
 
 from app.models.ai_config import AIConfig  # noqa: F401
+from app.models.analysis_history import AnalysisHistory  # noqa: F401
 from app.models.document import Document  # noqa: F401
 from app.models.document_type import DocumentType  # noqa: F401
 from app.models.document_version import DocumentVersion  # noqa: F401

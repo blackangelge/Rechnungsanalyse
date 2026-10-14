@@ -8,6 +8,7 @@ Verwendung in Routen:
 """
 
 from app.crud import ai_config  # noqa: F401
+from app.crud import analysis_history  # noqa: F401
 from app.crud import document  # noqa: F401
 from app.crud import document_type  # noqa: F401
 from app.crud import image_settings  # noqa: F401

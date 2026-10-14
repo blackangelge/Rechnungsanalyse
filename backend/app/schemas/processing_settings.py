@@ -23,6 +23,14 @@ class ProcessingSettingsUpdate(BaseModel):
     )
 
 
+    analysis_history_keep: int = Field(
+        default=3,
+        ge=0,
+        le=20,
+        description="Aufbewahrte frühere Analyse-Stände je Beleg (0 = keine Historie)",
+    )
+
+
 class ProcessingSettingsRead(ProcessingSettingsUpdate):
     """Schema für die API-Antwort inkl. id."""
 

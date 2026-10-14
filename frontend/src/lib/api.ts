@@ -599,11 +599,14 @@ export interface ProcessingSettings {
   id: number;
   import_concurrency: number;
   ai_concurrency: number;
+  /** Aufbewahrte frühere Analyse-Stände je Beleg (0 = Historie aus) */
+  analysis_history_keep: number;
 }
 
 export interface ProcessingSettingsUpdate {
   import_concurrency: number;
   ai_concurrency: number;
+  analysis_history_keep: number;
 }
 
 export const processingSettingsApi = {
@@ -618,6 +621,42 @@ export const processingSettingsApi = {
     apiClient
       .put<ProcessingSettings>("/api/settings/processing", data)
       .then((r) => r.data),
+};
+
+// ─── Analyse-Historie ────────────────────────────────────────────────────────
+
+export interface AnalysisHistoryItem {
+  id: number;
+  document_id: number;
+  created_at: string;
+  pdf_version: number | null;
+  workflow_name: string | null;
+  validation_status: string | null;
+  invoice_number: string | null;
+  supplier_name: string | null;
+  total_amount: number | string | null;
+  position_count: number;
+}
+
+export interface AnalysisHistoryDetail extends AnalysisHistoryItem {
+  extraction: Partial<InvoiceExtraction> & Record<string, unknown>;
+  order_positions: Partial<OrderPosition>[];
+  used_system_prompt?: string | null;
+  used_doc_type_prompt?: string | null;
+  used_recheck_prompt?: string | null;
+  workflow_run?: WorkflowTraceEntry[] | null;
+  validation?: ValidationDetails | null;
+}
+
+export const analysisHistoryApi = {
+  list: (docId: number) =>
+    apiClient.get<AnalysisHistoryItem[]>(`/api/documents/${docId}/analysis-history`).then((r) => r.data),
+  get: (docId: number, id: number) =>
+    apiClient.get<AnalysisHistoryDetail>(`/api/documents/${docId}/analysis-history/${id}`).then((r) => r.data),
+  restore: (docId: number, id: number) =>
+    apiClient.post(`/api/documents/${docId}/analysis-history/${id}/restore`).then((r) => r.data),
+  remove: (docId: number, id: number) =>
+    apiClient.delete(`/api/documents/${docId}/analysis-history/${id}`).then(() => undefined),
 };
 
 export const pdfSettingsApi = {

@@ -2,6 +2,7 @@
 
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
+import AnalysisHistoryPanel from "@/components/belege/AnalysisHistoryPanel";
 import PdfEditModal from "@/components/belege/PdfEditModal";
 import Pager from "@/components/common/Pager";
 import {
@@ -1392,6 +1393,7 @@ function InfosView({
         </div>
       )}
       <ValidationPanel doc={doc} onChange={onDocChange} />
+      <AnalysisHistoryPanel doc={doc} onChange={onDocChange} />
 
       {/* Lieferant */}
       <Section title="Lieferant">

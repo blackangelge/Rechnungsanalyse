@@ -63,6 +63,7 @@ function PdfTrimSettings() {
 export default function ProcessingSettingsPage() {
   const [settings, setSettings] = useState<ProcessingSettings | null>(null);
   const [importConcurrency, setImportConcurrency] = useState(10);
+  const [historyKeep, setHistoryKeep] = useState(3);
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [successMsg, setSuccessMsg] = useState<string | null>(null);
@@ -124,6 +125,7 @@ export default function ProcessingSettingsPage() {
         const data = await processingSettingsApi.get();
         setSettings(data);
         setImportConcurrency(data.import_concurrency);
+        setHistoryKeep(data.analysis_history_keep ?? 3);
       } catch {
         // Standardwerte behalten, Seite bleibt nutzbar
       } finally {
@@ -141,6 +143,7 @@ export default function ProcessingSettingsPage() {
       const updated = await processingSettingsApi.update({
         import_concurrency: importConcurrency,
         ai_concurrency: settings?.ai_concurrency ?? 1,  // Wert beibehalten (KI-Analyse ist sequenziell)
+        analysis_history_keep: historyKeep,
       });
       setSettings(updated);
       setSuccessMsg("Einstellungen gespeichert.");
@@ -232,6 +235,33 @@ export default function ProcessingSettingsPage() {
                 </span>
               )}
             </div>
+          </div>
+
+          {/* ── Analyse-Historie ───────────────────────────────────────────── */}
+          <div className="rounded-lg border bg-white p-6 shadow-sm">
+            <h2 className="mb-1 text-base font-semibold text-gray-800">Analyse-Historie</h2>
+            <p className="mb-5 text-sm text-gray-500">
+              Wird ein Beleg erneut analysiert, bleibt der bisherige Stand (Daten, Positionen, verwendeter Prompt
+              und Workflow) erhalten und lässt sich vergleichen und wiederherstellen. Hier steht, wie viele frühere
+              Stände je Beleg aufbewahrt werden. Ältere werden automatisch gelöscht. 0 schaltet die Historie aus.
+            </p>
+            <div className="flex items-center gap-3">
+              <label htmlFor="history-keep" className="text-sm font-medium text-gray-700">
+                Aufbewahrte frühere Stände je Beleg
+              </label>
+              <input
+                id="history-keep"
+                type="number"
+                min={0}
+                max={20}
+                value={historyKeep}
+                onChange={(e) => setHistoryKeep(Math.max(0, Math.min(20, Number(e.target.value) || 0)))}
+                className="w-20 rounded border border-gray-300 px-2 py-1 text-sm"
+              />
+            </div>
+            <p className="mt-2 text-xs text-gray-400">
+              Jeder Stand enthält u. a. die KI-Rohantwort (ca. 10 KB). Bei sehr vielen Belegen den Wert niedrig halten.
+            </p>
           </div>
 
           {/* ── Aktuelle Werte (Info) ───────────────────────────────────────── */}
