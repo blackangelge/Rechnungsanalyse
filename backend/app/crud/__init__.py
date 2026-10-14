@@ -12,6 +12,7 @@ from app.crud import document  # noqa: F401
 from app.crud import document_type  # noqa: F401
 from app.crud import image_settings  # noqa: F401
 from app.crud import pdf_settings  # noqa: F401
+from app.crud import position_search  # noqa: F401
 from app.crud import processing_settings  # noqa: F401
 from app.crud import import_batch  # noqa: F401
 from app.crud import item  # noqa: F401

@@ -68,6 +68,7 @@ app/
 │   │                       # update_document_type(db, doc_id, type_id)
 │   ├── document_type.py    # get_all(), get_by_id()
 │   ├── import_batch.py
+│   ├── position_search.py  # Artikelsuche über alle Positionen (Filter, Sortierung, Kennzahlen)
 │   ├── supplier.py         # find_or_create (IBAN → VAT-ID → Name)
 │   └── system_prompt.py    # + get_doc_type_prompt(db) → Prompt mit is_document_type_prompt=True
 │                           # + _clear_doc_type_prompt(db) — stellt Eindeutigkeit sicher
@@ -80,6 +81,7 @@ app/
 │   │                       # _KI_IO_EXECUTOR, _analyze_single (zweistufig, sequenziell)
 │   │                       # _db_type_only_finish: Abschluss ohne InvoiceExtraction
 │   │                       # _merge_ki_stats: summiert Token-Stats aus Stufe 1+2
+│   ├── positions.py        # GET /api/positions (+ /summary, /filter-options) — Artikelsuche
 │   ├── ai_configs.py       # CRUD /api/ai-configs, POST set-default
 │   ├── logs.py             # GET /api/logs (System-Log), GET /api/logs/ki-stats
 │   ├── settings.py         # GET/PUT /api/settings/image-conversion
@@ -570,6 +572,23 @@ IMPORT_BASE_PATH=/volume1/docker/_rechnungsanalyse/import
 STORAGE_PATH=/volume1/docker/_rechnungsanalyse/storage
 ```
 
+### Artikelsuche (`crud/position_search.py`, `routers/positions.py`, Seite `/artikel`)
+
+Durchsucht **alle Positionen (`order_positions`) aller Belege** — paginiert, sortierbar, mit Kennzahlen. Getestet mit 75.000 Positionen (alle Abfragen < 300 ms).
+
+- `GET /api/positions` (Header `X-Total-Count`), `GET /api/positions/summary` (Anzahl, Belege, Σ Gesamtpreis, Einzelpreis min/Ø/max, je Einheit),
+  `GET /api/positions/filter-options` (Einheiten). Dieselben Filter für alle drei (`_filters` in `routers/positions.py`, `_filtered` in der CRUD-Datei).
+- Filter: `q` (Freitext: **alle Wörter** müssen in Bezeichnung **oder** Artikelnummer vorkommen, Groß/Klein egal; `%` und `_` sind **keine Platzhalter**),
+  `article_number`, `supplier_id`/`supplier_name`, `company`, `year`, `batch_ids`, `document_id`, `invoice_number`, `unit` (exakt, Groß/Klein egal),
+  `unit_price_`/`total_price_`/`quantity_` `min|max`, `date_from|date_to` (Rechnungsdatum), `validation_status`, `include_hidden`, `include_deleted`.
+  Belege ausgeblendeter Imports und gelöschte Belege sind standardmäßig draußen (Ausnahmen wie bei der Belegliste: `batch_ids`, `document_id`).
+- Sortierung (`sort` ∈ `SORT_COLUMNS`, `order`): leere Werte immer am Ende, `id` als Tie-Breaker → stabiles Blättern. Standard: neueste Belege zuerst.
+- Es werden nur die Listenspalten gelesen (kein `raw_response`). Teilstring-Suche nutzt die `pg_trgm`-Indizes aus Migration 0016.
+- Frontend `app/artikel/page.tsx`: Suchfeld + Lieferant/Jahr/Einheit, „Mehr Filter" (Artikelnr., Rechnungsnr., Firma, Import, Preis-/Mengenbereiche,
+  Rechnungsdatum, Beleg-ID, ausgeblendete Imports), Kennzahlen-Kacheln, sortierbare Spalten, Treffer hervorgehoben, Beleg-Link auf
+  `/belege?doc_id=…`. **Alle Filter stehen in der Adresszeile** (`?q=…&unit=t`) → teilbar, Neuladen-sicher, Direktlinks sind möglich.
+- `components/common/Pager.tsx`: gemeinsame Blätterleiste (Belege + Artikel).
+
 ### Imports ausblenden (`import_batches.hidden_at`)
 
 Ganze Imports lassen sich ausblenden, wenn sie gerade nicht wichtig sind — **nichts wird gelöscht**, alles ist umkehrbar.
@@ -653,6 +672,7 @@ src/
 │   ├── layout.tsx
 │   ├── page.tsx                        # Redirect zu /dashboard
 │   ├── dashboard/page.tsx              # Übersicht aller Import-Batches
+│   ├── artikel/page.tsx                # Artikelsuche: alle Positionen, Filter, Kennzahlen
 │   ├── belege/page.tsx                 # Alle Dokumente, Filter, KI-Analyse starten
 │   │                                   # KI-Rohdaten-Ansicht + Infos-Ansicht (50/50)
 │   │                                   # Dokumententyp-Filter (DocTypeMultiSelect)
@@ -689,6 +709,7 @@ src/
 ```
 /dashboard        Dashboard
 /belege           Belege
+/artikel          Artikel
 /imports/new      Neuer Import
 /settings/ai      KI-Einstellungen
 /settings/prompts Systemprompts
