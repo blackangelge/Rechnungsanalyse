@@ -69,8 +69,10 @@ function KiBadge({ hasExtraction }: { hasExtraction: boolean }) {
 
 const VALIDATION_STYLES: Record<ValidationStatus, { label: string; cls: string; hint: string }> = {
   ok: { label: "OK", cls: "bg-green-100 text-green-700", hint: "Alle Prüfungen bestanden" },
-  corrected: { label: "Korrigiert", cls: "bg-amber-100 text-amber-800", hint: "Automatisch (rechnerisch) korrigiert" },
-  ai_corrected: { label: "KI-korrigiert", cls: "bg-amber-100 text-amber-800", hint: "Durch zweite KI-Abfrage korrigiert" },
+  // Automatisch korrigierte Belege sind ERLEDIGT (grün) — sie verlangen keine Bestätigung; die Änderungen
+  // bleiben im Prüfpanel nachlesbar. Nur "Prüfen!" braucht eine Entscheidung des Nutzers.
+  corrected: { label: "Korrigiert", cls: "bg-emerald-100 text-emerald-800", hint: "Automatisch (rechnerisch) korrigiert — keine Aktion nötig" },
+  ai_corrected: { label: "KI-korrigiert", cls: "bg-emerald-100 text-emerald-800", hint: "Durch zweite KI-Abfrage korrigiert — keine Aktion nötig" },
   needs_review: { label: "Prüfen!", cls: "bg-red-100 text-red-700", hint: "Nicht plausibel — bitte manuell prüfen" },
   manual_ok: { label: "Geprüft", cls: "bg-blue-100 text-blue-700", hint: "Manuell als geprüft bestätigt" },
   unchecked: { label: "–", cls: "bg-gray-100 text-gray-500", hint: "Nicht prüfbar (keine Beträge/Positionen)" },
@@ -90,7 +92,7 @@ function ValidationBadge({ status }: { status: ValidationStatus | null | undefin
 /** Filter-Presets für die Plausibilitätsprüfung → Backend-Statuswerte */
 const VALIDATION_FILTERS: Record<string, { label: string; statuses: ValidationStatus[] }> = {
   needs_review: { label: "Manuell prüfen", statuses: ["needs_review"] },
-  corrected: { label: "Korrigiert", statuses: ["corrected", "ai_corrected"] },
+  corrected: { label: "Automatisch korrigiert", statuses: ["corrected", "ai_corrected"] },
   ok: { label: "In Ordnung", statuses: ["ok", "manual_ok"] },
 };
 
@@ -1570,7 +1572,7 @@ function ValidationPanel({
   const info = VALIDATION_STYLES[status];
   const box =
     status === "needs_review" ? "border-red-200 bg-red-50"
-    : status === "corrected" || status === "ai_corrected" ? "border-amber-200 bg-amber-50"
+    : status === "corrected" || status === "ai_corrected" ? "border-emerald-200 bg-emerald-50"
     : status === "manual_ok" ? "border-blue-200 bg-blue-50"
     : "border-green-200 bg-green-50";
   const sevCls: Record<string, string> = {
@@ -1589,8 +1591,18 @@ function ValidationPanel({
         <ul className="mb-2 space-y-1 text-sm text-amber-900">
           {v!.corrections.map((c, i) => (
             <li key={i}>
-              ↻ Position {c.position + 1}: Positionspreis von <b>{fmtNum(c.from)} €</b> auf{" "}
-              <b>{fmtNum(c.to)} €</b> korrigiert (Faktor {String(c.factor).replace(".", ",")})
+              {c.field === "total_amount" ? (
+                <>
+                  ↻ Gesamtbetrag (Brutto){" "}
+                  {c.from == null ? "fehlte und wurde berechnet:" : <>von <b>{fmtNum(c.from)} €</b> auf</>}{" "}
+                  <b>{fmtNum(c.to)} €</b>{c.from == null ? "" : " korrigiert"} (Netto + Steuer)
+                </>
+              ) : (
+                <>
+                  ↻ Position {(c.position ?? 0) + 1}: Positionspreis von <b>{fmtNum(c.from ?? 0)} €</b> auf{" "}
+                  <b>{fmtNum(c.to)} €</b> korrigiert (Faktor {String(c.factor ?? "").replace(".", ",")})
+                </>
+              )}
             </li>
           ))}
         </ul>
@@ -1604,6 +1616,40 @@ function ValidationPanel({
             </li>
           ))}
         </ul>
+      )}
+
+      {(v?.calc ?? []).length > 0 && (
+        <details className="mb-2 rounded border border-gray-200 bg-white/70" data-testid="calc-details">
+          <summary className="cursor-pointer px-3 py-1.5 text-xs font-medium text-gray-700">
+            Durchrechnung ({v!.calc!.length} Prüfungen
+            {v!.calc!.some((r) => r.status === "warn") ? `, ${v!.calc!.filter((r) => r.status === "warn").length} auffällig` : ", alle stimmig"})
+          </summary>
+          <table className="w-full text-xs">
+            <thead className="border-t border-gray-200 bg-gray-50 text-left text-gray-500">
+              <tr>
+                <th className="px-3 py-1 font-medium">Prüfung</th>
+                <th className="px-3 py-1 text-right font-medium">Berechnet</th>
+                <th className="px-3 py-1 text-right font-medium">Laut Rechnung</th>
+                <th className="w-8 px-2 py-1"></th>
+              </tr>
+            </thead>
+            <tbody>
+              {v!.calc!.map((r, i) => (
+                <tr key={i} className={`border-t border-gray-100 ${r.status === "warn" ? "bg-red-50" : ""}`}>
+                  <td className="px-3 py-1 text-gray-700">
+                    {r.label}
+                    {r.note && <span className="block text-[11px] text-gray-400">{r.note}</span>}
+                  </td>
+                  <td className="px-3 py-1 text-right tabular-nums">{r.expected == null ? "–" : `${fmtNum(r.expected)} €`}</td>
+                  <td className="px-3 py-1 text-right tabular-nums">{r.actual == null ? "–" : `${fmtNum(r.actual)} €`}</td>
+                  <td className={`px-2 py-1 text-center font-bold ${r.status === "ok" ? "text-green-600" : "text-red-600"}`}>
+                    {r.status === "ok" ? "✓" : "✕"}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </details>
       )}
 
       {v?.recheck?.performed && (
@@ -1625,7 +1671,8 @@ function ValidationPanel({
         >
           {busy ? "…" : "Prüfung erneut ausführen"}
         </button>
-        {status !== "manual_ok" && status !== "ok" && (
+        {/* Nur Belege mit ungelöster Auffälligkeit brauchen eine Bestätigung — korrigierte nicht */}
+        {status === "needs_review" && (
           <button
             onClick={() => run("confirm")}
             disabled={busy}

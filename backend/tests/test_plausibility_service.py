@@ -127,3 +127,156 @@ def test_sum_matches_gross_when_positions_are_gross():
     pos = [{"quantity": 1, "unit": "Stück", "unit_price": 119.0, "total_price": 119.0}]
     r = validate_invoice({"total_amount": 119.0}, pos, None)
     assert r.status == STATUS_OK
+
+
+# ═══ Durchrechnung: Artikel, Netto, Steuer, Brutto gegeneinander ═════════════════════════════
+
+def _invoice(net, rows, positions_raw=None, gross=None):
+    """raw-JSON mit USt-Zusammenfassung rows=[(satz, netto, steuer)]."""
+    return {
+        "positionen": positions_raw or [],
+        "zahlungsinformationen": {
+            "gesamtbetrag_netto": net,
+            "umsatzsteuer_zusammenfassung": [
+                {"steuersatz": r, "nettobetrag": b, "steuerbetrag": t} for r, b, t in rows],
+            "gesamtbetrag_brutto": gross,
+        },
+    }
+
+
+def _pos(total, qty=1, unit="Stück", price=None, **kw):
+    return {"quantity": qty, "unit": unit, "unit_price": price if price is not None else total / qty,
+            "total_price": total, **kw}
+
+
+TWO_RATES_POS = [_pos(100.0), _pos(50.0)]
+TWO_RATES_RAW = _invoice(150.0, [(19.0, 100.0, 19.0), (7.0, 50.0, 3.5)],
+                         [{"steuersatz": 19.0}, {"steuersatz": 7.0}], gross=172.5)
+
+
+def _labels(result):
+    return {row["label"]: row["status"] for row in result.calc}
+
+
+def test_full_calculation_ok_and_calc_rows_listed():
+    r = validate_invoice({"total_amount": 172.5}, [dict(p) for p in TWO_RATES_POS], TWO_RATES_RAW)
+    assert r.status == STATUS_OK and not r.issues
+    labels = _labels(r)
+    assert labels["Σ Positionspreise ↔ Netto (Rechnung)"] == "ok"
+    assert labels["Steuer 19 %: Netto × Satz ↔ Steuerbetrag"] == "ok"
+    assert labels["Steuer 7 %: Netto × Satz ↔ Steuerbetrag"] == "ok"
+    assert labels["Netto 19 %: Σ Positionen ↔ USt-Zusammenfassung"] == "ok"
+    assert labels["Netto 7 %: Σ Positionen ↔ USt-Zusammenfassung"] == "ok"
+    assert labels["Steuer gesamt: aus Positionen berechnet ↔ ausgewiesen"] == "ok"
+    assert labels["Netto + Steuer ↔ Brutto"] == "ok"
+    assert any(l.startswith("Menge × Einzelpreis") and s == "ok" for l, s in labels.items())
+    assert all(row["status"] == "ok" for row in r.calc)
+    assert r.to_dict()["calc"] == r.calc                                   # wird mitgespeichert
+
+
+def test_misread_gross_is_corrected_when_everything_else_confirms_each_other():
+    fields = {"total_amount": 127.5}                                       # Brutto falsch gelesen
+    r = validate_invoice(fields, [dict(p) for p in TWO_RATES_POS], TWO_RATES_RAW)
+    assert r.status == STATUS_CORRECTED
+    assert fields["total_amount"] == 172.5                                 # in-place korrigiert
+    assert r.corrections == [{"field": "total_amount", "from": 127.5, "to": 172.5, "method": "net_plus_tax"}]
+    assert [i.code for i in r.issues] == ["total_corrected"]
+    assert _labels(r)["Netto + Steuer ↔ Brutto (korrigiert)"] == "ok"
+
+
+def test_gross_correction_is_off_without_auto_correct():
+    fields = {"total_amount": 127.5}
+    r = validate_invoice(fields, [dict(p) for p in TWO_RATES_POS], TWO_RATES_RAW, auto_correct=False)
+    assert r.status == STATUS_NEEDS_REVIEW and fields["total_amount"] == 127.5 and not r.corrections
+    assert "gross_mismatch" in [i.code for i in r.issues]
+    assert _labels(r)["Netto + Steuer ↔ Brutto"] == "warn"
+
+
+def test_missing_gross_is_derived_from_net_plus_tax():
+    fields = {"total_amount": None}
+    r = validate_invoice(fields, [dict(p) for p in TWO_RATES_POS], TWO_RATES_RAW)
+    assert fields["total_amount"] == 172.5 and r.status == STATUS_CORRECTED
+    assert r.corrections[0] == {"field": "total_amount", "from": None, "to": 172.5, "method": "net_plus_tax"}
+    assert [i.code for i in r.issues] == ["total_derived"]
+    # ohne auto_correct wird nichts erfunden
+    fields = {"total_amount": None}
+    validate_invoice(fields, [dict(p) for p in TWO_RATES_POS], TWO_RATES_RAW, auto_correct=False)
+    assert fields["total_amount"] is None
+
+
+def test_gross_is_not_corrected_when_not_confirmed_by_positions():
+    # Positionen passen NICHT zum Netto → es gibt keine gegenseitige Bestätigung → nur melden
+    pos = [_pos(100.0), _pos(60.0)]
+    fields = {"total_amount": 127.5}
+    r = validate_invoice(fields, pos, TWO_RATES_RAW)
+    assert fields["total_amount"] == 127.5
+    assert r.status == STATUS_NEEDS_REVIEW and not any(c.get("field") for c in r.corrections)
+
+
+def test_misread_net_is_reported_not_papered_over_by_scaling_positions():
+    """Positionen = Brutto − Steuer, nur das Netto ist falsch gelesen (1500 statt 150)."""
+    raw = _invoice(1500.0, [(19.0, 100.0, 19.0), (7.0, 50.0, 3.5)],
+                   [{"steuersatz": 19.0}, {"steuersatz": 7.0}], gross=172.5)
+    pos = [dict(p) for p in TWO_RATES_POS]
+    r = validate_invoice({"total_amount": 172.5}, pos, raw)
+    assert r.status == STATUS_NEEDS_REVIEW
+    codes = [i.code for i in r.issues]
+    assert "net_mismatch" in codes and "auto_corrected" not in codes and "sum_mismatch" not in codes
+    assert [p["total_price"] for p in pos] == [100.0, 50.0]                 # Positionen unangetastet
+    assert "Nettobetrag wurde wohl falsch gelesen" in next(i.message for i in r.issues if i.code == "net_mismatch")
+
+
+def test_wrong_tax_rate_on_a_position_is_found():
+    # Position 2 (50 €) trägt 19 % statt 7 % → je Steuersatz passt die USt-Zusammenfassung nicht
+    raw = _invoice(150.0, [(19.0, 100.0, 19.0), (7.0, 50.0, 3.5)],
+                   [{"steuersatz": 19.0}, {"steuersatz": 19.0}], gross=172.5)
+    r = validate_invoice({"total_amount": 172.5}, [dict(p) for p in TWO_RATES_POS], raw)
+    assert r.status == STATUS_NEEDS_REVIEW
+    assert [i.code for i in r.issues].count("rate_net_mismatch") == 2          # 19 % zu viel, 7 % fehlt
+    assert _labels(r)["Netto 19 %: Σ Positionen ↔ USt-Zusammenfassung"] == "warn"
+
+
+def test_rate_missing_in_tax_summary():
+    raw = _invoice(150.0, [(19.0, 150.0, 28.5)],
+                   [{"steuersatz": 19.0}, {"steuersatz": 7.0}], gross=178.5)
+    r = validate_invoice({"total_amount": 178.5}, [dict(p) for p in TWO_RATES_POS], raw)
+    msgs = [i.message for i in r.issues if i.code == "rate_net_mismatch"]
+    assert any("fehlen in der USt-Zusammenfassung" in m for m in msgs)
+
+
+def test_positions_with_gross_prices_receipt():
+    raw = _invoice(100.0, [(19.0, 100.0, 19.0)], gross=119.0)
+    r = validate_invoice({"total_amount": 119.0}, [_pos(119.0)], raw)
+    assert r.status == STATUS_OK
+    assert _labels(r)["Σ Positionspreise ↔ Brutto (Positionen brutto)"] == "ok"
+
+
+def test_gross_minus_tax_confirms_positions_when_net_is_missing():
+    raw = _invoice(None, [(19.0, 100.0, 19.0)], gross=119.0)
+    r = validate_invoice({"total_amount": 119.0}, [_pos(100.0)], raw)
+    assert r.status == STATUS_OK
+    assert _labels(r)["Σ Positionspreise ↔ Brutto − Steuer"] == "ok"
+
+
+def test_invoice_level_discount_is_taken_into_account():
+    raw = _invoice(90.0, [(19.0, 90.0, 17.1)], gross=107.1)
+    r = validate_invoice({"total_amount": 107.1, "discount_amount": 10.0}, [_pos(100.0)], raw)
+    assert r.status == STATUS_OK and not r.issues
+
+
+def test_unit_example_still_works_with_the_new_rules():
+    """1 t = 50 €, 500 kg → 25 €; Netto/Steuer/Brutto passen dazu."""
+    raw = _invoice(25.0, [(19.0, 25.0, 4.75)], [{"steuersatz": 19.0, "preiseinheit": "t"}], gross=29.75)
+    pos = [{"quantity": 500, "unit": "kg", "unit_price": 50.0, "total_price": 25.0}]
+    r = validate_invoice({"total_amount": 29.75}, pos, raw)
+    assert r.status == STATUS_OK and [i.code for i in r.issues] == ["price_unit_differs"]
+
+
+def test_wrongly_multiplied_total_still_auto_corrected_and_gross_untouched():
+    raw = _invoice(35.0, [(19.0, 35.0, 6.65)], [{"steuersatz": 19.0}, {"steuersatz": 19.0}], gross=41.65)
+    pos = [{"quantity": 500, "unit": "kg", "unit_price": 50.0, "total_price": 25000.0}, _pos(10.0)]
+    fields = {"total_amount": 41.65}
+    r = validate_invoice(fields, pos, raw)
+    assert r.status == STATUS_CORRECTED and pos[0]["total_price"] == 25.0 and fields["total_amount"] == 41.65
+    assert [c["field"] for c in r.corrections] == ["total_price"]            # nur der Positionspreis, nicht das Brutto
+    assert all(row["status"] == "ok" for row in r.calc)                        # nach der Korrektur stimmt alles

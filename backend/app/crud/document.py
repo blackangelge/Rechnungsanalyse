@@ -455,9 +455,10 @@ def update_validation(
     corrected_positions: list[dict] | None = None,
 ) -> InvoiceExtraction | None:
     """
-    Schreibt ein (neues) Prüfergebnis in die Extraktion. Optional werden
-    korrigierte `total_price`-Werte in die Positionen übernommen
-    (`corrected_positions` = [{"position": idx, "to": wert}, ...]).
+    Schreibt ein (neues) Prüfergebnis in die Extraktion und übernimmt die dabei entstandenen
+    Korrekturen in die Daten (`corrected_positions` = ValidationResult.corrections):
+      • {"position": idx, "to": wert}            → order_positions.total_price
+      • {"field": "total_amount", "to": wert}    → invoice_extractions.total_amount (Brutto)
     """
     extraction = (
         db.query(InvoiceExtraction).filter(InvoiceExtraction.document_id == doc_id).first()
@@ -465,16 +466,19 @@ def update_validation(
     if extraction is None:
         return None
     for corr in corrected_positions or []:
-        pos = (
-            db.query(OrderPosition)
-            .filter(
-                OrderPosition.document_id == doc_id,
-                OrderPosition.position_index == corr["position"],
+        if "position" in corr:
+            pos = (
+                db.query(OrderPosition)
+                .filter(
+                    OrderPosition.document_id == doc_id,
+                    OrderPosition.position_index == corr["position"],
+                )
+                .first()
             )
-            .first()
-        )
-        if pos is not None:
-            pos.total_price = Decimal(str(corr["to"]))
+            if pos is not None:
+                pos.total_price = Decimal(str(corr["to"]))
+        elif corr.get("field") == "total_amount":
+            extraction.total_amount = Decimal(str(corr["to"]))
     extraction.validation_status = validation.get("status")
     extraction.validation_details = json.dumps(validation, ensure_ascii=False)
     db.commit()

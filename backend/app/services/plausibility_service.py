@@ -3,15 +3,22 @@ Plausibilitätsprüfung für extrahierte Rechnungsdaten.
 
 Reine Rechenlogik ohne Datenbank- oder Netzwerkzugriff (gut testbar).
 
-Geprüft wird:
+Geprüft wird (alle Werte werden gegeneinander durchgerechnet):
   1. Position:  Menge × Einzelpreis  ≙  Positionspreis   (Rabatt und abweichende
                 Preiseinheit wie "je t" bei Menge in kg werden berücksichtigt)
-  2. Summe:     Σ Positionspreise  ≙  Netto- bzw. Brutto-Gesamtbetrag
+  2. Summe:     Σ Positionspreise  ≙  Netto  (oder Brutto − Steuer, oder Brutto)
   3. Beträge:   Netto + Steuer  ≙  Brutto,   Steuerbetrag  ≙  Netto × Steuersatz
+  4. Steuersätze: Σ Positionen je Steuersatz  ≙  Nettobetrag je Steuersatz der USt-Zusammenfassung,
+                Steuer aus den Positionen berechnet  ≙  ausgewiesene Steuer
+
+Das Ergebnis enthält zusätzlich die „Durchrechnung" (`calc`): jede Rechnung mit erwartetem und
+tatsächlichem Wert, damit nachvollziehbar ist, was geprüft wurde.
 
 Einheitenfehler (Tonne ↔ kg, Liter ↔ ml/hl, je 100 / je 1000 Stück …) werden
 erkannt. Lässt sich der Fehler eindeutig einer Position zuordnen, wird der
-Positionspreis automatisch korrigiert (Originalwert bleibt in `corrections`).
+Positionspreis automatisch korrigiert (Originalwert bleibt in `corrections`). Bestätigen sich
+Positionen, Netto und Steuer gegenseitig, das Brutto aber abweicht, wird das Brutto
+(`total_amount`) auf Netto + Steuer korrigiert; fehlt es, wird es berechnet.
 Alles Weitere meldet `status = "needs_review"` zur weiteren Behandlung
 (zweite KI-Abfrage bzw. manuelle Prüfung).
 """
@@ -142,6 +149,8 @@ class ValidationResult:
     issues: list[Issue] = field(default_factory=list)
     corrections: list[dict] = field(default_factory=list)
     checks_run: int = 0
+    # „Durchrechnung": jede geprüfte Rechnung mit erwartetem/tatsächlichem Wert
+    calc: list[dict] = field(default_factory=list)
 
     @property
     def blocking_issues(self) -> list[Issue]:
@@ -153,6 +162,7 @@ class ValidationResult:
             "issues": [i.to_dict() for i in self.issues],
             "corrections": self.corrections,
             "checks_run": self.checks_run,
+            "calc": self.calc,
         }
 
 
@@ -260,18 +270,56 @@ def validate_invoice(
                 details={"expected": expected, "total": total},
             ))
 
-    # ── 2. Summenprüfung ─────────────────────────────────────────────────────
+    # ── Ausgangswerte ────────────────────────────────────────────────────────
     gross = _f(fields.get("total_amount"))
     net = _f(zahlung.get("gesamtbetrag_netto"))
+    discount = _f(fields.get("discount_amount"))
     totals = [_f(p.get("total_price")) for p in positions]
     priced = [t for t in totals if t is not None]
+    tax_rows = [r for r in (zahlung.get("umsatzsteuer_zusammenfassung") or []) if isinstance(r, dict)]
+    tax_total = sum(_f(r.get("steuerbetrag")) or 0.0 for r in tax_rows) if tax_rows else None
 
-    if priced and (net is not None or gross is not None):
+    def calc(label: str, expected: float | None, actual: float | None, note: str | None = None,
+             extra: float = 0.0) -> bool | None:
+        """Hängt eine Zeile an die Durchrechnung an. Gibt True/False zurück (None = nicht prüfbar)."""
+        if expected is None or actual is None:
+            return None
+        ok = _close(expected, actual, extra=extra)
+        result.calc.append({
+            "label": label, "expected": round(expected, 2), "actual": round(actual, 2),
+            "status": "ok" if ok else "warn", "note": note,
+        })
+        return ok
+
+    # Positionen: Menge × Preis (Ergebnis von Schritt 1 zusammenfassen)
+    checked = [i for i, p in enumerate(positions)
+               if _f(p.get("quantity")) is not None and _f(p.get("unit_price")) is not None
+               and _f(p.get("total_price")) is not None]
+    if checked:
+        bad = [i for i in checked if any(x.position == i and x.code == "position_mismatch" for x in result.issues)]
+        result.calc.append({
+            "label": f"Menge × Einzelpreis ↔ Positionspreis ({len(checked)} Position(en))",
+            "expected": None, "actual": None,
+            "status": "warn" if bad else "ok",
+            "note": ("Abweichung bei Position " + ", ".join(str(i + 1) for i in bad)) if bad else "alle stimmig",
+        })
+
+    # ── 2. Summenprüfung ─────────────────────────────────────────────────────
+    # Positionssumme gilt als stimmig, wenn sie zum Netto, zum Brutto (Positionen brutto, z.B.
+    # Kassenbon) oder zu Brutto − Steuer passt; ein ausgewiesener Gesamtrabatt wird berücksichtigt.
+    targets = [v for v in (net, gross) if v is not None]
+    if gross is not None and tax_total is not None:
+        targets.append(gross - tax_total)
+
+    def sum_ok(total: float) -> bool:
+        candidates = [total] + ([total - discount] if discount else [])
+        return any(_sum_matches(c, targets) for c in candidates)
+
+    if priced and targets:
         result.checks_run += 1
-        target_values = [v for v in (net, gross) if v is not None]
-        if not _sum_matches(sum(priced), target_values):
+        if not sum_ok(sum(priced)):
             corrected = (
-                _try_auto_correct(positions, totals, target_values, raw_pos)
+                _try_auto_correct(positions, totals, targets, raw_pos)
                 if auto_correct else None
             )
             if corrected:
@@ -290,34 +338,161 @@ def validate_invoice(
                     "sum_mismatch", "warning",
                     (f"Summe der Positionen ({_fmt(sum(priced))}) passt weder zum Netto- "
                      f"noch zum Brutto-Rechnungsbetrag "
-                     f"({' / '.join(_fmt(v) for v in target_values)})."),
+                     f"({' / '.join(_fmt(v) for v in (net, gross) if v is not None)})."),
                     details={"positions_sum": sum(priced), "net": net, "gross": gross},
                 ))
+        priced = [_f(p.get("total_price")) for p in positions if _f(p.get("total_price")) is not None]  # nach Korrektur
+    positions_sum = sum(priced) if priced else None
 
-    # ── 3. Netto + Steuer = Brutto, Steuerbetrag = Netto × Satz ─────────────
-    tax_rows = [r for r in (zahlung.get("umsatzsteuer_zusammenfassung") or []) if isinstance(r, dict)]
-    tax_total = sum(_f(r.get("steuerbetrag")) or 0.0 for r in tax_rows) if tax_rows else None
-    if net is not None and gross is not None and tax_total is not None:
+    # Netto ↔ Σ Positionen (nur sinnvoll, wenn die Positionen netto geführt sind)
+    positions_are_gross = (
+        positions_sum is not None and gross is not None and _close(positions_sum, gross)
+        and (net is None or not _close(positions_sum, net))
+    )
+    if positions_sum is not None and net is not None and not positions_are_gross:
         result.checks_run += 1
-        if not _close(net + tax_total, gross):
-            result.issues.append(Issue(
-                "gross_mismatch", "warning",
-                (f"Netto ({_fmt(net)}) + Steuer ({_fmt(tax_total)}) ergibt "
-                 f"{_fmt(net + tax_total)}, Brutto laut Rechnung: {_fmt(gross)}."),
-                details={"net": net, "tax": tax_total, "gross": gross},
-            ))
+        ok = calc("Σ Positionspreise ↔ Netto (Rechnung)", positions_sum, net, extra=0.01)
+        if ok is False and not (discount and _close(positions_sum - discount, net)):
+            # Bestätigen Brutto − Steuer die Positionssumme, ist der ausgewiesene Netto-Wert das Problem
+            hint = ""
+            if gross is not None and tax_total is not None and _close(positions_sum, gross - tax_total):
+                hint = (f" Positionen und Brutto − Steuer ({_fmt(gross - tax_total)}) stimmen überein — "
+                        f"der Nettobetrag wurde wohl falsch gelesen.")
+            if not any(x.code == "sum_mismatch" for x in result.issues):
+                result.issues.append(Issue(
+                    "net_mismatch", "warning",
+                    f"Summe der Positionen ({_fmt(positions_sum)}) passt nicht zum Nettobetrag ({_fmt(net)}).{hint}",
+                    details={"positions_sum": positions_sum, "net": net, "implied_net": (gross - tax_total) if (gross is not None and tax_total is not None) else None},
+                ))
+    elif positions_sum is not None and positions_are_gross:
+        calc("Σ Positionspreise ↔ Brutto (Positionen brutto)", positions_sum, gross, extra=0.01)
+    elif positions_sum is not None and net is None and gross is not None and tax_total is not None:
+        calc("Σ Positionspreise ↔ Brutto − Steuer", positions_sum, gross - tax_total, extra=0.01)
+
+    # ── 3. Steuer je Steuersatz, Netto + Steuer = Brutto ─────────────────────
     for row in tax_rows:
         rate, base, amount = _f(row.get("steuersatz")), _f(row.get("nettobetrag")), _f(row.get("steuerbetrag"))
         if rate is None or base is None or amount is None:
             continue
         result.checks_run += 1
-        if not _close(base * rate / 100, amount):
+        if calc(f"Steuer {rate:g} %: Netto × Satz ↔ Steuerbetrag", base * rate / 100, amount) is False:
             result.issues.append(Issue(
                 "tax_mismatch", "warning",
                 (f"Steuerbetrag {_fmt(amount)} passt nicht zu {_fmt(base)} × {rate:g} % "
                  f"({_fmt(base * rate / 100)})."),
                 details={"rate": rate, "net": base, "tax": amount},
             ))
+
+    # Positionen je Steuersatz ↔ USt-Zusammenfassung (nur wenn jede bepreiste Position einen Satz hat)
+    rated: dict[float, float] = {}
+    all_rated = bool(priced)
+    for i, p in enumerate(positions):
+        total = _f(p.get("total_price"))
+        if total is None:
+            continue
+        rate = _f((raw_pos[i] if i < len(raw_pos) else {}).get("steuersatz"))
+        if rate is None:
+            all_rated = False
+            break
+        rated[rate] = rated.get(rate, 0.0) + total
+    rate_issue = False
+    if all_rated and rated and tax_rows and not positions_are_gross:
+        by_rate = {_f(r.get("steuersatz")): r for r in tax_rows if _f(r.get("steuersatz")) is not None}
+        for rate, total in sorted(rated.items()):
+            row = by_rate.get(rate)
+            base = _f(row.get("nettobetrag")) if row else None
+            if row is None:
+                result.checks_run += 1
+                rate_issue = True
+                result.calc.append({"label": f"Netto {rate:g} %: Σ Positionen ↔ USt-Zusammenfassung",
+                                    "expected": round(total, 2), "actual": None, "status": "warn",
+                                    "note": f"Steuersatz {rate:g} % fehlt in der USt-Zusammenfassung"})
+                result.issues.append(Issue(
+                    "rate_net_mismatch", "warning",
+                    f"Positionen mit {rate:g} % Steuer ({_fmt(total)}) fehlen in der USt-Zusammenfassung.",
+                    details={"rate": rate, "positions_net": total},
+                ))
+            elif base is not None:
+                result.checks_run += 1
+                if calc(f"Netto {rate:g} %: Σ Positionen ↔ USt-Zusammenfassung", total, base, extra=0.01) is False:
+                    rate_issue = True
+                    result.issues.append(Issue(
+                        "rate_net_mismatch", "warning",
+                        (f"Positionen mit {rate:g} % Steuer ergeben {_fmt(total)}, die USt-Zusammenfassung "
+                         f"weist {_fmt(base)} aus."),
+                        details={"rate": rate, "positions_net": total, "summary_net": base},
+                    ))
+        # Umgekehrt: Steuersätze der USt-Zusammenfassung, zu denen keine Position gehört
+        for rate, row in sorted(by_rate.items()):
+            base = _f(row.get("nettobetrag"))
+            if rate not in rated and base:
+                result.checks_run += 1
+                rate_issue = True
+                result.calc.append({"label": f"Netto {rate:g} %: Σ Positionen ↔ USt-Zusammenfassung",
+                                    "expected": None, "actual": round(base, 2), "status": "warn",
+                                    "note": f"keine Position mit {rate:g} % Steuer"})
+                result.issues.append(Issue(
+                    "rate_net_mismatch", "warning",
+                    f"Die USt-Zusammenfassung weist {_fmt(base)} mit {rate:g} % aus, aber keine Position hat diesen Steuersatz.",
+                    details={"rate": rate, "summary_net": base},
+                ))
+        if not rate_issue and tax_total is not None:
+            tax_calc = sum(round(t * r / 100, 2) for r, t in rated.items())
+            result.checks_run += 1
+            if calc("Steuer gesamt: aus Positionen berechnet ↔ ausgewiesen", tax_calc, tax_total, extra=0.01) is False:
+                result.issues.append(Issue(
+                    "tax_from_positions_mismatch", "warning",
+                    (f"Aus den Positionen berechnet sich eine Steuer von {_fmt(tax_calc)}, "
+                     f"ausgewiesen sind {_fmt(tax_total)}."),
+                    details={"computed_tax": tax_calc, "tax": tax_total},
+                ))
+
+    # Netto + Steuer ↔ Brutto — bei Abweichung ggf. Brutto korrigieren/berechnen
+    if net is not None and tax_total is not None:
+        expected_gross = round(net + tax_total, 2)
+        result.checks_run += 1
+        if gross is None:
+            if auto_correct:
+                fields["total_amount"] = expected_gross
+                gross = expected_gross
+                result.corrections.append({"field": "total_amount", "from": None, "to": expected_gross,
+                                           "method": "net_plus_tax"})
+                result.issues.append(Issue(
+                    "total_derived", "info",
+                    f"Gesamtbetrag (Brutto) fehlte und wurde aus Netto + Steuer berechnet: {_fmt(expected_gross)}.",
+                    details={"to": expected_gross},
+                ))
+                calc("Netto + Steuer ↔ Brutto", expected_gross, gross)
+        elif not _close(expected_gross, gross):
+            # Gegenseitig bestätigt: Positionen ≙ Netto und Steuer ≙ Netto × Satz → das Brutto ist der Ausreißer
+            tax_consistent = all(
+                _close((_f(r.get("nettobetrag")) or 0) * (_f(r.get("steuersatz")) or 0) / 100, _f(r.get("steuerbetrag")) or 0)
+                for r in tax_rows if _f(r.get("steuersatz")) is not None and _f(r.get("nettobetrag")) is not None
+            )
+            confirmed = (positions_sum is not None and _close(positions_sum, net, extra=0.01) and tax_consistent)
+            if auto_correct and confirmed:
+                old = gross
+                fields["total_amount"] = expected_gross
+                gross = expected_gross
+                result.corrections.append({"field": "total_amount", "from": old, "to": expected_gross,
+                                           "method": "net_plus_tax"})
+                result.issues.append(Issue(
+                    "total_corrected", "info",
+                    (f"Gesamtbetrag (Brutto) von {_fmt(old)} auf {_fmt(expected_gross)} korrigiert: Positionen, "
+                     f"Netto ({_fmt(net)}) und Steuer ({_fmt(tax_total)}) bestätigen sich gegenseitig."),
+                    details={"from": old, "to": expected_gross},
+                ))
+                calc("Netto + Steuer ↔ Brutto (korrigiert)", expected_gross, gross)
+            else:
+                calc("Netto + Steuer ↔ Brutto", expected_gross, gross)
+                result.issues.append(Issue(
+                    "gross_mismatch", "warning",
+                    (f"Netto ({_fmt(net)}) + Steuer ({_fmt(tax_total)}) ergibt "
+                     f"{_fmt(net + tax_total)}, Brutto laut Rechnung: {_fmt(gross)}."),
+                    details={"net": net, "tax": tax_total, "gross": gross},
+                ))
+        else:
+            calc("Netto + Steuer ↔ Brutto", expected_gross, gross)
 
     # ── Status ableiten ──────────────────────────────────────────────────────
     if result.blocking_issues:

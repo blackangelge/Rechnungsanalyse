@@ -173,3 +173,59 @@ def test_db_analyze_write_persists_validation_and_prompts(db, sqlite_session_fac
     assert d.validation_status == "corrected"
     assert d.validation["corrections"] == [{"position": 0}]
     assert (d.used_system_prompt, d.used_doc_type_prompt) == ("SYSTEM", "TYP")
+
+
+# ─── Durchrechnung: korrigiertes Brutto landet in der Datenbank ───────────────
+
+TWO_RATES_RAW = json.dumps({
+    "positionen": [{"steuersatz": 19.0}, {"steuersatz": 7.0}],
+    "zahlungsinformationen": {
+        "gesamtbetrag_netto": 150.0, "gesamtbetrag_brutto": 172.5,
+        "umsatzsteuer_zusammenfassung": [
+            {"steuersatz": 19.0, "nettobetrag": 100.0, "steuerbetrag": 19.0},
+            {"steuersatz": 7.0, "nettobetrag": 50.0, "steuerbetrag": 3.5},
+        ],
+    },
+})
+TWO_POS = [
+    {"quantity": 1, "unit": "Stück", "unit_price": 100.0, "total_price": 100.0},
+    {"quantity": 1, "unit": "Stück", "unit_price": 50.0, "total_price": 50.0},
+]
+
+
+def test_revalidate_persists_corrected_gross_and_keeps_history(db, client):
+    doc = _make_doc(db)
+    crud.document.save_extraction(db, doc.id, {"total_amount": 127.5}, [dict(p) for p in TWO_POS], TWO_RATES_RAW)
+    body = client.post(f"/api/documents/{doc.id}/validate").json()
+    assert body["validation_status"] == "corrected"
+    assert float(body["extraction"]["total_amount"]) == 172.5
+    corr = body["validation"]["corrections"]
+    assert corr == [{"field": "total_amount", "from": 127.5, "to": 172.5, "method": "net_plus_tax"}]
+    assert [r["status"] for r in body["validation"]["calc"]].count("warn") == 0
+    # zweiter Lauf: Daten stimmen jetzt, Korrekturhistorie bleibt erhalten
+    again = client.post(f"/api/documents/{doc.id}/validate").json()
+    assert again["validation_status"] == "corrected" and len(again["validation"]["corrections"]) == 1
+    assert float(again["extraction"]["total_amount"]) == 172.5
+
+
+def test_revalidate_derives_missing_gross(db, client):
+    doc = _make_doc(db)
+    crud.document.save_extraction(db, doc.id, {"total_amount": None}, [dict(p) for p in TWO_POS], TWO_RATES_RAW)
+    body = client.post(f"/api/documents/{doc.id}/validate").json()
+    assert float(body["extraction"]["total_amount"]) == 172.5
+    assert body["validation"]["issues"][0]["code"] == "total_derived"
+
+
+def test_analysis_pass_corrects_gross_without_second_ai_call(monkeypatch, db):
+    def boom(*a, **k):
+        raise AssertionError("zweite KI-Abfrage darf nicht laufen")
+    monkeypatch.setattr(docs_router.ai_service, "recheck_invoice_data", boom)
+    doc = _make_doc(db)
+    fields = {"total_amount": 127.5, "supplier_name": "ACME"}
+    f, p, raw, stats, validation = asyncio.run(docs_router._plausibility_pass(
+        doc.id, ["img"], object(), None, fields, [dict(x) for x in TWO_POS], TWO_RATES_RAW, {}))
+    assert validation["status"] == "corrected" and f["total_amount"] == 172.5
+    docs_router._db_analyze_write(doc.id, "r.pdf", doc.batch_id, "modell", 1, f, p, raw, None, None, validation)
+    db.expire_all()
+    d = crud.document.get_by_id_with_details(db, doc.id)
+    assert float(d.extraction.total_amount) == 172.5 and d.validation_status == "corrected"
