@@ -97,6 +97,7 @@ app/
     │                       # detect_document_type ist SYNCHRON (httpx.Client)
     │                       # DEFAULT_DOC_TYPE_SYSTEM_PROMPT — Fallback-Systemprompt
     ├── pdf_service.py      # PDF → Bilder (pypdfium2), Seitenanzahl (pypdf)
+    ├── pdf_edit_service.py # PDF-Bearbeitung mit Versionierung (Seiten entfernen, Wiederherstellen, Auto-Kürzen)
     └── plausibility_service.py  # Plausibilitätsprüfung (reine Rechenlogik, keine DB/Netzwerk)
                             # Einheiten (t/kg/g, l/ml/hl, Stück, Verpackungen), Positions-/Summen-/
                             # Steuerprüfung, automatische Einheiten-Korrektur
@@ -115,10 +116,13 @@ alembic/
     ├── 0012_doc_ki_stats.py
     │                       # doc_ki_input_tokens, doc_ki_output_tokens, doc_ki_total_duration
     │                       # auf documents (Fallback-Stats für Nicht-Eingangsrechnungen)
-    └── 0013_plausibility_and_prompt_snapshot.py
-                            # revision = "0013_plausibility"; validation_status/-details auf
-                            # invoice_extractions; used_system_prompt/_doc_type_prompt/
-                            # _recheck_prompt auf documents
+    ├── 0013_plausibility_and_prompt_snapshot.py
+    │                       # revision = "0013_plausibility"; validation_status/-details auf
+    │                       # invoice_extractions; used_system_prompt/_doc_type_prompt/
+    │                       # _recheck_prompt auf documents
+    └── 0014_pdf_versions.py
+                            # revision = "0014_pdf_versions"; document_versions, pdf_settings,
+                            # documents.pdf_version / analyzed_pdf_version
 ```
 
 ### Import-Ablauf
@@ -359,6 +363,37 @@ neuen Spalten schlägt jede Dokument-Abfrage fehl.
 
 **Tests:** `cd backend && pip install -r requirements-dev.txt && pytest`
 
+### PDF-Bearbeitung & Versionen (`services/pdf_edit_service.py`, `routers/document_pdf.py`)
+
+Seiten einer PDF können entfernt werden — **manuell** (Seitenauswahl mit Vorschaubildern im Modal „Seiten" auf der
+Belege-Seite) und **automatisch** (nur die ersten N Seiten behalten). Jede Änderung erzeugt eine **neue,
+unveränderliche Version**; das Original bleibt immer erhalten.
+
+- Dateien: `STORAGE_PATH/{Firma_Jahr}/versions/{doc_id}/v{n}.pdf`. Version 1 (Original) wird beim **ersten Bearbeiten**
+  angelegt (vorher gibt `GET /versions` ein virtuelles Original mit `id: null` zurück).
+- Die **aktuelle** Version liegt zusätzlich unverändert als `{id}.pdf` — Vorschau, KI-Analyse und Export brauchen keine
+  Anpassung. `documents.pdf_version` = aktuelle Version, `documents.page_count` wird mitgeführt.
+- `document_versions`: `version_number`, `stored_path`, `page_count`, `file_size_bytes`, `source`
+  (`original|manual|auto|restore`), `description`, `parent_version`, `removed_pages` (JSON, 1-basiert, bezogen auf die
+  Elternversion).
+- **Wiederherstellen** legt eine NEUE Version an (Kopie der alten) — der Verlauf wird nie überschrieben.
+- Schreiben ist atomar (tmp-Datei → `os.replace`); schlägt der DB-Commit fehl, wird `{id}.pdf` auf die Elternversion
+  zurückgesetzt. Bearbeiten ist bei `status == "processing"` gesperrt (HTTP 409).
+- Import löschen entfernt auch `versions/{id}/` (`delete_version_files`). Soft-Delete lässt alles liegen.
+- **Seitenzahl:** Der Import liest sie nicht (`page_count = 0` bis zur Analyse). `GET /versions` trägt sie aus der Datei nach.
+- Eine bestehende KI-Extraktion wird durch eine PDF-Änderung **nicht** gelöscht. `documents.analyzed_pdf_version`
+  (gesetzt in `_db_prepare_pdf` vor jeder Analyse) zeigt, ob die PDF seitdem geändert wurde → Hinweis in der Belege-Liste
+  (`v2` gelb) und Infos-Ansicht „bitte neu analysieren".
+
+**Automatisches Kürzen:** Einstellungen → Verarbeitung (`pdf_settings`, Singleton: `auto_trim_enabled`,
+`auto_trim_max_pages`). Hat die PDF mehr Seiten, werden vor der KI-Analyse (Phase 1b, `_db_prepare_pdf`) nur die ersten N
+behalten (Version `source="auto"`). Fehler dabei brechen die Analyse nie ab. Zusätzlich für die Auswahl in der Belege-Liste:
+`POST /api/documents/auto-trim`.
+
+Endpunkte (`/api/documents`): `GET /{id}/versions`, `GET /{id}/versions/{n}/preview`, `GET /{id}/pages/{page}/thumbnail`
+(PNG, `?version=`, 1-basiert), `POST /{id}/pages/remove` (`remove_pages` ODER `keep_pages`, optional `note`),
+`POST /{id}/versions/{n}/restore`, `POST /auto-trim`; `GET|PUT /api/settings/pdf`.
+
 ### KI-Token-Statistiken
 
 #### Für Eingangsrechnungen (in `invoice_extractions`)
@@ -568,6 +603,10 @@ Gleiche Dropdown-Checkbox-Komponente wie `BatchMultiSelect` (Import-Filter):
 - `resetFilters()` setzt `selectedDocTypeIds` zurück
 - Backend: `GET /api/documents?document_type_ids=1&document_type_ids=3` — filtert mit `.in_()`
 
+- Aktion **Seiten** (und „PDF bearbeiten" in der Infos-Ansicht): `components/belege/PdfEditModal.tsx` — Seiten per
+  Vorschaubild anklicken (Shift = Bereich) oder als „2-5, 8" eingeben, „Ausgewählte entfernen" / „Nur ausgewählte behalten" /
+  „nur die ersten N behalten", rechts Versionsverlauf mit Ansehen und Wiederherstellen
+- Aktionsleiste: „PDFs kürzen" für die Auswahl (`POST /auto-trim`)
 - Spalte **Prüfung** (`ValidationBadge`): OK · Korrigiert · KI-korrigiert · Prüfen! · Geprüft
 - Infos-Ansicht: `ValidationPanel` oben (Korrekturen, Auffälligkeiten, Ergebnis der zweiten KI-Abfrage,
   Buttons „Prüfung erneut ausführen" / „Als geprüft bestätigen")
@@ -725,6 +764,7 @@ ProcessingSettings (Singleton, import_concurrency + ai_concurrency)
 | `0009_ki_stats_on_invoice_extractions.py` | 5 `ki_*`-Spalten auf `invoice_extractions` (nullable) |
 | `0011_document_types.py` | `document_types`-Tabelle (15 vordefinierte Typen), `document_type_id` FK auf `documents`, `is_document_type_prompt` auf `system_prompts` |
 | `0012_doc_ki_stats.py` | `doc_ki_input_tokens`, `doc_ki_output_tokens`, `doc_ki_total_duration` auf `documents` (Fallback-Stats für Nicht-Eingangsrechnungen ohne InvoiceExtraction) |
+| `0014_pdf_versions.py` | `document_versions`-Tabelle, `pdf_settings` (Singleton), `pdf_version`/`analyzed_pdf_version` auf `documents` |
 | `0013_plausibility_and_prompt_snapshot.py` | `validation_status`/`validation_details` auf `invoice_extractions`; `used_system_prompt`, `used_doc_type_prompt`, `used_recheck_prompt` auf `documents` |
 
 ### Import-Status-Flow

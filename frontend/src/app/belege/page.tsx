@@ -2,6 +2,7 @@
 
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
+import PdfEditModal from "@/components/belege/PdfEditModal";
 import {
   AIConfig,
   AnalyzeRequest,
@@ -257,6 +258,11 @@ export default function BelegePage() {
   // Löschen-Bestätigung
   const [deleteConfirmId, setDeleteConfirmId] = useState<number | null>(null);
 
+  // PDF bearbeiten (Seiten entfernen, Versionen) + Sammel-Kürzen
+  const [editDoc, setEditDoc] = useState<{ id: number; filename: string } | null>(null);
+  const [trimMaxPages, setTrimMaxPages] = useState("1");
+  const [trimming, setTrimming] = useState(false);
+
   // KI-Modal
   const [viewMode, setViewMode] = useState<"ki" | "infos" | null>(null);
   const [viewedDoc, setViewedDoc] = useState<DocumentDetail | null>(null);
@@ -435,6 +441,41 @@ export default function BelegePage() {
       setError(extractApiError(err, "Fehler beim Starten der KI-Analyse"));
     } finally {
       setAnalyzing(false);
+    }
+  }
+
+  /** Ausgewählte Dokumente auf die ersten N Seiten kürzen (jeweils als neue Version) */
+  async function trimSelected() {
+    const n = parseInt(trimMaxPages, 10);
+    if (selectedIds.size === 0 || !Number.isFinite(n) || n < 1) return;
+    if (!confirm(
+      `${selectedIds.size} Dokument(e) auf die ersten ${n} Seite(n) kürzen? ` +
+      `Dokumente mit höchstens ${n} Seite(n) bleiben unverändert. Die Originale bleiben als Version 1 erhalten.`
+    )) return;
+    setTrimming(true);
+    setError(null);
+    setSuccessMsg(null);
+    try {
+      const r = await documentsApi.autoTrim(Array.from(selectedIds), n);
+      const errs = Object.entries(r.errors);
+      setSuccessMsg(
+        `${r.trimmed.length} gekürzt, ${r.unchanged.length} unverändert` +
+        (errs.length ? `, ${errs.length} Fehler (${errs.map(([id, m]) => `#${id}: ${m}`).join("; ")})` : "") +
+        (r.trimmed.length ? " — bitte danach neu analysieren." : "")
+      );
+      await loadDocuments(activeFilters);
+    } catch (err: unknown) {
+      setError(extractApiError(err, "Fehler beim Kürzen"));
+    } finally {
+      setTrimming(false);
+    }
+  }
+
+  /** Nach einer PDF-Änderung: Liste und ggf. geöffnete Infos-Ansicht aktualisieren */
+  async function handlePdfChanged() {
+    await loadDocuments(activeFilters);
+    if (editDoc && viewedDoc && viewedDoc.id === editDoc.id) {
+      try { setViewedDoc(await documentsApi.get(editDoc.id)); } catch { /* ignore */ }
     }
   }
 
@@ -675,6 +716,20 @@ export default function BelegePage() {
               {analyzing ? "Starte..." : "KI-Analyse starten"}
             </button>
           </div>
+
+          {/* PDFs kürzen (automatische Funktion für die Auswahl) */}
+          <div className="mt-3 flex flex-wrap items-center gap-3 border-t border-gray-200 pt-3">
+            <span className={`text-sm font-medium ${selectedIds.size > 0 ? "text-blue-800" : "text-gray-500"}`}>PDFs kürzen:</span>
+            <span className="text-sm text-gray-600">nur die ersten</span>
+            <input type="number" min={1} value={trimMaxPages} onChange={(e) => setTrimMaxPages(e.target.value)}
+              className="w-16 rounded border border-gray-300 bg-white px-2 py-1 text-center text-sm focus:border-blue-500 focus:outline-none" />
+            <span className="text-sm text-gray-600">Seite(n) behalten</span>
+            <button onClick={trimSelected} disabled={trimming || selectedIds.size === 0}
+              className="rounded border border-blue-300 bg-white px-3 py-1 text-sm font-medium text-blue-700 hover:bg-blue-100 disabled:opacity-40 disabled:cursor-not-allowed transition-colors">
+              {trimming ? "Kürze..." : "Auswahl kürzen"}
+            </button>
+            <span className="text-xs text-gray-400">Original bleibt als Version 1 erhalten. Automatisch vor jeder Analyse: Einstellungen → Verarbeitung.</span>
+          </div>
         </div>
 
       </div>{/* Ende Kopfbereich */}
@@ -730,6 +785,12 @@ export default function BelegePage() {
                   <div className="sticky top-0 z-10 border-b bg-white px-5 py-3">
                     <h2 className="text-sm font-semibold text-gray-900 truncate">{viewedDoc.original_filename}</h2>
                     <p className="text-xs text-gray-500">{viewedDoc.company} {viewedDoc.year} · #{viewedDoc.id}</p>
+                    <button
+                      onClick={() => setEditDoc({ id: viewedDoc.id, filename: viewedDoc.original_filename })}
+                      className="mt-1.5 rounded border border-gray-300 px-2 py-0.5 text-xs font-medium text-gray-600 hover:bg-gray-100"
+                    >
+                      PDF bearbeiten (Seiten / Versionen)
+                    </button>
                   </div>
                   <div className="p-5">
                     <InfosView
@@ -847,6 +908,19 @@ export default function BelegePage() {
 
                       <td className="px-3 py-2.5 text-right text-gray-700 tabular-nums">
                         {doc.page_count > 0 ? doc.page_count : "–"}
+                        {(doc.pdf_version ?? 1) > 1 && (
+                          <span
+                            title={`PDF bearbeitet (Version ${doc.pdf_version})${
+                              doc.has_extraction && doc.analyzed_pdf_version !== doc.pdf_version ? " — seit der Analyse geändert, bitte neu analysieren" : ""
+                            }`}
+                            className={`ml-1 rounded px-1 text-[10px] font-semibold ${
+                              doc.has_extraction && doc.analyzed_pdf_version !== doc.pdf_version
+                                ? "bg-amber-100 text-amber-800" : "bg-gray-100 text-gray-500"
+                            }`}
+                          >
+                            v{doc.pdf_version}
+                          </span>
+                        )}
                       </td>
                       <td className="px-3 py-2.5 text-right text-gray-700 tabular-nums">
                         {formatCurrency(doc.total_amount)}
@@ -894,6 +968,17 @@ export default function BelegePage() {
                               ].join(" ")}
                             >
                               {isActivePreview ? "Vorschau aus" : "PDF"}
+                            </button>
+                          )}
+
+                          {/* Seiten bearbeiten / Versionen */}
+                          {!isDeleted && doc.stored_filename && doc.status !== "processing" && (
+                            <button
+                              onClick={() => setEditDoc({ id: doc.id, filename: doc.original_filename })}
+                              title="Seiten entfernen, Versionen ansehen"
+                              className="rounded border border-gray-300 px-2 py-1 text-xs font-medium text-gray-600 hover:bg-gray-100 transition-colors"
+                            >
+                              Seiten
                             </button>
                           )}
 
@@ -1023,6 +1108,15 @@ export default function BelegePage() {
           </div>
         </div>
       )}
+
+      {editDoc && (
+        <PdfEditModal
+          docId={editDoc.id}
+          filename={editDoc.filename}
+          onClose={() => setEditDoc(null)}
+          onChanged={handlePdfChanged}
+        />
+      )}
     </>
   );
 }
@@ -1143,6 +1237,12 @@ function InfosView({
 
   return (
     <div>
+      {doc.extraction && doc.analyzed_pdf_version != null && doc.analyzed_pdf_version !== doc.pdf_version && (
+        <div className="mb-6 rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-900">
+          Die PDF wurde nach der letzten KI-Analyse bearbeitet (analysiert: Version {doc.analyzed_pdf_version},
+          aktuell: Version {doc.pdf_version}). Bitte neu analysieren, damit die Daten zur aktuellen PDF passen.
+        </div>
+      )}
       <ValidationPanel doc={doc} onChange={onDocChange} />
 
       {/* Lieferant */}

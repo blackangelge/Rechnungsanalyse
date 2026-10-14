@@ -23,6 +23,9 @@ class DocumentRead(BaseModel):
     error_message: str | None
     created_at: datetime
     deleted_at: datetime | None = None
+    # Aktuelle PDF-Version (1 = Original) und Version der letzten KI-Analyse
+    pdf_version: int = 1
+    analyzed_pdf_version: int | None = None
 
     model_config = ConfigDict(from_attributes=True)
 

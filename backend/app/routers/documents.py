@@ -27,8 +27,9 @@ from sqlalchemy.orm import Session
 from app import crud
 from app.config import settings
 from app.database import SessionLocal, get_db
+from app.models.document import Document as DocModel
 from app.schemas.document import DocumentCommentUpdate, DocumentDetail, DocumentListRead
-from app.services import ai_service, pdf_service, plausibility_service
+from app.services import ai_service, pdf_edit_service, pdf_service, plausibility_service
 
 logger = logging.getLogger(__name__)
 
@@ -270,6 +271,45 @@ def _db_analyze_read(doc_id: int, ai_config_id: int) -> dict | None:
         except Exception:
             pass
         return None
+    finally:
+        db.close()
+
+
+def _db_prepare_pdf(doc_id: int, original_filename: str, batch_id: int | None) -> None:
+    """
+    Vor dem Rendern (sync, für asyncio.to_thread): optional automatisch kürzen
+    (neue PDF-Version) und die analysierte PDF-Version am Dokument festhalten.
+    Fehler beim Kürzen brechen die Analyse nie ab — es wird dann das volle PDF analysiert.
+    """
+    db = SessionLocal()
+    try:
+        doc = db.get(DocModel, doc_id)
+        if doc is None:
+            return
+        pdf_settings = crud.pdf_settings.get_or_create(db)
+        if pdf_settings.auto_trim_enabled:
+            try:
+                version = pdf_edit_service.auto_trim(db, doc, pdf_settings.auto_trim_max_pages)
+                if version is not None:
+                    crud.system_log.add(
+                        db, category="pdf", level="info",
+                        message=f"PDF automatisch gekürzt: {original_filename} — {version.description}",
+                        batch_id=batch_id, document_id=doc_id,
+                    )
+            except Exception as exc:
+                db.rollback()
+                logger.warning("Auto-Kürzen für #%d fehlgeschlagen: %s", doc_id, exc)
+                crud.system_log.add(
+                    db, category="pdf", level="warning",
+                    message=f"Automatisches Kürzen fehlgeschlagen: {original_filename} — {exc}",
+                    batch_id=batch_id, document_id=doc_id,
+                )
+        doc = db.get(DocModel, doc_id)
+        doc.analyzed_pdf_version = doc.pdf_version
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        logger.warning("PDF-Vorbereitung für #%d fehlgeschlagen: %s", doc_id, exc)
     finally:
         db.close()
 
@@ -658,6 +698,9 @@ async def _analyze_single(
         system_prompt_text or ai_service.DEFAULT_SYSTEM_PROMPT,
         doc_type_prompt_text if (doc_type_prompt_text and document_types) else None,
     )
+
+    # ── Phase 1b: optional automatisch kürzen, analysierte PDF-Version merken ──
+    await asyncio.to_thread(_db_prepare_pdf, doc_id, original_filename, batch_id)
 
     # ── Phase 2: PDF → Bilder (blockierende IO, kein DB-Handle offen) ────
     logger.info("Rendere PDF für Dokument #%d: %s", doc_id, pdf_path.name)
