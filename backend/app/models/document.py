@@ -5,6 +5,7 @@ Jedes Dokument gehört zu einem ImportBatch.
 Nach dem Kopieren wird die Originaldatei unter {id}.pdf im Storage gespeichert.
 """
 
+import json
 from datetime import datetime
 
 from sqlalchemy import BigInteger, DateTime, ForeignKey, Integer, String, Text, func
@@ -80,6 +81,11 @@ class Document(Base):
     doc_ki_output_tokens: Mapped[int | None]   = mapped_column(Integer, nullable=True)
     doc_ki_total_duration: Mapped[float | None] = mapped_column(nullable=True)
 
+    # Beim Analysieren tatsächlich verwendete Systemprompts (Wortlaut-Snapshot)
+    used_system_prompt:   Mapped[str | None] = mapped_column(Text, nullable=True)
+    used_doc_type_prompt: Mapped[str | None] = mapped_column(Text, nullable=True)
+    used_recheck_prompt:  Mapped[str | None] = mapped_column(Text, nullable=True)
+
     # Beziehung zum übergeordneten Batch
     batch: Mapped["ImportBatch"] = relationship(  # noqa: F821
         "ImportBatch", back_populates="documents"
@@ -141,6 +147,21 @@ class Document(Base):
         if self.extraction and self.extraction.ki_total_duration is not None:
             return self.extraction.ki_total_duration
         return self.doc_ki_total_duration
+
+    @property
+    def validation_status(self) -> str | None:
+        return self.extraction.validation_status if self.extraction else None
+
+    @property
+    def validation(self) -> dict | None:
+        """Geparste Prüfdetails (issues, corrections …) oder None."""
+        raw = self.extraction.validation_details if self.extraction else None
+        if not raw:
+            return None
+        try:
+            return json.loads(raw)
+        except ValueError:
+            return None
 
     @property
     def document_type_name(self) -> str | None:

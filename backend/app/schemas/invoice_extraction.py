@@ -60,6 +60,9 @@ class InvoiceExtractionRead(BaseModel):
     # Rohantwort der KI (für Debugging)
     raw_response: str | None
 
+    # Plausibilitätsprüfung
+    validation_status: str | None = None
+
     # KI-Statistiken (Token-Counts + Laufzeit)
     ki_input_tokens: int | None = None
     ki_output_tokens: int | None = None

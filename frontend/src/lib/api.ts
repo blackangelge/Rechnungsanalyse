@@ -238,6 +238,48 @@ export interface DocumentItem {
   /** Erkannter Dokumententyp (durch KI-Klassifikation) */
   document_type_id?: number | null;
   document_type_name?: string | null;
+  /** Ergebnis der Plausibilitätsprüfung (nur bei Eingangsrechnungen) */
+  validation_status?: ValidationStatus | null;
+}
+
+/** ok = plausibel · corrected = automatisch korrigiert · ai_corrected = durch zweite
+ *  KI-Abfrage korrigiert · needs_review = manuelle Prüfung nötig · manual_ok = vom
+ *  Nutzer bestätigt · unchecked = nichts prüfbar */
+export type ValidationStatus =
+  | "ok" | "corrected" | "ai_corrected" | "needs_review" | "manual_ok" | "unchecked";
+
+export interface ValidationIssue {
+  code: string;
+  severity: "info" | "warning" | "error";
+  message: string;
+  /** 0-basierter Positionsindex (null = betrifft die ganze Rechnung) */
+  position: number | null;
+  details: Record<string, unknown>;
+}
+
+export interface ValidationCorrection {
+  position: number;
+  field: string;
+  from: number;
+  to: number;
+  factor: number;
+  method: string;
+}
+
+export interface ValidationDetails {
+  status: ValidationStatus;
+  method?: "rules" | "ai_recheck";
+  issues: ValidationIssue[];
+  corrections: ValidationCorrection[];
+  checks_run: number;
+  confirmed_manually?: boolean;
+  recheck?: {
+    performed: boolean;
+    outcome?: "corrected" | "still_inconsistent" | "failed";
+    issues_before?: ValidationIssue[];
+    issues_after?: ValidationIssue[];
+    error?: string;
+  };
 }
 
 export interface OrderPosition {
@@ -284,6 +326,11 @@ export interface InvoiceExtraction {
 export interface DocumentDetail extends DocumentItem {
   extraction: InvoiceExtraction | null;
   order_positions: OrderPosition[];
+  validation?: ValidationDetails | null;
+  /** Wortlaut der bei der Analyse verwendeten Systemprompts */
+  used_system_prompt?: string | null;
+  used_doc_type_prompt?: string | null;
+  used_recheck_prompt?: string | null;
 }
 
 export interface DocumentFilter {
@@ -300,6 +347,7 @@ export interface DocumentFilter {
   supplier_name?: string;
   doc_id?: number;
   document_type_ids?: number[];
+  validation_status?: ValidationStatus[];
 }
 
 export interface AnalyzeRequest {
@@ -326,6 +374,16 @@ export const documentsApi = {
   updateComment: (id: number, comment: string | null) =>
     apiClient
       .patch<DocumentDetail>(`/api/documents/${id}/comment`, { comment })
+      .then((r) => r.data),
+
+  /** Plausibilitätsprüfung auf den gespeicherten Daten erneut ausführen */
+  revalidate: (id: number) =>
+    apiClient.post<DocumentDetail>(`/api/documents/${id}/validate`).then((r) => r.data),
+
+  /** Prüfung nach manueller Kontrolle als "geprüft" bestätigen */
+  confirmValidation: (id: number) =>
+    apiClient
+      .post<DocumentDetail>(`/api/documents/${id}/validation/confirm`)
       .then((r) => r.data),
 
   /** Soft-Delete: Dokument als gelöscht markieren (PDF bleibt erhalten) */
