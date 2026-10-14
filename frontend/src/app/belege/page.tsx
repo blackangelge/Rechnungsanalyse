@@ -150,7 +150,10 @@ function BatchMultiSelect({
             <label key={b.id} className="flex cursor-pointer items-center gap-2 px-3 py-2 text-sm hover:bg-gray-50">
               <input type="checkbox" checked={selectedIds.has(b.id)} onChange={() => toggle(b.id)}
                 className="rounded border-gray-300 text-blue-600" />
-              <span className="flex-1 truncate">{b.company_name} {b.year}</span>
+              <span className="flex-1 truncate">
+                {b.company_name} {b.year}
+                {b.hidden_at && <span className="ml-1 text-xs text-gray-400">(ausgeblendet)</span>}
+              </span>
               <span className="text-xs text-gray-400">#{b.id}</span>
             </label>
           ))}
@@ -240,6 +243,7 @@ export default function BelegePage() {
   const [selectedBatchIds, setSelectedBatchIds] = useState<Set<number>>(new Set());
   const [selectedDocTypeIds, setSelectedDocTypeIds] = useState<Set<number>>(new Set());
   const [includeDeleted, setIncludeDeleted] = useState(false);
+  const [includeHidden, setIncludeHidden] = useState(false);
   const [filterKi, setFilterKi] = useState<"" | "ja" | "nein">("");
   const [filterSupplierName, setFilterSupplierName] = useState("");
   const [filterDocId, setFilterDocId] = useState("");
@@ -335,10 +339,10 @@ export default function BelegePage() {
       const [configs, prompts, allBatches, allDocTypes, allWorkflows, options, allSuppliers] = await Promise.all([
         aiConfigsApi.list(),
         systemPromptsApi.list(),
-        importsApi.list(),
+        importsApi.list({ include_hidden: true }),      // ausgeblendete bleiben im Import-Filter wählbar
         documentTypesApi.list(),
         workflowsApi.list().catch(() => [] as WorkflowListItem[]),   // Workflows sind optional
-        documentsApi.filterOptions().catch(() => ({ years: [] as number[], companies: [] as string[] })),
+        documentsApi.filterOptions(true).catch(() => ({ years: [] as number[], companies: [] as string[] })),
         suppliersApi.list().catch(() => [] as Supplier[]),
       ]);
       setWorkflows(allWorkflows);
@@ -430,6 +434,7 @@ export default function BelegePage() {
     if (selectedBatchIds.size > 0) f.batch_ids = Array.from(selectedBatchIds);
     if (selectedDocTypeIds.size > 0) f.document_type_ids = Array.from(selectedDocTypeIds);
     if (includeDeleted) f.include_deleted = true;
+    if (includeHidden) f.include_hidden = true;
     if (filterKi === "ja") f.has_extraction = true;
     if (filterKi === "nein") f.has_extraction = false;
     if (filterSupplierName.trim()) f.supplier_name = filterSupplierName.trim();
@@ -463,7 +468,7 @@ export default function BelegePage() {
   function resetFilters() {
     setFilterCompany(""); setFilterYear(""); setFilterStatus("");
     setFilterTotalMin(""); setFilterTotalMax(""); setFilterPageMin(""); setFilterPageMax("");
-    setSelectedBatchIds(new Set()); setSelectedDocTypeIds(new Set()); setIncludeDeleted(false);
+    setSelectedBatchIds(new Set()); setSelectedDocTypeIds(new Set()); setIncludeDeleted(false); setIncludeHidden(false);
     setFilterKi(""); setFilterSupplierName(""); setFilterDocId(""); setFilterValidation("");
     const f: DocumentFilter = {};
     syncUrl(f);
@@ -777,6 +782,13 @@ export default function BelegePage() {
               <input type="checkbox" checked={includeDeleted} onChange={(e) => setIncludeDeleted(e.target.checked)}
                 className="rounded border-gray-300 text-blue-600" />
               <span className="text-sm text-gray-600">Gelöschte anzeigen</span>
+            </label>
+            {/* Belege ausgeblendeter Imports */}
+            <label className="flex cursor-pointer items-center gap-2 mt-auto pb-1.5"
+              title="Belege von Imports, die auf dem Dashboard ausgeblendet wurden. Ein ausdrücklich gewählter Import wird immer angezeigt.">
+              <input type="checkbox" checked={includeHidden} onChange={(e) => setIncludeHidden(e.target.checked)}
+                className="rounded border-gray-300 text-blue-600" />
+              <span className="text-sm text-gray-600">Ausgeblendete Imports einbeziehen</span>
             </label>
             <div className="flex gap-2 mt-auto">
               <button onClick={applyFilters}

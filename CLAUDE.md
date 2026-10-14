@@ -129,10 +129,12 @@ alembic/
     ├── 0015_workflows.py
     │                       # revision = "0015_workflows"; workflows, suppliers.workflow_id,
     │                       # documents.used_workflow_* / workflow_trace
-    └── 0016_search_indexes.py
-                            # revision = "0016_search_indexes"; B-Tree-Indizes (Filter-Spalten, Fremdschlüssel — u.a.
-                            # order_positions.document_id) + pg_trgm-GIN-Indizes für ILIKE '%…%' (übersprungen, falls
-                            # die Erweiterung nicht anlegbar ist)
+    ├── 0016_search_indexes.py
+    │                       # revision = "0016_search_indexes"; B-Tree-Indizes (Filter-Spalten, Fremdschlüssel — u.a.
+    │                       # order_positions.document_id) + pg_trgm-GIN-Indizes für ILIKE '%…%' (übersprungen, falls
+    │                       # die Erweiterung nicht anlegbar ist)
+    └── 0017_import_hidden.py
+                            # revision = "0017_import_hidden"; import_batches.hidden_at (+ Index)
 ```
 
 ### Import-Ablauf
@@ -550,7 +552,27 @@ IMPORT_BASE_PATH=/volume1/docker/_rechnungsanalyse/import
 STORAGE_PATH=/volume1/docker/_rechnungsanalyse/storage
 ```
 
+### Imports ausblenden (`import_batches.hidden_at`)
+
+Ganze Imports lassen sich ausblenden, wenn sie gerade nicht wichtig sind — **nichts wird gelöscht**, alles ist umkehrbar.
+
+- `POST /api/imports/visibility` `{ids, hidden}` (mehrere auf einmal, idempotent: bereits passende Imports behalten ihren Zeitstempel;
+  unbekannte ID → 404 und es ändert sich nichts; System-Log-Eintrag). `GET /api/imports` liefert Ausgeblendete nur mit `include_hidden=true`.
+- `GET /api/documents` (+ `/ids`, `/filter-options`) schließt Belege ausgeblendeter Imports standardmäßig aus; `include_hidden=true`
+  nimmt sie hinein. **Ausnahmen:** ein ausdrücklich gewählter Import (`batch_ids`) und die Suche per `doc_id` (z.B. Link aus den Logs)
+  zeigen immer an. Neue Auswertungen/Listen über Belege müssen diese Regel (`_filtered_query`) mitbedenken.
+- Frontend: Dashboard mit Mehrfachauswahl (Ausblenden/Einblenden), Schalter „Ausgeblendete anzeigen (N)", Zeilen-Buttons und
+  Markierung „ausgeblendet"; Import-Detailseite mit Button; Belege-Filter „Ausgeblendete Imports einbeziehen" (ausgeblendete Imports
+  bleiben im Import-Dropdown wählbar, mit Hinweis).
+
 ### Excel-Export (`routers/imports.py`)
+
+`GET /api/imports/export?ids=1&ids=2` — **gemeinsamer Export mehrerer Imports in eine Datei** (Dashboard: Imports ankreuzen →
+„↓ Excel exportieren"; zusätzlich Excel-Link je Zeile). Bei ≥ 2 Imports gibt es am Ende beider Sheets die Spalte **„Import"**
+(`Firma Jahr (#id)`), sonst ist das Layout identisch zum Einzelexport. Die Route muss **vor** `/{batch_id}` stehen.
+Ausgeblendete Imports sind exportierbar. Laufzeit hier ≈ 3 s je 1.500 Belege (openpyxl); Zell-Stile werden vorbereitet und kopiert
+(`_style(...)`) statt je Zelle zu setzen (1,6–1,8× schneller, Ergebnis zellweise identisch). Große Exporte brauchen auf dem NAS länger:
+`next.config.ts` setzt deshalb `experimental.proxyTimeout` auf 10 Minuten (Standard 30 s) — nach Änderung Frontend-Container neu starten.
 
 `GET /api/imports/{id}/export` — gibt eine `.xlsx`-Datei zurück (StreamingResponse).
 Lädt alle **nicht-soft-gelöschten** Dokumente des Batches via `joinedload` für
@@ -885,6 +907,7 @@ Workflow     1──n  Supplier          (Supplier.workflow_id, optional)
 | `0014_pdf_versions.py` | `document_versions`-Tabelle, `pdf_settings` (Singleton), `pdf_version`/`analyzed_pdf_version` auf `documents` |
 | `0015_workflows.py` | `workflows`-Tabelle, `suppliers.workflow_id` (FK, SET NULL), `used_workflow_id/_name/_graph` + `workflow_trace` auf `documents` |
 | `0016_search_indexes.py` | Indizes für Beleg-/Artikelsuche (B-Tree + `pg_trgm`), siehe „Große Bestände" |
+| `0017_import_hidden.py` | `import_batches.hidden_at` (Imports ausblenden) |
 
 ### Import-Status-Flow
 

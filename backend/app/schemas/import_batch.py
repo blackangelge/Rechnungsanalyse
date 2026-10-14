@@ -7,7 +7,7 @@ ImportBatchRead: vollständige Antwort inkl. Status und Dokumente.
 
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class ImportBatchCreate(BaseModel):
@@ -58,8 +58,16 @@ class ImportBatchRead(BaseModel):
     started_at: datetime | None
     finished_at: datetime | None
     created_at: datetime
+    hidden_at: datetime | None = None
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class ImportVisibilityUpdate(BaseModel):
+    """Imports aus- bzw. einblenden (mehrere auf einmal)."""
+
+    ids: list[int] = Field(min_length=1)
+    hidden: bool
 
 
 class ImportBatchWithDocuments(ImportBatchRead):

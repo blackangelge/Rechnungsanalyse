@@ -13,6 +13,7 @@ from sqlalchemy import func, outerjoin
 from sqlalchemy.orm import Session, defer, joinedload
 
 from app.models.document import Document
+from app.models.import_batch import ImportBatch
 from app.models.invoice_extraction import InvoiceExtraction
 from app.models.order_position import OrderPosition
 
@@ -147,7 +148,7 @@ def get_by_id_with_details(db: Session, doc_id: int) -> Document | None:
 _FILTER_KEYS = (
     "company", "year", "status", "total_min", "total_max", "page_min", "page_max", "batch_ids",
     "include_deleted", "has_extraction", "supplier_name_filter", "doc_id", "document_type_ids",
-    "validation_statuses",
+    "validation_statuses", "include_hidden",
 )
 
 
@@ -170,6 +171,14 @@ def _filtered_query(db: Session, **f):
 
     if g("batch_ids"):
         query = query.filter(Document.batch_id.in_(g("batch_ids")))
+    elif not g("include_hidden") and g("doc_id") is None:
+        # Belege ausgeblendeter Imports nur auf Wunsch. Ausnahmen: ein ausdrücklich gewählter
+        # Import (batch_ids) und die gezielte Suche nach einer Beleg-ID (z.B. Link aus den Logs).
+        query = query.filter(
+            ~Document.batch_id.in_(
+                db.query(ImportBatch.id).filter(ImportBatch.hidden_at.isnot(None))
+            )
+        )
 
     needs_join = (
         g("total_min") is not None
@@ -253,12 +262,16 @@ def get_ids_filtered(db: Session, **filters) -> list[int]:
     return [r[0] for r in rows]
 
 
-def get_filter_options(db: Session) -> dict:
-    """Werte für die Filter-Dropdowns: Jahre und Firmen aller (nicht gelöschten) Belege."""
-    years = [r[0] for r in db.query(Document.year).filter(Document.deleted_at.is_(None))
-             .distinct().order_by(Document.year.desc()).all()]
-    companies = [r[0] for r in db.query(Document.company).filter(Document.deleted_at.is_(None))
-                 .distinct().order_by(Document.company).all()]
+def get_filter_options(db: Session, include_hidden: bool = False) -> dict:
+    """Werte für die Filter-Dropdowns: Jahre und Firmen der (nicht gelöschten) Belege."""
+    def base(column):
+        q = db.query(column).filter(Document.deleted_at.is_(None))
+        if not include_hidden:
+            q = q.filter(~Document.batch_id.in_(
+                db.query(ImportBatch.id).filter(ImportBatch.hidden_at.isnot(None))))
+        return q
+    years = [r[0] for r in base(Document.year).distinct().order_by(Document.year.desc()).all()]
+    companies = [r[0] for r in base(Document.company).distinct().order_by(Document.company).all()]
     return {"years": years, "companies": companies}
 
 

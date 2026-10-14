@@ -7,6 +7,11 @@ const nextConfig: NextConfig = {
   // NAS-Hostname muss explizit erlaubt werden, sonst blockiert Next.js 16
   // cross-origin Anfragen zu /_next/webpack-hmr (HMR WebSocket)
   allowedDevOrigins: ["nas", "192.168.16.4"],
+  experimental: {
+    // Der Rewrite-Proxy bricht Anfragen standardmäßig nach 30 s ab. Große Excel-Exporte (mehrere
+    // Imports / tausende Belege) und die KI-Analyse brauchen auf dem NAS länger → 10 Minuten.
+    proxyTimeout: 10 * 60 * 1000,
+  },
   async rewrites() {
     return [
       {

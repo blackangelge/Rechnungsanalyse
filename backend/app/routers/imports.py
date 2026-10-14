@@ -19,7 +19,10 @@ from sqlalchemy.orm import Session
 
 from app import crud
 from app.database import SessionLocal, get_db
-from app.schemas.import_batch import ImportBatchCreate, ImportBatchRead, ImportBatchWithDocuments
+from app.models.import_batch import ImportBatch
+from app.schemas.import_batch import (
+    ImportBatchCreate, ImportBatchRead, ImportBatchWithDocuments, ImportVisibilityUpdate,
+)
 from app.services.import_service import (
     _run_import_io,
     list_pdf_files,
@@ -224,13 +227,83 @@ async def _import_then_analyze(
 def list_imports(
     company_name: str | None = Query(None, description="Firmenname (Teilstring-Suche)"),
     year: int | None = Query(None, description="Importjahr (exakt)"),
+    include_hidden: bool = Query(False, description="Auch ausgeblendete Imports liefern"),
     db: Session = Depends(get_db),
 ):
     """
-    Gibt alle Import-Batches zurück.
+    Gibt Import-Batches zurück (ausgeblendete nur mit include_hidden=true).
     Optional nach Firmenname (Teilstring) und/oder Jahr filtern.
     """
-    return crud.import_batch.get_all(db, company_name=company_name, year=year)
+    return crud.import_batch.get_all(
+        db, company_name=company_name, year=year, include_hidden=include_hidden
+    )
+
+
+@router.post("/visibility")
+def set_imports_visibility(payload: ImportVisibilityUpdate, db: Session = Depends(get_db)):
+    """
+    Blendet Imports aus (`hidden: true`) oder wieder ein (`hidden: false`).
+
+    Ausgeblendete Imports und ihre Belege erscheinen im Dashboard und in der Belege-Liste nur
+    auf Wunsch. Es wird nichts gelöscht — Dateien, Belege und Auswertungen bleiben erhalten.
+    """
+    existing = {b.id for b in db.query(ImportBatch.id).filter(ImportBatch.id.in_(payload.ids)).all()}
+    missing = sorted(set(payload.ids) - existing)
+    if missing:
+        raise HTTPException(
+            status_code=404,
+            detail="Import(s) nicht gefunden: " + ", ".join(f"#{i}" for i in missing),
+        )
+    changed = crud.import_batch.set_hidden(db, payload.ids, payload.hidden)
+    crud.system_log.add(
+        db, category="import", level="info",
+        message=(f"{len(existing)} Import(s) {'ausgeblendet' if payload.hidden else 'eingeblendet'}: "
+                 + ", ".join(f"#{i}" for i in sorted(existing))),
+    )
+    return {"updated": changed, "hidden": payload.hidden, "ids": sorted(existing)}
+
+
+# ─── GET /api/imports/export?ids=1&ids=2 — gemeinsamer Excel-Export ──────────
+
+@router.get("/export")
+def export_batches_excel(
+    ids: list[int] = Query(..., description="Import-IDs (mehrfach angeben)"),
+    db: Session = Depends(get_db),
+):
+    """
+    Exportiert mehrere Imports in EINE Excel-Datei (gleiche zwei Sheets wie beim Einzelexport,
+    zusätzlich mit der Spalte „Import" am Ende). Nur nicht-gelöschte Dokumente.
+    """
+    from datetime import date
+
+    from sqlalchemy.orm import joinedload as _jl
+    from app.models.document import Document as _Doc
+    from app.models.invoice_extraction import InvoiceExtraction as _Ext
+
+    ids = list(dict.fromkeys(ids))
+    batches = db.query(ImportBatch).filter(ImportBatch.id.in_(ids)).order_by(ImportBatch.id).all()
+    missing = sorted(set(ids) - {b.id for b in batches})
+    if missing:
+        raise HTTPException(
+            status_code=404, detail="Import(s) nicht gefunden: " + ", ".join(f"#{i}" for i in missing)
+        )
+    docs = (
+        db.query(_Doc)
+        .options(_jl(_Doc.extraction).joinedload(_Ext.supplier), _jl(_Doc.order_positions))
+        .filter(_Doc.batch_id.in_(ids), _Doc.deleted_at.is_(None))
+        .order_by(_Doc.batch_id, _Doc.id)
+        .all()
+    )
+    excel_bytes = _build_export_excel(batches[0], docs, batches=batches if len(batches) > 1 else None)
+    if len(batches) == 1:
+        filename = f"Export_{batches[0].company_name}_{batches[0].year}".replace(" ", "_") + ".xlsx"
+    else:
+        filename = f"Export_{len(batches)}_Imports_{date.today().isoformat()}.xlsx"
+    return StreamingResponse(
+        io.BytesIO(excel_bytes),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @router.post("", response_model=ImportBatchRead, status_code=status.HTTP_201_CREATED)
@@ -436,7 +509,7 @@ def export_batch_excel(batch_id: int, db: Session = Depends(get_db)):
     )
 
 
-def _build_export_excel(batch, docs) -> bytes:
+def _build_export_excel(batch, docs, batches=None) -> bytes:
     """
     Erstellt eine formatierte Excel-Datei mit zwei Sheets:
     - „Rechnungen": alle Rechnungsfelder pro Dokument inkl. Adresse (Straße/PLZ/Ort)
@@ -445,6 +518,9 @@ def _build_export_excel(batch, docs) -> bytes:
 
     Adress-Einzelfelder kommen aus dem verknüpften Supplier-Datensatz.
     Steuersatz und Skonto-Details werden aus raw_response geparst.
+
+    `batches` (≥ 2 Imports) erzeugt einen gemeinsamen Export: in beiden Sheets kommt am Ende die
+    Spalte „Import" ("Firma Jahr (#id)") dazu; sonst ist das Layout unverändert.
     """
     import json as _json
 
@@ -466,6 +542,24 @@ def _build_export_excel(batch, docs) -> bytes:
     fmt_pct   = '0.00"%"'
     fmt_date  = 'DD.MM.YYYY'
     fmt_dt    = 'DD.MM.YYYY HH:MM'
+
+    # Zell-Stile einmal vorbereiten und je Zelle nur kopieren: Das Zuweisen von Font/Fill/Format
+    # einzeln pro Zelle ist in openpyxl sehr langsam (bei ~150.000 Zellen > 10× so lange).
+    from copy import copy
+    _scratch = wb.create_sheet("_stile")
+    _style_cache: dict[tuple, object] = {}
+    _formats = {"plain": None, "eur": fmt_eur, "pct": fmt_pct, "date": fmt_date, "dt": fmt_dt, "center": None}
+
+    def _style(parity: int, kind: str):
+        key = (parity, kind)
+        if key not in _style_cache:
+            probe = _scratch.cell(row=1, column=1)
+            probe.font = data_font
+            probe.fill = fill_a if parity == 0 else fill_b
+            probe.number_format = _formats[kind] or "General"
+            probe.alignment = center if kind == "center" else Alignment()
+            _style_cache[key] = copy(probe._style)
+        return copy(_style_cache[key])
 
     def _header_row(ws, headers: list[str], row: int = 1):
         for c, h in enumerate(headers, 1):
@@ -524,13 +618,17 @@ def _build_export_excel(batch, docs) -> bytes:
     #                     24 Zahlungsbedingungen
     #                     25 Kommentar
     #                     26 Importiert am
-    NUM_COLS_WS1 = 26
+    multi = bool(batches) and len(batches) > 1
+    import_label = {b.id: f"{b.company_name} {b.year} (#{b.id})" for b in (batches or [])}
+    NUM_COLS_WS1 = 26 + (1 if multi else 0)
 
     ws1 = wb.active
     ws1.title = "Rechnungen"
 
     ws1.merge_cells(f"A1:{get_column_letter(NUM_COLS_WS1)}1")
-    ws1["A1"] = f"Export: {batch.company_name} {batch.year}"
+    ws1["A1"] = (
+        f"Export: {len(batches)} Imports" if multi else f"Export: {batch.company_name} {batch.year}"
+    )
     ws1["A1"].font = Font(name="Arial", size=13, bold=True)
     ws1["A1"].alignment = Alignment(vertical="center")
     ws1.row_dimensions[1].height = 24
@@ -544,6 +642,7 @@ def _build_export_excel(batch, docs) -> bytes:
         "Gesamtbetrag (€)", "Rabatt (€)",
         "Skonto (€)", "Skonto (%)", "Skonto Frist (Tage)",
         "Zahlungsbedingungen", "Kommentar", "Importiert am",
+        *(["Import"] if multi else []),
     ], row=2)
 
     for r, doc in enumerate(docs, start=3):
@@ -586,22 +685,24 @@ def _build_export_excel(batch, docs) -> bytes:
             ex.payment_terms         if ex  else None,
             doc.comment,
             _dt(doc.created_at),
+            *([import_label.get(doc.batch_id)] if multi else []),
         ]
 
         for c, val in enumerate(row_vals, 1):
             cell = ws1.cell(row=r, column=c, value=val)
-            cell.font = data_font
-            cell.fill = fill
             if c in (19, 20, 21):           # Beträge
-                cell.number_format = fmt_eur
+                kind = "eur"
             elif c == 22:                    # Skonto %
-                cell.number_format = fmt_pct
+                kind = "pct"
             elif c in (6, 7):               # Datumsfelder
-                cell.number_format = fmt_date
+                kind = "date"
             elif c == 26:                   # Importiert am
-                cell.number_format = fmt_dt
+                kind = "dt"
             elif c == 4:                    # Seiten — zentriert
-                cell.alignment = center
+                kind = "center"
+            else:
+                kind = "plain"
+            cell._style = _style(r % 2, kind)
 
     _set_widths(ws1, [
         10, 36, 12, 8,          # Beleg, Dateiname, Status, Seiten
@@ -611,6 +712,7 @@ def _build_export_excel(batch, docs) -> bytes:
         24, 26, 12,             # Bank, IBAN, BIC
         17, 13, 13, 10, 12,     # Gesamtbetrag, Rabatt, Skonto€, Skonto%, Frist
         42, 30, 18,             # Zahlungsbedingungen, Kommentar, Importiert am
+        *([26] if multi else []),   # Import
     ])
     ws1.freeze_panes = "A3"
 
@@ -623,6 +725,7 @@ def _build_export_excel(batch, docs) -> bytes:
         "Artikelbezeichnung", "Artikelnummer",
         "Menge", "Einheit",
         "Einzelpreis (€)", "Gesamtpreis (€)", "Steuersatz (%)", "Nachlass",
+        *(["Import"] if multi else []),
     ])
 
     r = 2
@@ -650,17 +753,19 @@ def _build_export_excel(batch, docs) -> bytes:
                 _f(pos.total_price),
                 tax_map.get(pos.position_index),   # Steuersatz aus raw_response
                 pos.discount,
+                *([import_label.get(doc.batch_id)] if multi else []),
             ]
             for c, val in enumerate(row_vals, 1):
                 cell = ws2.cell(row=r, column=c, value=val)
-                cell.font = data_font
-                cell.fill = fill
                 if c in (9, 10):
-                    cell.number_format = fmt_eur
+                    kind = "eur"
                 elif c == 11:               # Steuersatz %
-                    cell.number_format = fmt_pct
+                    kind = "pct"
                 elif c == 4:
-                    cell.alignment = center
+                    kind = "center"
+                else:
+                    kind = "plain"
+                cell._style = _style(r % 2, kind)
             r += 1
 
     if r == 2:
@@ -668,8 +773,10 @@ def _build_export_excel(batch, docs) -> bytes:
             name="Arial", size=10, color="888888", italic=True
         )
 
-    _set_widths(ws2, [10, 22, 30, 8, 52, 20, 12, 12, 17, 17, 14, 22])
+    _set_widths(ws2, [10, 22, 30, 8, 52, 20, 12, 12, 17, 17, 14, 22, *([26] if multi else [])])
     ws2.freeze_panes = "A2"
+
+    wb.remove(_scratch)
 
     # ── Bytes zurückgeben ─────────────────────────────────────────────────────
     buf = io.BytesIO()
