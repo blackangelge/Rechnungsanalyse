@@ -5,7 +5,7 @@ Singleton-Tabelle: immer genau eine Zeile mit id=1.
 Steuert die Parallelität beim PDF-Import und bei der KI-Analyse.
 """
 
-from sqlalchemy import Integer
+from sqlalchemy import Integer, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database import Base
@@ -27,3 +27,8 @@ class ProcessingSettings(Base):
     # Höhere Werte = schnellere Analyse, aber mehr Last auf der KI-API.
     # Vorsicht bei lokalen Modellen (LM Studio / Ollama): 1–2 empfohlen.
     ai_concurrency: Mapped[int] = mapped_column(Integer, default=4, nullable=False)
+
+    # Wie viele frühere Analyse-Stände je Beleg aufbewahrt werden (0 = Historie aus).
+    analysis_history_keep: Mapped[int] = mapped_column(
+        Integer, default=3, server_default=text("3"), nullable=False
+    )
